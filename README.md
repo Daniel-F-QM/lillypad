@@ -6,17 +6,10 @@
 
 <p align="center">
   A FROG acquisition app for ultrashort-pulse characterisation —
-  motorised delay stage + spectrometer, live feed, and a Qt GUI.
+  motorised delay stage control + spectrometer live feed in a Qt GUI.
 </p>
 
 ---
-
-Lillypad drives a **F**requency-**R**esolved **O**ptical **G**ating measurement: it
-steps a motorised delay stage through a delay grid, records a spectrum at every
-point, and builds up the 2-D FROG trace (wavelength × delay) live as the scan
-progresses. It ships with a physics-based simulator, so the whole application
-runs end-to-end on a laptop with no hardware attached.
-
 ## Features
 
 - **Live spectrum feed** on a background thread, paced to the spectrometer's
@@ -145,10 +138,3 @@ frozen and from source.
 
 The spec excludes `PyQt5`, `PyQt6` and `PySide2`, so a stray Qt binding in the
 environment cannot end up in the bundle even if something reinstalls one.
-
-## Origin
-
-Lillypad grew out of the `FROG/` directory of an internal spectrometer
-toolbox, extracted here as a standalone application. The GUI is the
-performance-optimised variant of that prototype: acquisition moved off the GUI
-thread, blitted live plots, and feed pacing tied to the actual integration time.
