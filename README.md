@@ -5,11 +5,11 @@
 <h1 align="center">Lillypad</h1>
 
 <p align="center">
-  A FROG acquisition app for ultrashort-pulse characterisation.
+  A FROG acquisition app for ultrashort-pulse characterisation —
+  motorised delay stage control + spectrometer live feed in a Qt GUI.
 </p>
 
 ---
-
 ## Features
 
 - **Live spectrum feed** on a background thread, paced to the spectrometer's
