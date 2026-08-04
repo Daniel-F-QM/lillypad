@@ -1,0 +1,22 @@
+# Virtual environment
+.venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Measurement output — data belongs in a data store, not in git
+*.dwc
+*.npz
+data/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
