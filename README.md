@@ -49,7 +49,7 @@ runs end-to-end on a laptop with no hardware attached.
 | [hardware.py](hardware.py) | Device abstraction: stage + spectrometer adapters, pulse simulator |
 | [scan.py](scan.py) | Delay-scan engine: optics conversions, scan worker, file writers |
 | [Lillypad.spec](Lillypad.spec) | PyInstaller recipe for a standalone Windows build |
-| [requirements.txt](requirements.txt) | Pinned dependencies (Python 3.13, verified working set) |
+| [requirements.txt](requirements.txt) | Pinned lockfile (Python 3.13) — install with `--no-deps` |
 | [icons/](icons/) | Application and toolbar icons |
 
 The dependency direction is strictly one-way — `frog_gui_fast` → `scan` →
@@ -68,10 +68,17 @@ cd lillypad
 
 python -m venv .venv
 .venv\Scripts\activate          # Windows;  source .venv/bin/activate on POSIX
-pip install -r requirements.txt
+pip install --no-deps -r requirements.txt
 
 python frog_gui_fast.py
 ```
+
+> **`--no-deps` is required.** `requirements.txt` is a complete lockfile, and
+> the flag is what keeps **PyQt5** out. `pylablib` hard-declares `pyqt5` even
+> though Lillypad is PySide6-only and only uses `pylablib.devices` — a plain
+> `pip install -r` puts two Qt bindings in the environment, which has broken
+> PyInstaller builds here before. `pip check` will warn that pylablib is
+> missing pyqt5; that warning is expected and safe to ignore.
 
 The app starts on simulated hardware, so this works with nothing plugged in.
 Press **START FEED** for a live spectrum, then **Measure FROG** to run a scan.
@@ -135,6 +142,9 @@ pyinstaller Lillypad.spec
 Produces `dist/Lillypad/Lillypad.exe` with the icons bundled. `resource_path()`
 in the GUI resolves assets through `sys._MEIPASS`, so the same code path works
 frozen and from source.
+
+The spec excludes `PyQt5`, `PyQt6` and `PySide2`, so a stray Qt binding in the
+environment cannot end up in the bundle even if something reinstalls one.
 
 ## Origin
 

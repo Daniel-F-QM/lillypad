@@ -12,7 +12,10 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # Lillypad is PySide6-only. PyQt5 reaches the environment as a declared
+    # pylablib dependency, and a second Qt binding in the bundle has broken
+    # builds before — keep it out even if something reinstalls it.
+    excludes=['PyQt5', 'PyQt6', 'PySide2'],
     noarchive=False,
     optimize=0,
 )
