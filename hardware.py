@@ -21,6 +21,7 @@ with only numpy installed (no pylablib / seabreeze needed to run the sims).
 from __future__ import annotations
 
 import abc
+import re
 import time
 import numpy as np
 
@@ -102,29 +103,114 @@ class SpectrometerBase(abc.ABC):
 # ===========================================================================
 # Stage calibration registry
 # ===========================================================================
-# pylablib only ships built-in calibrations for some Thorlabs stages. For a
-# stage it does NOT recognise (per your setup, the LTS300C/M), you must supply
-# an explicit `scale` so move_to()/get_position() come out in millimetres.
+# A Kinesis stage can get its millimetre calibration two ways, tried in order:
 #
-# `scale` is pylablib's KinesisMotor scale argument:
-#   * a tuple passed straight to pylablib's KinesisMotor scale argument, for
-#     stages pylablib can't calibrate itself (see the LTS300C/M below), OR
-#   * the string "stage" to use the controller's own reported calibration
-#     (only for recognised stages — verify the resulting units are mm!).
+#   1. An entry below, selected by matching the model number the CONTROLLER
+#     reports against that entry's `models` patterns. This is for stages
+#     pylablib cannot calibrate itself — the LTS300C/M is one: its controller
+#     reports no stage ID, so pylablib would silently fall back to raw steps.
+#   2. pylablib's own calibration (KinesisMotor(scale="stage")), which covers
+#     the stages it can identify — the Z6xx/Z7xx/Z8xx and MTS families on a
+#     KDC101/TDC001, K10CR1, MPC…
 #
-# To support a new stage, add one entry here. Nothing in the UI changes.
-# The LTS300C/M tuple below is therefore applied ONLY to the LTS300C/M.
+# A stage matching NEITHER is refused rather than driven with somebody else's
+# steps-per-mm, which would quietly distort the delay axis instead of failing.
+#
+# Entry fields:
+#   models    — regexes matched (case-insensitively, anchored at the start)
+#               against the reported model number. One entry can cover a family.
+#   scale     — passed straight to pylablib's KinesisMotor:
+#                 * a (position, velocity, acceleration) tuple in steps per
+#                   MILLIMETRE — pylablib calls these units "user" and applies
+#                   no conversion of its own, so the stage reads out in mm; or
+#                 * "stage" / a pylablib stage name ("MTS50-Z8", …) — pylablib
+#                   then works in METRES, which KinesisStage converts.
+#   travel_mm — full travel, used as the scan-range soft limit. Optional.
+#
+# Either way the resulting scale units are VERIFIED after opening (see
+# KinesisStage), so a rotational or uncalibrated stage cannot slip through as
+# a millimetre one. Adding an entry is all it takes; nothing in the UI changes.
 STAGE_CONFIGS: dict[str, dict] = {
     "LTS300C/M": {
+        # Matches LTS300/M, LTS300C/M, … — every LTS300 variant shares the
+        # controller and therefore the scale.
+        "models": (r"LTS300",),
         # pylablib KinesisMotor scale = (position, velocity, acceleration) in
         # steps per physical unit. These are the LTS300C/M's APT values
         # (409600 steps/mm), so get_position()/move_to() come out directly in mm.
         "scale": (409600, 21990232, 4506),
         "travel_mm": 300.0,
     },
-    # Example — a stage pylablib already recognises (adapt / uncomment):
-    # "Z825B": {"scale": "stage", "travel_mm": 25.0},
+    # Example — the LTS150 shares the LTS300's controller and step scale and
+    # differs only in travel (adapt / uncomment):
+    # "LTS150C/M": {
+    #     "models": (r"LTS150",),
+    #     "scale": (409600, 21990232, 4506),
+    #     "travel_mm": 150.0,
+    # },
 }
+
+# Travel of the stages pylablib identifies by itself, so an auto-calibrated
+# stage still gets a soft scan-range limit. This covers every translational
+# stage in pylablib's autodetect table; a stage missing from it connects with
+# travel_mm = None, i.e. no soft limit beyond the stage's own limit switches.
+KINESIS_TRAVEL_MM: dict[str, float] = {
+    "Z806": 6.0, "Z812": 12.0, "Z825": 25.0,
+    "Z706": 6.0, "Z712": 12.0, "Z725": 25.0,
+    "MTS25-Z8": 25.0, "MTS50-Z8": 50.0,
+}
+
+
+def _match_stage_config(model_no: str | None) -> str | None:
+    """The STAGE_CONFIGS key whose `models` patterns match `model_no`, else None."""
+    if not model_no:
+        return None
+    for key, cfg in STAGE_CONFIGS.items():
+        for pattern in cfg.get("models", ()):
+            if re.match(pattern, model_no, re.IGNORECASE):
+                return key
+    return None
+
+
+def _kinesis_model(conn: str, timeout: float = 1.0) -> str | None:
+    """The model number a Kinesis controller reports, or None if unreadable.
+
+    Opens the device and closes it again straight away — it only asks for the
+    identification message, so nothing moves and no device state changes. The
+    short timeout keeps enumeration snappy when a device is busy or wedged.
+    """
+    from pylablib.devices import Thorlabs
+    dev = None
+    try:
+        dev = Thorlabs.BasicKinesisDevice(conn, timeout=timeout)
+        return str(dev.get_device_info().model_no).strip() or None
+    except Exception:
+        return None
+    finally:
+        if dev is not None:
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+
+def list_kinesis_stages() -> list[tuple[str, str]]:
+    """Enumerate attached Thorlabs Kinesis devices without adopting any.
+
+    Returns [(model, conn), ...] — deliberately the same shape as
+    list_seabreeze_spectrometers(), so the GUI can drive one picker dialog for
+    both. `conn` is the connection string (normally the 8-digit serial) that
+    KinesisStage(serial=...) takes. Each device is briefly opened to read its
+    model number; one whose model cannot be read (already in use, say) falls
+    back to the USB description and then to "?" rather than being dropped.
+    """
+    from pylablib.devices import Thorlabs
+    out = []
+    for entry in Thorlabs.list_kinesis_devices():
+        conn = str(entry[0])
+        description = str(entry[1]).strip() if len(entry) > 1 else ""
+        out.append((_kinesis_model(conn) or description or "?", conn))
+    return out
 
 
 # ===========================================================================
@@ -133,20 +219,25 @@ STAGE_CONFIGS: dict[str, dict] = {
 class KinesisStage(StageBase):
     """Thorlabs Kinesis stage via pylablib. Positions in mm.
 
-    The scale is looked up from STAGE_CONFIGS[model]; unknown models raise
-    rather than silently auto-scaling, since a wrong scale would quietly
-    distort the delay axis.
-    """
-    def __init__(self, model: str = "LTS300C/M",
-                 serial: str | None = None, index: int = 0):
-        from pylablib.devices import Thorlabs
+    The stage is IDENTIFIED before it is driven: the model number its
+    controller reports selects a STAGE_CONFIGS entry, and failing that
+    pylablib is asked to calibrate the stage itself. Whichever supplied the
+    scale, the units pylablib ends up working in are checked, and anything
+    that is not a linear millimetre-convertible unit is refused — a rotational
+    or uncalibrated stage driven with somebody else's steps-per-mm would
+    quietly distort the delay axis instead of failing.
 
-        if model not in STAGE_CONFIGS:
-            raise KeyError(
-                f"No calibration for stage model {model!r}. Add an entry to "
-                f"STAGE_CONFIGS in hardware.py. Known: {sorted(STAGE_CONFIGS)}"
-            )
-        cfg = STAGE_CONFIGS[model]
+    Arguments:
+      serial — connection string / serial of the device to open (substring
+               match against the enumerated devices); default: first device.
+      index  — which enumerated device to open when `serial` is None.
+      model  — force a STAGE_CONFIGS entry instead of identifying the stage.
+               An escape hatch for a controller whose reported model number no
+               entry matches; you are then asserting the scale is right.
+    """
+    def __init__(self, serial: str | None = None, index: int = 0,
+                 model: str | None = None):
+        from pylablib.devices import Thorlabs
 
         devices = Thorlabs.list_kinesis_devices()
         if not devices:
@@ -156,23 +247,86 @@ class KinesisStage(StageBase):
             if conn is None:
                 raise RuntimeError(f"Kinesis device with serial {serial!r} not found.")
         else:
+            if index >= len(devices):
+                raise RuntimeError(
+                    f"index {index} out of range ({len(devices)} Kinesis device(s)).")
             conn = devices[index][0]
 
-        self.model     = model
-        self.name      = f"{model} [{conn}]"
-        self.travel_mm = cfg.get("travel_mm")
-        self._motor    = Thorlabs.KinesisMotor(conn, scale=cfg["scale"])
+        reported = _kinesis_model(str(conn))
+        if model is not None:
+            if model not in STAGE_CONFIGS:
+                raise KeyError(
+                    f"No calibration for stage model {model!r}. Add an entry to "
+                    f"STAGE_CONFIGS in hardware.py. Known: {sorted(STAGE_CONFIGS)}"
+                )
+            key = model
+        else:
+            key = _match_stage_config(reported)
+        cfg = STAGE_CONFIGS.get(key, {}) if key else {}
+
+        # No entry for this stage -> ask pylablib to calibrate it. That is a
+        # request, not an assumption: the units check below is what decides
+        # whether the answer is usable.
+        motor = Thorlabs.KinesisMotor(conn, scale=cfg.get("scale", "stage"))
+        try:
+            units = motor.get_scale_units()
+            if units == "user":
+                mm_per_unit = 1.0        # STAGE_CONFIGS tuple: steps per mm
+            elif units == "m":
+                mm_per_unit = 1000.0     # pylablib calibration: metres
+            else:
+                raise RuntimeError(
+                    self._no_calibration_msg(conn, reported, units))
+            stage_name = motor.get_stage()
+            travel_mm = cfg.get("travel_mm")
+            if travel_mm is None and stage_name:
+                travel_mm = KINESIS_TRAVEL_MM.get(str(stage_name).strip().upper())
+        except Exception:
+            try:
+                motor.close()
+            except Exception:
+                pass
+            raise
+
+        self.model        = key or reported
+        self.stage_name   = str(stage_name) if stage_name else None
+        self.scale_units  = units
+        self.travel_mm    = travel_mm
+        self.name         = f"{self._label(key, reported, stage_name)} [{conn}]"
+        self._mm_per_unit = mm_per_unit
+        self._motor       = motor
+
+    @staticmethod
+    def _label(key, reported, stage_name) -> str:
+        """Human name for the stage: what it is, and what is driving it."""
+        if key:
+            return key
+        if stage_name and reported and str(stage_name) != reported:
+            return f"{stage_name} on {reported}"
+        return str(stage_name or reported or "Kinesis stage")
+
+    @staticmethod
+    def _no_calibration_msg(conn, reported, units) -> str:
+        who = f"{reported} [{conn}]" if reported else str(conn)
+        if units == "deg":
+            why = ("it is a rotational stage (pylablib reports degrees) — this "
+                   "app drives linear delay stages only")
+        else:
+            why = (f"no STAGE_CONFIGS entry matches it and pylablib cannot "
+                   f"calibrate it either (scale units: {units!r})")
+        return (f"Stage {who} has no millimetre calibration: {why}. "
+                f"Add an entry for it to STAGE_CONFIGS in hardware.py.")
 
     def move_to(self, position_mm: float) -> None:
-        self._motor.move_to(float(position_mm))
+        self._motor.move_to(float(position_mm) / self._mm_per_unit)
         self._motor.wait_move()
 
     def move_by(self, delta_mm: float) -> None:
-        self._motor.move_by(float(delta_mm))
+        self._motor.move_by(float(delta_mm) / self._mm_per_unit)
         self._motor.wait_move()
 
     def get_position(self) -> float:
-        return float(self._motor.get_position())
+        return float(self._motor.get_position()) * self._mm_per_unit
 
     def home(self) -> None:
         self._motor.home()

@@ -50,7 +50,7 @@ from matplotlib.figure import Figure
 
 from hardware import (SimulatedStage, SimulatedSpectrometer,
                       KinesisStage, ZaberStage, SeabreezeSpectrometer,
-                      list_seabreeze_spectrometers,
+                      list_kinesis_stages, list_seabreeze_spectrometers,
                       PULSE_SHAPES, DEFAULT_PULSE)
 from scan import (FrogScanConfig, FrogScanWorker, autocorrelation, fwhm,
                   position_to_delay_fs, delay_to_position_um,
@@ -682,18 +682,22 @@ class HardwareDialog(QDialog):
 # ─────────────────────────────────────────────────────────────────────────────
 # Spectrometer picker (modal — shown only when seabreeze finds 2+ devices)
 # ─────────────────────────────────────────────────────────────────────────────
-class SpectrometerPickerDialog(QDialog):
-    def __init__(self, devices, parent=None):
+class DevicePickerDialog(QDialog):
+    """Pick one device from an enumeration. `devices` is [(label, id), ...] —
+    the shape both hardware.list_*() helpers return — and the chosen id comes
+    back from pick()."""
+    def __init__(self, devices, parent=None, title="Select Device", prompt=""):
         super().__init__(parent)
-        self.setWindowTitle("Select Spectrometer")
+        self.setWindowTitle(title)
         self.setFixedWidth(360)
         lay = QVBoxLayout(self); lay.setSpacing(10); lay.setContentsMargins(14, 14, 14, 14)
-        lbl = QLabel(f"{len(devices)} spectrometers found — choose one:")
+        lbl = QLabel(prompt or f"{len(devices)} devices found — choose one:")
         lbl.setObjectName("dim")
+        lbl.setWordWrap(True)
         lay.addWidget(lbl)
         self.cmb = QComboBox()
-        for model, serial in devices:
-            self.cmb.addItem(f"{model}  [{serial}]", serial)
+        for label, ident in devices:
+            self.cmb.addItem(f"{label}  [{ident}]", ident)
         lay.addWidget(self.cmb)
         row = QHBoxLayout()
         b_cancel = QPushButton("Cancel"); b_cancel.clicked.connect(self.reject)
@@ -703,9 +707,9 @@ class SpectrometerPickerDialog(QDialog):
         lay.addLayout(row)
 
     @staticmethod
-    def pick(parent, devices):
-        """Returns the chosen serial, or None on cancel."""
-        dlg = SpectrometerPickerDialog(devices, parent)
+    def pick(parent, devices, title="Select Device", prompt=""):
+        """Returns the chosen id, or None on cancel."""
+        dlg = DevicePickerDialog(devices, parent, title, prompt)
         return dlg.cmb.currentData() if dlg.exec() == QDialog.Accepted else None
 
 
@@ -1410,7 +1414,22 @@ class FrogWindow(QMainWindow):
 
     def _connect_real_stage(self):
         try:
-            stage = KinesisStage()                 # LTS300C/M, first Kinesis device
+            devices = list_kinesis_stages()   # brief per-device model query
+        except Exception as e:
+            return False, f"Stage connect failed: {e}"
+        if not devices:
+            return False, "Stage connect failed: No Kinesis devices found."
+        if len(devices) > 1:
+            conn = DevicePickerDialog.pick(
+                self.dlg_hardware, devices, "Select Kinesis Stage",
+                f"{len(devices)} Kinesis devices found — choose one:")
+            if conn is None:
+                return False, "Cancelled — stage unchanged."
+        else:
+            conn = devices[0][1]
+        try:
+            # Identifies the stage and refuses anything it can't calibrate in mm.
+            stage = KinesisStage(serial=conn)
         except Exception as e:
             return False, f"Stage connect failed: {e}"
         ok, err = self._apply_stage(stage)
@@ -1418,8 +1437,11 @@ class FrogWindow(QMainWindow):
             self._drop(stage)      # never adopted — don't leak the connection
             return False, err
         self.status.showMessage(f"Stage: {stage.name} — zero at current position.", 5000)
+        travel = (f"Travel {stage.travel_mm:.0f} mm." if stage.travel_mm else
+                  "Travel unknown — no soft range limit, set one in the scan "
+                  "config if you need it.")
         return True, (f"Stage connected: {stage.name}. Zero-delay set to current "
-                      f"position ({self.scan_cfg.zero_pos_um:.1f} um).")
+                      f"position ({self.scan_cfg.zero_pos_um:.1f} um). {travel}")
 
     def _connect_zaber_stage(self, port=None):
         try:
@@ -1449,7 +1471,9 @@ class FrogWindow(QMainWindow):
         if not devices:
             return False, "Spectrometer connect failed: No spectrometers found."
         if len(devices) > 1:
-            serial = SpectrometerPickerDialog.pick(self.dlg_hardware, devices)
+            serial = DevicePickerDialog.pick(
+                self.dlg_hardware, devices, "Select Spectrometer",
+                f"{len(devices)} spectrometers found — choose one:")
             if serial is None:
                 return False, "Cancelled — spectrometer unchanged."
         else:

@@ -94,17 +94,22 @@ rather than the whole app.
 
 | Device | Adapter | Backend |
 | --- | --- | --- |
-| Thorlabs Kinesis stage (LTS300C/M) | `KinesisStage` | `pylablib` |
+| Thorlabs Kinesis stage (LTS300C/M + autodetected stages) | `KinesisStage` | `pylablib` |
 | Zaber stage (serial / daisy-chain) | `ZaberStage` | `zaber-motion` |
 | Ocean Optics / Ocean Insight spectrometer | `SeabreezeSpectrometer` | `seabreeze` |
 
-Zaber auto-scans serial ports when no port is given. Seabreeze picks the first
-device it finds unless you pass a serial number.
+Kinesis and Seabreeze both enumerate first and pop a picker when more than one
+device is attached. Zaber auto-scans serial ports when no port is given.
 
-**Adding a stage model.** `KinesisStage` looks its scale up in `STAGE_CONFIGS`
-and *raises* on an unknown model rather than guessing — a wrong steps-per-mm
-scale would silently distort the delay axis instead of failing. Add an entry to
-[hardware.py](hardware.py) to support a new one.
+**Kinesis stages.** `KinesisStage` identifies the stage from the model number
+its controller reports before driving it, and calibrates it either from a
+`STAGE_CONFIGS` entry in [hardware.py](hardware.py) (needed for the LTS300C/M,
+which pylablib cannot calibrate itself) or from pylablib's own stage
+autodetection (the Z6xx/Z7xx/Z8xx and MTS families, K10CR1, …). The resulting
+scale units are then verified, so a rotational or uncalibrated stage is
+*refused* rather than driven with somebody else's steps-per-mm — a wrong scale
+would silently distort the delay axis instead of failing. To support a stage
+that matches neither, add a `STAGE_CONFIGS` entry.
 
 **Adding a device class.** Implement `StageBase` or `SpectrometerBase` in
 [hardware.py](hardware.py). Moves must block until settled, so the scan loop can
