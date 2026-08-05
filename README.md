@@ -54,14 +54,20 @@ and reusable without a GUI.
 ## Getting started
 
 Requires Python 3.13.
+Requires Visual C++ - e.g. x64 "Visual C++ Redistributable" (vc_redist.x64.exe)
+(likely) Requires Kinesis to be installed for Thorlabs stages to get the drivers
+
+!!! Important: if Python is installed through Anaconda it will give you an error "DLL load failed..." because it carries its own DLLs / search behaviour. If python is not installed otherwise, install the latests version and make sure you deactivate conda in your terminal if it starts up with it.
 
 ```bash
 git clone https://github.com/Daniel-F-QM/lillypad.git
 cd lillypad
 
+conda deactivate                #only if your terminal launched with conda, you will see (Base)... in your terminal
 python -m venv .venv
 .venv\Scripts\activate          # Windows;  source .venv/bin/activate on POSIX
 pip install --no-deps -r requirements.txt
+seabreeze_os_setup              # Required for seabreeze to talk to the spectrometers
 
 python frog_gui_fast.py
 ```
