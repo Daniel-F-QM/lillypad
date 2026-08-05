@@ -372,6 +372,12 @@ FEED_BUSY_MSG = ("Live feed is still mid-acquisition — try again in a moment "
 # spectrum around them is already wrong.
 SAT_WARN_FRACTION = 0.90
 
+# Colormaps offered for the FROG trace. All perceptually uniform, so equal
+# steps in count map to equal steps in apparent brightness — a trace read off
+# a non-uniform map (jet and friends) shows structure the data does not have.
+# First entry is the default.
+TRACE_COLORMAPS = ["magma", "viridis", "inferno", "plasma", "cividis"]
+
 
 class StatusLamp(QWidget):
     """Round go/no-go indicator for detector headroom.
@@ -721,8 +727,17 @@ class GraphicsSettingsDialog(QDialog):
         super().__init__(parent, Qt.Tool)
         self.canvas = canvas
         self.setWindowTitle("Graphics Settings")
-        self.setFixedWidth(390)
-        lay = QVBoxLayout(self); lay.setSpacing(10); lay.setContentsMargins(14, 14, 14, 14)
+        # Width is set from the content once it is built (see below) — the
+        # rows are wider than they look, and a hard-coded width clips them at
+        # font sizes or DPI scalings other than the one it was picked on.
+        #
+        # Scrolled body + pinned Close button: the settings list is taller than
+        # a short laptop screen, and a dialog that runs off the bottom takes
+        # its Close button with it. Same pattern (and stylesheet) as the main
+        # window's control column.
+        outer = QVBoxLayout(self); outer.setSpacing(8); outer.setContentsMargins(0, 0, 0, 0)
+        body = QWidget()
+        lay = QVBoxLayout(body); lay.setSpacing(10); lay.setContentsMargins(14, 14, 14, 14)
 
         # ── Spectrum Y-axis ──────────────────────────────────────────────────
         lay.addWidget(self._hdr("Spectrum Y-axis"))
@@ -782,6 +797,85 @@ class GraphicsSettingsDialog(QDialog):
 
         lay.addWidget(_hline())
 
+        # ── FROG trace axes ──────────────────────────────────────────────────
+        lay.addWidget(self._hdr("FROG Trace Axes"))
+        self.chk_auto_trace = QCheckBox("Auto-scale to scan range")
+        self.chk_auto_trace.setChecked(canvas.autoscale_trace)
+        self.chk_auto_trace.toggled.connect(self._on_autoscale_trace)
+        lay.addWidget(self.chk_auto_trace)
+
+        tx_row = QHBoxLayout(); tx_row.setSpacing(6)
+        tx_row.addWidget(QLabel("Delay"))
+        # ±100 ps of delay axis is already far beyond any FROG scan this stage
+        # can produce; the tighter range keeps the spinbox from sizing itself
+        # for a seven-figure number it will never show.
+        self.spin_tmin = QDoubleSpinBox()
+        self.spin_tmin.setRange(-1e5, 1e5); self.spin_tmin.setDecimals(1)
+        self.spin_tmin.setSingleStep(10); self.spin_tmin.setValue(-500)
+        self.spin_tmin.setSuffix(" fs")
+        tx_row.addWidget(self.spin_tmin)
+        self.spin_tmax = QDoubleSpinBox()
+        self.spin_tmax.setRange(-1e5, 1e5); self.spin_tmax.setDecimals(1)
+        self.spin_tmax.setSingleStep(10); self.spin_tmax.setValue(500)
+        self.spin_tmax.setSuffix(" fs")
+        tx_row.addWidget(self.spin_tmax)
+        lay.addLayout(tx_row)
+        self.spin_tmin.valueChanged.connect(
+            lambda v: canvas.set_trace_xlim(v, self.spin_tmax.value()))
+        self.spin_tmax.valueChanged.connect(
+            lambda v: canvas.set_trace_xlim(self.spin_tmin.value(), v))
+
+        ty_row = QHBoxLayout(); ty_row.setSpacing(6)
+        ty_row.addWidget(QLabel("Wavel."))
+        self.spin_twmin = QDoubleSpinBox()
+        self.spin_twmin.setRange(0, 4000); self.spin_twmin.setDecimals(1)
+        self.spin_twmin.setSingleStep(0.5); self.spin_twmin.setValue(380)
+        self.spin_twmin.setSuffix(" nm")
+        ty_row.addWidget(self.spin_twmin)
+        self.spin_twmax = QDoubleSpinBox()
+        self.spin_twmax.setRange(0, 4000); self.spin_twmax.setDecimals(1)
+        self.spin_twmax.setSingleStep(0.5); self.spin_twmax.setValue(620)
+        self.spin_twmax.setSuffix(" nm")
+        ty_row.addWidget(self.spin_twmax)
+        lay.addLayout(ty_row)
+        self.spin_twmin.valueChanged.connect(
+            lambda v: canvas.set_trace_ylim(v, self.spin_twmax.value()))
+        self.spin_twmax.valueChanged.connect(
+            lambda v: canvas.set_trace_ylim(self.spin_twmin.value(), v))
+
+        lay.addWidget(_hline())
+
+        # ── FROG trace colour ────────────────────────────────────────────────
+        lay.addWidget(self._hdr("FROG Trace Colour"))
+        cm_row = QHBoxLayout(); cm_row.setSpacing(6)
+        cm_row.addWidget(QLabel("Colormap"))
+        self.cmb_cmap = QComboBox()
+        self.cmb_cmap.addItems(TRACE_COLORMAPS)
+        self.cmb_cmap.setCurrentText(canvas._cmap_name)
+        self.cmb_cmap.currentTextChanged.connect(canvas.set_cmap)
+        cm_row.addWidget(self.cmb_cmap, 1)
+        lay.addLayout(cm_row)
+        self.chk_cmap_rev = QCheckBox("Reversed")
+        self.chk_cmap_rev.toggled.connect(canvas.set_trace_reversed)
+        lay.addWidget(self.chk_cmap_rev)
+
+        thr_row = QHBoxLayout(); thr_row.setSpacing(6)
+        thr_row.addWidget(QLabel("Hide below"))
+        self.spin_thresh = QDoubleSpinBox()
+        self.spin_thresh.setRange(0.0, 100.0); self.spin_thresh.setDecimals(1)
+        self.spin_thresh.setSingleStep(0.5); self.spin_thresh.setValue(0.0)
+        self.spin_thresh.setSuffix(" %")
+        self.spin_thresh.valueChanged.connect(canvas.set_trace_threshold)
+        thr_row.addWidget(self.spin_thresh)
+        thr_row.addWidget(QLabel("of peak")); thr_row.addStretch()
+        lay.addLayout(thr_row)
+        thr_hint = QLabel("Display only — saved data and the autocorrelation "
+                          "always use the full trace.")
+        thr_hint.setObjectName("dim"); thr_hint.setWordWrap(True)
+        lay.addWidget(thr_hint)
+
+        lay.addWidget(_hline())
+
         # ── Line width ───────────────────────────────────────────────────────
         lay.addWidget(self._hdr("Line Width"))
         lw_row = QHBoxLayout(); lw_row.setSpacing(6)
@@ -811,16 +905,57 @@ class GraphicsSettingsDialog(QDialog):
         self.sld_prop.valueChanged.connect(self._on_prop)
 
         lay.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidget(body); scroll.setWidgetResizable(True)
+        # As-needed, not off: if a screen really cannot take the natural width,
+        # the content must stay reachable rather than being silently clipped.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        outer.addWidget(scroll, 1)
+
+        close_row = QHBoxLayout(); close_row.setContentsMargins(14, 0, 14, 14)
         btn_close = QPushButton("Close"); btn_close.clicked.connect(self.hide)
-        lay.addWidget(btn_close)
+        close_row.addWidget(btn_close)
+        outer.addLayout(close_row)
+
+        self._scroll = scroll
+        self._body   = body
+        self._sized  = False
+        self.setFixedWidth(390)        # provisional; _fit_to_content resizes
 
         self._on_autoscale_y(canvas.autoscale_y)
         self._on_autoscale_x(canvas.autoscale_x)
+        self._on_autoscale_trace(canvas.autoscale_trace)
 
     def _hdr(self, text):
         lbl = QLabel(text)
         lbl.setObjectName("hdr")
         return lbl
+
+    def _fit_to_content(self):
+        """Size to the content: wide enough that no row is cut off (hence no
+        horizontal scrolling), tall enough to show what the screen allows.
+
+        Both are clamped to the screen, so a small display degrades to
+        scrolling rather than to a dialog with unreachable controls. Deferred
+        to the first show: the row widths are only final once the stylesheet
+        has polished the widgets, and a width measured before that under-sizes
+        the dialog and clips the very rows it was meant to fit.
+        """
+        avail = QApplication.primaryScreen().availableGeometry()
+        vbar  = self._scroll.verticalScrollBar().sizeHint().width()
+        need  = (self._body.minimumSizeHint().width() + vbar
+                 + 2 * self._scroll.frameWidth())
+        self.setFixedWidth(max(390, min(need, int(avail.width() * 0.9))))
+        self.resize(self.width(),
+                    min(self._body.sizeHint().height() + 60,
+                        int(avail.height() * 0.9)))
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._sized:
+            self._sized = True
+            self._fit_to_content()
 
     def _on_autoscale_y(self, on):
         self.canvas.autoscale_y = on
@@ -832,21 +967,46 @@ class GraphicsSettingsDialog(QDialog):
         self.spin_xmin.setEnabled(not on)
         self.spin_xmax.setEnabled(not on)
 
+    def _on_autoscale_trace(self, on):
+        self.canvas.autoscale_trace = on
+        for sb in (self.spin_tmin, self.spin_tmax,
+                   self.spin_twmin, self.spin_twmax):
+            sb.setEnabled(not on)
+        if not on:
+            # Start manual from whatever is on screen, and PIN it: with the
+            # axes still on matplotlib's own autoscale, the next scan's
+            # im.set_extent() would drag the view along with it.
+            tlo, thi = self.canvas.ax_trace.get_xlim()
+            wlo, whi = self.canvas.ax_trace.get_ylim()
+            for sb, v in ((self.spin_tmin, tlo), (self.spin_tmax, thi),
+                          (self.spin_twmin, wlo), (self.spin_twmax, whi)):
+                sb.blockSignals(True); sb.setValue(v); sb.blockSignals(False)
+            self.canvas.set_trace_xlim(tlo, thi)
+            self.canvas.set_trace_ylim(wlo, whi)
+
     def sync_limits(self):
         """Pull current axis limits and auto-scale flags into the dialog."""
         xlo, xhi = self.canvas.ax_spec.get_xlim()
         ylo, yhi = self.canvas.ax_spec.get_ylim()
+        tlo, thi = self.canvas.ax_trace.get_xlim()
+        wlo, whi = self.canvas.ax_trace.get_ylim()
         for sb, v in ((self.spin_xmin, xlo), (self.spin_xmax, xhi),
-                      (self.spin_ymin, ylo), (self.spin_ymax, yhi)):
+                      (self.spin_ymin, ylo), (self.spin_ymax, yhi),
+                      (self.spin_tmin, tlo), (self.spin_tmax, thi),
+                      (self.spin_twmin, wlo), (self.spin_twmax, whi)):
             sb.blockSignals(True); sb.setValue(v); sb.blockSignals(False)
         # Sync checkboxes to canvas state without re-triggering callbacks
         for chk, flag in ((self.chk_auto_x, self.canvas.autoscale_x),
-                          (self.chk_auto_y, self.canvas.autoscale_y)):
+                          (self.chk_auto_y, self.canvas.autoscale_y),
+                          (self.chk_auto_trace, self.canvas.autoscale_trace)):
             chk.blockSignals(True); chk.setChecked(flag); chk.blockSignals(False)
         self.spin_xmin.setEnabled(not self.canvas.autoscale_x)
         self.spin_xmax.setEnabled(not self.canvas.autoscale_x)
         self.spin_ymin.setEnabled(not self.canvas.autoscale_y)
         self.spin_ymax.setEnabled(not self.canvas.autoscale_y)
+        for sb in (self.spin_tmin, self.spin_tmax,
+                   self.spin_twmin, self.spin_twmax):
+            sb.setEnabled(not self.canvas.autoscale_trace)
 
     def _on_prop(self, val):
         self.lbl_prop.setText(f"{val}%")
@@ -902,7 +1062,22 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.autoscale_x = True
         self.autoscale_ac_x = True
         self.autoscale_ac_y = True
+        # Unlike the spectrum's flags (consulted every frame), this one only
+        # bites when a new scan calls init_trace: manual trace bounds are meant
+        # to outlive the scan they were dialled in on.
+        self.autoscale_trace = True
         self._lw = 1.6
+
+        # ── FROG-trace display settings ───────────────────────────────────
+        # The threshold hides weak pixels from the PLOT only: the raw trace is
+        # kept here and re-rendered on every settings change, and what the scan
+        # worker recorded (and what gets exported / autocorrelated) is never
+        # touched.
+        self._trace_raw    = None    # last full trace, unmasked
+        self._trace_thresh = 0.0     # display floor, fraction of peak (0 = off)
+        self._cmap_name    = "magma"
+        self._cmap_rev     = False
+        self._apply_cmap()           # installs the masked-pixel colour
 
         # ── Mouse interaction: rubber-band zoom + axis-click log toggle ──
         # The rectangle is a Qt child widget composited above the canvas, so
@@ -929,6 +1104,8 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._ylim_cache = None
         self._ac_xlim_cache = None
         self._ac_ylim_cache = None
+        self._trace_xlim_cache = None
+        self._trace_ylim_cache = None
         # Axis y-positions are cached after first draw so set_proportions can
         # reposition axes without touching the row heights.
         self._ay_spec = self._ay_trace = self._ay_ac = None
@@ -952,12 +1129,22 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.ax_spec.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
         self.ax_ac.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
 
+    def _apply_cmap(self):
+        """Install the selected colormap, with sub-threshold ('bad') pixels
+        painted in the plot background so they read as absent rather than as
+        the map's darkest colour. with_extremes returns a copy, so the shared
+        matplotlib registry is never mutated."""
+        name = self._cmap_name + ("_r" if self._cmap_rev else "")
+        self.im.set_cmap(
+            matplotlib.colormaps[name].with_extremes(bad=PALETTE["plot_bg"]))
+
     def apply_palette(self, pal):
         """Recolor the figure for a theme switch (light/dark)."""
         self.fig.set_facecolor(pal["plot_bg"])
         self.line_spec.set_color(pal["accent"])
         self.line_ac.set_color(pal["accent2"])
         self._style()   # re-applies axes/tick/label/grid colors from PALETTE
+        self._apply_cmap()   # masked pixels must follow the new background
         self.draw_idle()
 
     # ── Blitting core ─────────────────────────────────────────────────────
@@ -1081,7 +1268,13 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.autoscale_ac_y = False
             self._ac_xlim_cache = (xlo, xhi)
             self._ac_ylim_cache = (ylo, yhi)
-        # ax_trace: update_trace never touches limits, nothing to freeze.
+        elif ax is self.ax_trace:
+            # update_trace never touches limits, so nothing to freeze for the
+            # rest of this scan — but the NEXT scan's init_trace would snap the
+            # view back, and the dialog must show the zoom as manual bounds.
+            self.autoscale_trace = False
+            self._trace_xlim_cache = (xlo, xhi)
+            self._trace_ylim_cache = (ylo, yhi)
         self.draw_idle()
         self.limits_changed.emit()
 
@@ -1092,9 +1285,12 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.autoscale_x = True            # …so re-enable live follow
             self.autoscale_y = True
         elif ax is self.ax_trace:
+            self.autoscale_trace = True        # resume following the scan range
             x0, x1, y0, y1 = self.im.get_extent()
             self.ax_trace.set_xlim(x0, x1)
             self.ax_trace.set_ylim(y0, y1)
+            self._trace_xlim_cache = self.ax_trace.get_xlim()
+            self._trace_ylim_cache = self.ax_trace.get_ylim()
         elif ax is self.ax_ac:
             self.autoscale_ac_x = True
             self.autoscale_ac_y = True
@@ -1142,6 +1338,37 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.ax_spec.set_xlim(xmin, xmax)
             self._xlim_cache = (xmin, xmax)
             self.draw_idle()
+
+    # ── FROG trace: manual bounds and colour ──────────────────────────────
+    def set_trace_xlim(self, xmin, xmax):
+        """Delay axis (fs) of the FROG trace."""
+        if xmin < xmax:
+            self.ax_trace.set_xlim(xmin, xmax)
+            self._trace_xlim_cache = (xmin, xmax)
+            self.draw_idle()
+
+    def set_trace_ylim(self, ymin, ymax):
+        """Wavelength axis (nm) of the FROG trace."""
+        if ymin < ymax:
+            self.ax_trace.set_ylim(ymin, ymax)
+            self._trace_ylim_cache = (ymin, ymax)
+            self.draw_idle()
+
+    def set_cmap(self, name):
+        self._cmap_name = name
+        self._apply_cmap()
+        self.draw_idle()
+
+    def set_trace_reversed(self, on):
+        self._cmap_rev = bool(on)
+        self._apply_cmap()
+        self.draw_idle()
+
+    def set_trace_threshold(self, percent):
+        """Hide trace pixels below `percent` of the trace peak. Display only —
+        the stored trace keeps every count."""
+        self._trace_thresh = max(0.0, min(100.0, float(percent))) / 100.0
+        self._render_trace()          # takes effect without waiting for a column
 
     def set_log_scale(self, on):
         self.ax_spec.set_yscale('log' if on else 'linear')
@@ -1209,16 +1436,40 @@ class FrogCanvas(FigureCanvasQTAgg):
         # mirroring the trace-view reset below.
         self.autoscale_ac_x = True
         self.autoscale_ac_y = True
-        self.im.set_data(np.zeros((wl.size, delays.size)))
+        self._trace_raw = np.zeros((wl.size, delays.size))
+        self.im.set_data(self._trace_raw)
+        # The extent is the data -> axes mapping and must always track the new
+        # scan, even under manual bounds — otherwise the columns would land in
+        # the wrong place. Only the VIEW is left alone when the user has dialled
+        # bounds in by hand.
         self.im.set_extent([float(delays[0]), float(delays[-1]),
                             float(wl[0]), float(wl[-1])])
-        self.ax_trace.set_xlim(delays[0], delays[-1])
-        self.ax_trace.set_ylim(wl[0], wl[-1])
+        if self.autoscale_trace:
+            self.ax_trace.set_xlim(delays[0], delays[-1])
+            self.ax_trace.set_ylim(wl[0], wl[-1])
+            self._trace_xlim_cache = self.ax_trace.get_xlim()
+            self._trace_ylim_cache = self.ax_trace.get_ylim()
         self.draw_idle()
 
     def update_trace(self, trace):
-        self.im.set_data(trace)
-        self.im.set_clim(0, max(float(trace.max()), 1.0))
+        self._trace_raw = trace
+        self._render_trace()
+
+    def _render_trace(self):
+        """Push the stored trace to the image, applying the display threshold.
+
+        The colour scale is computed from the RAW trace, so moving the
+        threshold only removes pixels — it never restretches the colours of
+        the ones that survive.
+        """
+        raw = self._trace_raw
+        if raw is None:
+            return
+        peak = max(float(raw.max()), 1.0)
+        data = (np.ma.masked_less(raw, self._trace_thresh * peak)
+                if self._trace_thresh > 0 else raw)
+        self.im.set_data(data)
+        self.im.set_clim(0, peak)
         # Extent/limits are fixed by init_trace, so this is always a fast blit.
         self._blit()
 
@@ -1274,6 +1525,10 @@ class FrogWindow(QMainWindow):
         self._export_worker = None
         self._scan_trace   = None
         self._scan_delays  = None
+        # Cached at scan start so _on_column can redraw the spectrum panel
+        # without touching self.spec from the GUI thread while the worker is
+        # inside acquire().
+        self._scan_wl      = None
         self._feed_was_on  = True
         self._pending_fit  = True
         self._export_fmt   = "dwc"
@@ -2076,6 +2331,7 @@ class FrogWindow(QMainWindow):
 
         self._scan_trace  = np.zeros((wl.size, delays.size))
         self._scan_delays = delays
+        self._scan_wl     = wl
         self.canvas.init_trace(delays, wl)
         self._reset_saturation(); self.progress.setValue(0)
 
@@ -2099,6 +2355,21 @@ class FrogWindow(QMainWindow):
     def _on_column(self, i, delay_fs, pos_um, col):
         self._scan_trace[:, i] = col
         self.lbl_pos.setText(f"{pos_um:.2f} um")
+        # Keep the spectrum panel alive through the scan. The live feed is
+        # parked (the worker owns the device), so the column the scan just
+        # measured is the only spectrum there is — reusing it costs no extra
+        # device traffic. Cadence is one frame per delay point, i.e. the real
+        # acquisition rate, rather than the feed's.
+        #
+        # Trace only, never the headroom lamp: `col` is an average of
+        # n_average frames, so its peak sits below any single frame's and
+        # would under-report clipping. Saturation during a scan is reported
+        # per-frame by the worker via saturation_warning -> _on_saturation.
+        if self._scan_wl is not None:
+            spectrum = col
+            if self.chk_dark.isChecked() and self.background is not None:
+                spectrum = np.clip(col - self.background, 0, None)
+            self.canvas.update_spectrum(self._scan_wl, spectrum)
         if i % 3 == 0 or i == self._scan_delays.size - 1:
             self.canvas.update_trace(self._scan_trace)
             ac = autocorrelation(self._scan_trace[:, :i + 1])
