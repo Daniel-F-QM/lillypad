@@ -325,6 +325,26 @@ class ZaberStage(StageBase):
             self._conn = None
 
 
+def list_seabreeze_spectrometers(backend: str = "cseabreeze") -> list[tuple[str, str]]:
+    """Enumerate attached Ocean Optics spectrometers without adopting any.
+    Returns [(model, serial), ...]; entries whose metadata cannot be read come
+    back as "?" placeholders rather than being dropped. Lives here so the GUI
+    never touches the vendor SDK, and so seabreeze.use() precedes the
+    spectrometers import."""
+    import seabreeze
+    seabreeze.use(backend)
+    from seabreeze.spectrometers import list_devices
+    out = []
+    for dev in list_devices():
+        try:
+            model = str(getattr(dev, "model", "?"))
+            serial = str(getattr(dev, "serial_number", "?"))
+        except Exception:
+            model, serial = "?", "?"
+        out.append((model, serial))
+    return out
+
+
 class SeabreezeSpectrometer(SpectrometerBase):
     """Ocean Optics / Ocean Insight spectrometer via python-seabreeze."""
     def __init__(self, device=None, serial: str | None = None,

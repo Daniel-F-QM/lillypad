@@ -21,6 +21,7 @@ and shared with frog_gui.py via hardware.py / scan.py.
 """
 
 import sys
+import math
 import time
 import tempfile
 import threading
@@ -32,9 +33,9 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QDoubleSpinBox, QSpinBox, QCheckBox, QPushButton,
     QProgressBar, QFrame, QScrollArea, QSizePolicy, QStatusBar, QFileDialog,
-    QDialog, QToolBar, QSlider, QLineEdit, QMenu, QComboBox
+    QDialog, QToolBar, QSlider, QLineEdit, QMenu, QComboBox, QRubberBand
 )
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPointF, QSize
+from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPointF, QSize, QRect, QPoint
 from PySide6.QtGui import (QPalette, QColor, QFont, QIcon, QPixmap, QPainter,
                            QPen, QPolygonF, QAction, QActionGroup)
 import matplotlib
@@ -49,6 +50,7 @@ from matplotlib.figure import Figure
 
 from hardware import (SimulatedStage, SimulatedSpectrometer,
                       KinesisStage, ZaberStage, SeabreezeSpectrometer,
+                      list_seabreeze_spectrometers,
                       PULSE_SHAPES, DEFAULT_PULSE)
 from scan import (FrogScanConfig, FrogScanWorker, autocorrelation, fwhm,
                   position_to_delay_fs, delay_to_position_um,
@@ -678,6 +680,36 @@ class HardwareDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Spectrometer picker (modal — shown only when seabreeze finds 2+ devices)
+# ─────────────────────────────────────────────────────────────────────────────
+class SpectrometerPickerDialog(QDialog):
+    def __init__(self, devices, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Spectrometer")
+        self.setFixedWidth(360)
+        lay = QVBoxLayout(self); lay.setSpacing(10); lay.setContentsMargins(14, 14, 14, 14)
+        lbl = QLabel(f"{len(devices)} spectrometers found — choose one:")
+        lbl.setObjectName("dim")
+        lay.addWidget(lbl)
+        self.cmb = QComboBox()
+        for model, serial in devices:
+            self.cmb.addItem(f"{model}  [{serial}]", serial)
+        lay.addWidget(self.cmb)
+        row = QHBoxLayout()
+        b_cancel = QPushButton("Cancel"); b_cancel.clicked.connect(self.reject)
+        b_ok = QPushButton("Connect"); b_ok.setObjectName("accent")
+        b_ok.setDefault(True); b_ok.clicked.connect(self.accept)
+        row.addWidget(b_cancel); row.addWidget(b_ok)
+        lay.addLayout(row)
+
+    @staticmethod
+    def pick(parent, devices):
+        """Returns the chosen serial, or None on cancel."""
+        dlg = SpectrometerPickerDialog(devices, parent)
+        return dlg.cmb.currentData() if dlg.exec() == QDialog.Accepted else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Graphics settings dialog
 # ─────────────────────────────────────────────────────────────────────────────
 class GraphicsSettingsDialog(QDialog):
@@ -829,12 +861,15 @@ class GraphicsSettingsDialog(QDialog):
 # FIX 1 + 4 — blitting. The three live artists (spectrum line, FROG-trace image,
 # autocorrelation line) are marked `animated`, so a normal draw() skips them and
 # a cached background can be captured without them. Per-frame updates then just
-# restore that background and re-rasterize the single changed artist instead of
+# restore that background and re-rasterize the three animated artists instead of
 # redrawing every tick/spine/grid/label. A full draw_idle() (which re-captures
 # the background via the draw_event handler) is only issued when something static
 # actually changes — axis limits, theme, log scale, line width, proportions.
 # ─────────────────────────────────────────────────────────────────────────────
 class FrogCanvas(FigureCanvasQTAgg):
+    limits_changed = Signal()        # zoom/reset happened → window syncs dialog
+    log_toggle_requested = Signal()  # click on spectrum y-axis strip
+
     def __init__(self):
         self.fig = Figure(facecolor=PALETTE["plot_bg"])
         super().__init__(self.fig)
@@ -861,7 +896,19 @@ class FrogCanvas(FigureCanvasQTAgg):
 
         self.autoscale_y = False
         self.autoscale_x = True
+        self.autoscale_ac_x = True
+        self.autoscale_ac_y = True
         self._lw = 1.6
+
+        # ── Mouse interaction: rubber-band zoom + axis-click log toggle ──
+        # The rectangle is a Qt child widget composited above the canvas, so
+        # the blit background cache never contains it.
+        self._drag_ax = None
+        self._drag_start = None      # (x, y) in mpl display coords
+        self._rubber = QRubberBand(QRubberBand.Rectangle, self)
+        self.mpl_connect('button_press_event', self._on_press)
+        self.mpl_connect('motion_notify_event', self._on_motion)
+        self.mpl_connect('button_release_event', self._on_release)
 
         # ── Blitting state ────────────────────────────────────────────────
         # These three are drawn by hand every frame; exclude them from draw().
@@ -923,20 +970,143 @@ class FrogCanvas(FigureCanvasQTAgg):
         for ax, art in self._animated:
             ax.draw_artist(art)
 
-    def _blit(self, ax, artist):
-        """Fast path: repaint just `artist` over the cached background."""
+    def _blit(self):
+        """Fast path: repaint the animated artists over the cached background.
+        All three must be redrawn, not just the one that changed: the restore
+        wipes every animated artist out of the render buffer, and a buffer
+        missing some of them shows those plots vanished on the next full
+        widget repaint. (Restoring only one axes' patch via restore_region's
+        bbox argument is not an option — its sub-region path disagrees with
+        display coords on the y origin and lands the rect in the wrong place.)
+        """
         if self._bg is None:
             self.draw_idle()          # nothing cached yet — force a full draw
             return
         self.restore_region(self._bg)
-        ax.draw_artist(artist)
-        self.blit(ax.bbox)
+        for ax, art in self._animated:
+            ax.draw_artist(art)
+        self.blit(self.fig.bbox)
 
     def _on_first_draw(self, _event):   # retained for API parity; unused
         pass
 
+    # ── Mouse interaction ─────────────────────────────────────────────────
+    def _disp_to_qt(self, x, y):
+        """mpl display coords (physical px, origin bottom-left) →
+        Qt widget coords (logical px, origin top-left)."""
+        dpr = self.devicePixelRatioF()
+        return QPoint(round(x / dpr), round(self.height() - y / dpr))
+
+    def _hit_spec_yaxis(self, event):
+        """Click landed in the spectrum's y-axis tick-label strip? ax_spec is
+        the leftmost column, so everything left of its live bbox within its
+        vertical span belongs to its y-axis."""
+        bb = self.ax_spec.get_window_extent()
+        return event.x < bb.x0 and bb.y0 <= event.y <= bb.y1
+
+    def _cancel_drag(self):
+        self._rubber.hide()
+        self._drag_ax = None
+        self._drag_start = None
+
+    def _clamped_point(self, event):
+        """Current cursor position clamped to the drag axes' live bbox, so a
+        drag never extends into a neighboring axes or outside the figure."""
+        bb = self._drag_ax.get_window_extent()
+        return (min(max(event.x, bb.x0), bb.x1),
+                min(max(event.y, bb.y0), bb.y1))
+
+    def _on_press(self, event):
+        axes = (self.ax_spec, self.ax_trace, self.ax_ac)
+        if event.button == 3:
+            if self._drag_ax is not None:      # right-click aborts a drag
+                self._cancel_drag()
+            elif event.inaxes in axes:
+                self.reset_axes(event.inaxes)
+            return
+        if event.button != 1:
+            return
+        if event.inaxes in axes:
+            self._drag_ax = event.inaxes
+            self._drag_start = (event.x, event.y)
+        elif event.inaxes is None and self._hit_spec_yaxis(event):
+            self.log_toggle_requested.emit()
+
+    def _on_motion(self, event):
+        if self._drag_ax is None:
+            return
+        x0, y0 = self._drag_start
+        cx, cy = self._clamped_point(event)
+        # Show the rectangle only past the click threshold so a plain
+        # click never flashes it.
+        if max(abs(cx - x0), abs(cy - y0)) < 5 * self.devicePixelRatioF():
+            self._rubber.hide()
+            return
+        self._rubber.setGeometry(
+            QRect(self._disp_to_qt(x0, y0), self._disp_to_qt(cx, cy)).normalized())
+        self._rubber.show()
+
+    def _on_release(self, event):
+        if event.button != 1 or self._drag_ax is None:
+            return
+        ax = self._drag_ax
+        x0, y0 = self._drag_start
+        cx, cy = self._clamped_point(event)
+        self._cancel_drag()
+        thr = 5 * self.devicePixelRatioF()
+        if abs(cx - x0) < thr or abs(cy - y0) < thr:
+            return                             # plain click / degenerate drag
+        inv = ax.transData.inverted()          # includes any log transform
+        (dx0, dy0), (dx1, dy1) = inv.transform([(x0, y0), (cx, cy)])
+        xlo, xhi = sorted((dx0, dx1))
+        ylo, yhi = sorted((dy0, dy1))
+        self._apply_zoom(ax, xlo, xhi, ylo, yhi)
+
+    def _apply_zoom(self, ax, xlo, xhi, ylo, yhi):
+        ax.set_xlim(xlo, xhi)
+        ax.set_ylim(ylo, yhi)
+        # Freeze the matching autoscale and sync the limit caches, or the
+        # next data frame would snap the view straight back.
+        if ax is self.ax_spec:
+            self.autoscale_x = False
+            self.autoscale_y = False
+            self._xlim_cache = (xlo, xhi)
+            self._ylim_cache = (ylo, yhi)
+        elif ax is self.ax_ac:
+            self.autoscale_ac_x = False
+            self.autoscale_ac_y = False
+            self._ac_xlim_cache = (xlo, xhi)
+            self._ac_ylim_cache = (ylo, yhi)
+        # ax_trace: update_trace never touches limits, nothing to freeze.
+        self.draw_idle()
+        self.limits_changed.emit()
+
+    def reset_axes(self, ax):
+        """Right-click: restore the full data range and resume autoscaling."""
+        if ax is self.ax_spec:
+            self.fit_xy()                      # fits, but freezes autoscale…
+            self.autoscale_x = True            # …so re-enable live follow
+            self.autoscale_y = True
+        elif ax is self.ax_trace:
+            x0, x1, y0, y1 = self.im.get_extent()
+            self.ax_trace.set_xlim(x0, x1)
+            self.ax_trace.set_ylim(y0, y1)
+        elif ax is self.ax_ac:
+            self.autoscale_ac_x = True
+            self.autoscale_ac_y = True
+            if len(self.line_ac.get_xdata()) > 1:
+                self.ax_ac.set_autoscalex_on(True)
+                self.ax_ac.set_autoscaley_on(True)
+                self.ax_ac.relim()
+                self.ax_ac.autoscale_view()
+                self._ac_xlim_cache = self.ax_ac.get_xlim()
+                self._ac_ylim_cache = self.ax_ac.get_ylim()
+        self.draw_idle()
+        self.limits_changed.emit()
+
     def fit_y(self):
         """One-shot Y auto-fit; returns new (ymin, ymax)."""
+        self.ax_spec.set_autoscaley_on(True)
         self.ax_spec.relim()
         self.ax_spec.autoscale_view(scalex=False)
         self._ylim_cache = self.ax_spec.get_ylim()
@@ -945,6 +1115,10 @@ class FrogCanvas(FigureCanvasQTAgg):
 
     def fit_xy(self):
         """One-shot fit of both spectrum axes, then freezes auto-scale."""
+        # Any earlier set_xlim/set_ylim (spinboxes, rubber-band zoom) turned
+        # matplotlib's internal autoscale off, making autoscale_view a no-op.
+        self.ax_spec.set_autoscalex_on(True)
+        self.ax_spec.set_autoscaley_on(True)
         self.ax_spec.relim()
         self.ax_spec.autoscale_view()
         self.autoscale_x = False
@@ -969,7 +1143,11 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.ax_spec.set_yscale('log' if on else 'linear')
         if on:
             lo, hi = self.ax_spec.get_ylim()
-            if lo <= 0:
+            if hi <= 0:
+                # Entirely nonpositive view (possible after a zoom): a bottom
+                # clamp alone would leave an inverted log axis.
+                self.ax_spec.set_ylim(1.0, 10.0)
+            elif lo <= 0:
                 self.ax_spec.set_ylim(bottom=max(1.0, hi * 0.001))
         self._ylim_cache = self.ax_spec.get_ylim()
         self.draw_idle()
@@ -1011,6 +1189,7 @@ class FrogCanvas(FigureCanvasQTAgg):
             if xl != self._xlim_cache:
                 self.ax_spec.set_xlim(*xl); self._xlim_cache = xl; changed = True
         if self.autoscale_y:
+            self.ax_spec.set_autoscaley_on(True)
             self.ax_spec.relim()
             self.ax_spec.autoscale_view(scalex=False)
             yl = self.ax_spec.get_ylim()
@@ -1019,9 +1198,13 @@ class FrogCanvas(FigureCanvasQTAgg):
         if changed:
             self.draw_idle()          # limits moved: full redraw + re-cache bg
         else:
-            self._blit(self.ax_spec, self.line_spec)
+            self._blit()
 
     def init_trace(self, delays, wl):
+        # A new scan can span a different delay range; resume following it,
+        # mirroring the trace-view reset below.
+        self.autoscale_ac_x = True
+        self.autoscale_ac_y = True
         self.im.set_data(np.zeros((wl.size, delays.size)))
         self.im.set_extent([float(delays[0]), float(delays[-1]),
                             float(wl[0]), float(wl[-1])])
@@ -1033,24 +1216,26 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.im.set_data(trace)
         self.im.set_clim(0, max(float(trace.max()), 1.0))
         # Extent/limits are fixed by init_trace, so this is always a fast blit.
-        self._blit(self.ax_trace, self.im)
+        self._blit()
 
     def update_ac(self, delays, ac):
         self.line_ac.set_data(delays, ac)
         changed = False
-        if delays.size > 1:
+        if self.autoscale_ac_x and delays.size > 1:
             xl = (float(delays[0]), float(delays[-1]))
             if xl != self._ac_xlim_cache:
                 self.ax_ac.set_xlim(*xl); self._ac_xlim_cache = xl; changed = True
-        self.ax_ac.relim()
-        self.ax_ac.autoscale_view(scalex=False)
-        yl = self.ax_ac.get_ylim()
-        if yl != self._ac_ylim_cache:
-            self._ac_ylim_cache = yl; changed = True
+        if self.autoscale_ac_y:
+            self.ax_ac.set_autoscaley_on(True)
+            self.ax_ac.relim()
+            self.ax_ac.autoscale_view(scalex=False)
+            yl = self.ax_ac.get_ylim()
+            if yl != self._ac_ylim_cache:
+                self._ac_ylim_cache = yl; changed = True
         if changed:
             self.draw_idle()
         else:
-            self._blit(self.ax_ac, self.line_ac)
+            self._blit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1077,6 +1262,7 @@ class FrogWindow(QMainWindow):
 
         self.scan_cfg      = FrogScanConfig(delay_start_fs=-500, delay_stop_fs=500,
                                             delay_step_fs=13.3426, zero_pos_um=150000.0)
+        self._stage_units_fs = True     # jog/move fields default to fs
         self.background    = None
         self.last_spectrum = None
         self.result        = None
@@ -1181,7 +1367,13 @@ class FrogWindow(QMainWindow):
                 self.spec.stage = self.stage
             if isinstance(new_stage, SimulatedStage):
                 new_stage.move_to(_um_to_stage(self.scan_cfg.zero_pos_um))
+            else:
+                # Real stage: adopt its ACTUAL position as zero-delay so
+                # "Move to 0 fs" can never slam it into a travel limit.
+                self.scan_cfg.zero_pos_um = _stage_to_um(new_stage.get_position())
+            self._update_stage_unit_ranges()  # new travel + possibly new zero
             self._refresh_positions()   # inside the lock — we still own the stage
+        self._refresh_scan_um()         # zero may have moved: fs→um previews
         return True, ""
 
     def _apply_spectrometer(self, new_spec):
@@ -1225,8 +1417,9 @@ class FrogWindow(QMainWindow):
         if not ok:
             self._drop(stage)      # never adopted — don't leak the connection
             return False, err
-        self.status.showMessage(f"Stage: {stage.name}", 5000)
-        return True, f"Stage connected: {stage.name}"
+        self.status.showMessage(f"Stage: {stage.name} — zero at current position.", 5000)
+        return True, (f"Stage connected: {stage.name}. Zero-delay set to current "
+                      f"position ({self.scan_cfg.zero_pos_um:.1f} um).")
 
     def _connect_zaber_stage(self, port=None):
         try:
@@ -1237,8 +1430,9 @@ class FrogWindow(QMainWindow):
         if not ok:
             self._drop(stage)      # never adopted — release the serial port
             return False, err
-        self.status.showMessage(f"Stage: {stage.name}", 5000)
-        return True, f"Stage connected: {stage.name}"
+        self.status.showMessage(f"Stage: {stage.name} — zero at current position.", 5000)
+        return True, (f"Stage connected: {stage.name}. Zero-delay set to current "
+                      f"position ({self.scan_cfg.zero_pos_um:.1f} um).")
 
     def _use_sim_spectrometer(self):
         ok, err = self._apply_spectrometer(self._make_sim_spectrometer())
@@ -1249,7 +1443,21 @@ class FrogWindow(QMainWindow):
 
     def _connect_real_spectrometer(self):
         try:
-            spec = SeabreezeSpectrometer()
+            devices = list_seabreeze_spectrometers()  # quick USB descriptor query
+        except Exception as e:
+            return False, f"Spectrometer connect failed: {e}"
+        if not devices:
+            return False, "Spectrometer connect failed: No spectrometers found."
+        if len(devices) > 1:
+            serial = SpectrometerPickerDialog.pick(self.dlg_hardware, devices)
+            if serial is None:
+                return False, "Cancelled — spectrometer unchanged."
+        else:
+            serial = devices[0][1]
+        try:
+            # "?" = serial unreadable; fall back to first-device auto-connect.
+            spec = (SeabreezeSpectrometer(serial=serial)
+                    if serial and serial != "?" else SeabreezeSpectrometer())
         except Exception as e:
             return False, f"Spectrometer connect failed: {e}"
         ok, err = self._apply_spectrometer(spec)
@@ -1329,6 +1537,11 @@ class FrogWindow(QMainWindow):
         self.btn_autofit.clicked.connect(self._autofit_spectrum)
 
         self.dlg_graphics = GraphicsSettingsDialog(self.canvas, self)
+        # Mouse zoom/reset keeps the dialog's spinboxes and auto-scale
+        # checkboxes truthful; the y-axis click routes through chk_log so the
+        # checkbox stays the single source of truth for the log scale.
+        self.canvas.limits_changed.connect(self.dlg_graphics.sync_limits)
+        self.canvas.log_toggle_requested.connect(self.dlg_graphics.chk_log.toggle)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -1402,15 +1615,21 @@ class FrogWindow(QMainWindow):
         self.btn_minus.clicked.connect(lambda: self._jog(-1))
         self.btn_plus.clicked.connect(lambda: self._jog(+1))
         self.spin_step = QDoubleSpinBox()
-        self.spin_step.setRange(0.01, 100000); self.spin_step.setDecimals(2)
-        self.spin_step.setValue(100.0); self.spin_step.setSuffix(" um")
+        self.spin_step.setDecimals(0)
+        self.spin_step.setSuffix(" fs")     # value set after ranges, below
+        self.btn_units = QPushButton("fs")
+        self.btn_units.setFixedWidth(38)
+        self.btn_units.setToolTip("Toggle jog/move units between optical delay (fs) "
+                                  "and stage position (um)")
+        self.btn_units.clicked.connect(self._toggle_stage_units)
         jog.addWidget(self.btn_minus); jog.addWidget(self.spin_step); jog.addWidget(self.btn_plus)
+        jog.addWidget(self.btn_units)
         lay.addLayout(jog)
 
         mv = QHBoxLayout()
         self.spin_moveto = QDoubleSpinBox()
-        self.spin_moveto.setRange(0, 300000); self.spin_moveto.setDecimals(2)
-        self.spin_moveto.setSuffix(" um")
+        self.spin_moveto.setDecimals(0)
+        self.spin_moveto.setSuffix(" fs")
         self.btn_moveto = QPushButton("Move")
         self.btn_moveto.clicked.connect(self._move_absolute)
         mv.addWidget(self.spin_moveto); mv.addWidget(self.btn_moveto)
@@ -1445,6 +1664,8 @@ class FrogWindow(QMainWindow):
         self.btn_set_zero.setObjectName("accent")
         self.btn_set_zero.clicked.connect(self._mark_zero)
         lay.addWidget(self.btn_set_zero)
+        self._update_stage_unit_ranges()   # stage + scan_cfg exist by now
+        self.spin_step.setValue(100.0)     # after ranges: default 100 fs jog
         return grp
 
     def _build_scan_group(self):
@@ -1654,7 +1875,8 @@ class FrogWindow(QMainWindow):
     # ── Manual stage ──────────────────────────────────────────────────────────
     def _set_stage_controls_enabled(self, on):
         for w in (self.btn_minus, self.btn_plus, self.btn_moveto,
-                  self.btn_home, self.btn_goto_zero, self.btn_set_zero):
+                  self.btn_home, self.btn_goto_zero, self.btn_set_zero,
+                  self.btn_units):
             w.setEnabled(on)
 
     def _moving(self, on):
@@ -1694,13 +1916,66 @@ class FrogWindow(QMainWindow):
             self._moving(False)
             self._set_stage_controls_enabled(True)
 
+    def _travel_um(self):
+        """Stage travel in um; 300 mm fallback when the adapter reports none."""
+        t = getattr(self.stage, "travel_mm", None)
+        return _stage_to_um(t if t else 300.0)
+
+    def _update_stage_unit_ranges(self):
+        """Set spin_step/spin_moveto ranges for the active unit, the connected
+        stage's travel, and the current zero. Call after: unit toggle, stage
+        swap, zero change."""
+        travel_um = self._travel_um()
+        pf, z = self.scan_cfg.pass_factor, self.scan_cfg.zero_pos_um
+        if self._stage_units_fs:
+            # Inward rounding (ceil min, floor max) so every integer fs in
+            # range maps to a position strictly inside [0, travel].
+            self.spin_step.setRange(
+                1, math.floor(float(position_to_delay_fs(travel_um, 0.0, pf))))
+            self.spin_moveto.setRange(
+                math.ceil(float(position_to_delay_fs(0.0, z, pf))),
+                math.floor(float(position_to_delay_fs(travel_um, z, pf))))
+        else:
+            self.spin_step.setRange(0.01, travel_um)
+            self.spin_moveto.setRange(0.0, travel_um)
+
+    def _toggle_stage_units(self):
+        pf, z = self.scan_cfg.pass_factor, self.scan_cfg.zero_pos_um
+        step, move = self.spin_step.value(), self.spin_moveto.value()
+        self._stage_units_fs = not self._stage_units_fs
+        if self._stage_units_fs:
+            new_step = round(float(position_to_delay_fs(step, 0.0, pf)))
+            new_move = round(float(position_to_delay_fs(move, z, pf)))
+            suffix, dec = " fs", 0
+        else:
+            new_step = round(float(delay_to_position_um(step, 0.0, pf)))
+            new_move = round(float(delay_to_position_um(move, z, pf)))
+            suffix, dec = " um", 2
+        for s in (self.spin_step, self.spin_moveto):
+            s.setSuffix(suffix); s.setDecimals(dec)
+        self._update_stage_unit_ranges()   # ranges before values: no bad clamp
+        self.spin_step.setValue(new_step)
+        self.spin_moveto.setValue(new_move)
+        self.btn_units.setText("fs" if self._stage_units_fs else "um")
+
     def _jog(self, sign):
-        self._stage_action(
-            lambda: self.stage.move_by(_um_to_stage(sign * self.spin_step.value())))
+        v = self.spin_step.value()
+        step_um = (float(delay_to_position_um(v, 0.0, self.scan_cfg.pass_factor))
+                   if self._stage_units_fs else v)
+        def do():
+            # Clamped move_to instead of move_by: the target can never leave
+            # the travel range. get_position() runs inside the device lock.
+            cur = _stage_to_um(self.stage.get_position())
+            target = min(max(cur + sign * step_um, 0.0), self._travel_um())
+            self.stage.move_to(_um_to_stage(target))
+        self._stage_action(do)
 
     def _move_absolute(self):
-        self._stage_action(
-            lambda: self.stage.move_to(_um_to_stage(self.spin_moveto.value())))
+        v = self.spin_moveto.value()
+        pf, z = self.scan_cfg.pass_factor, self.scan_cfg.zero_pos_um
+        target_um = float(delay_to_position_um(v, z, pf)) if self._stage_units_fs else v
+        target_um = min(max(target_um, 0.0), self._travel_um())
+        self._stage_action(lambda: self.stage.move_to(_um_to_stage(target_um)))
 
     def _move_to_zero(self):
         self._stage_action(
@@ -1714,6 +1989,10 @@ class FrogWindow(QMainWindow):
             # get_position() is a device read like any other — take the lock.
             self.scan_cfg.zero_pos_um = _stage_to_um(self.stage.get_position())
         self._stage_action(mark)
+        # fs-mode values are delays and stay as typed — the zero moved, so the
+        # same delay now maps to the new (correct) absolute position. Only the
+        # ranges need recomputing; Qt clamps anything now out of range.
+        self._update_stage_unit_ranges()
         self._refresh_scan_um()
         self.status.showMessage(f"Zero-delay set to {self.scan_cfg.zero_pos_um:.2f} um.", 3000)
 
