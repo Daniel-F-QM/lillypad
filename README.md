@@ -54,7 +54,9 @@ and reusable without a GUI.
 ## Getting started
 
 Requires Python 3.13.
+
 Requires Visual C++ - e.g. x64 "Visual C++ Redistributable" (vc_redist.x64.exe)
+
 (likely) Requires Kinesis to be installed for Thorlabs stages to get the drivers
 
 !!! Important: if Python is installed through Anaconda it will give you an error "DLL load failed..." because it carries its own DLLs / search behaviour. If python is not installed otherwise, install the latests version and make sure you deactivate conda in your terminal if it starts up with it.
