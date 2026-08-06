@@ -2,11 +2,37 @@
 # Build with:  pyinstaller Lillypad.spec
 # Output:      dist/Lillypad/Lillypad.exe
 
+import glob
+import importlib.util
+import os
+
+# zaber-motion is a thin Python wrapper around a native core library shipped in
+# a sibling `zaber_motion_bindings` package that contains *no* Python module —
+# only the .dll. PyInstaller's import analysis therefore pulls in every
+# zaber_motion .py file and none of the actual library, and the frozen app dies
+# with "Could not find library zaber-motion-core-windows-amd64.dll" the moment
+# hardware.ZaberStage imports it.
+#
+# zaber_motion/bindings.py resolves the library as
+#     dirname(zaber_motion/bindings.py)/../zaber_motion_bindings/<lib name>
+# so the file has to land in <bundle>/zaber_motion_bindings/, next to the
+# zaber_motion package — hence the explicit dest dir below.
+_zaber_spec = importlib.util.find_spec('zaber_motion')
+if _zaber_spec is None:
+    raise SystemExit('zaber_motion is not installed in the build environment; '
+                     'run: pip install --no-deps -r requirements.txt')
+_zaber_bindings_dir = os.path.join(
+    os.path.dirname(os.path.dirname(_zaber_spec.origin)), 'zaber_motion_bindings')
+_zaber_libs = [(p, 'zaber_motion_bindings')
+               for p in glob.glob(os.path.join(_zaber_bindings_dir, 'zaber-motion-core-*'))]
+if not _zaber_libs:
+    raise SystemExit(f'No zaber-motion core library found in {_zaber_bindings_dir}; '
+                     'reinstall zaber_motion.')
 
 a = Analysis(
     ['frog_gui_fast.py'],
     pathex=[],
-    binaries=[],
+    binaries=_zaber_libs,
     datas=[('icons', 'icons')],
     hiddenimports=[],
     hookspath=[],
@@ -47,6 +73,8 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    # The ~19 MB zaber-motion core is a packed native library; UPX has no real
+    # gain on it and compressing it risks a load failure at runtime.
+    upx_exclude=[os.path.basename(src) for src, _ in _zaber_libs],
     name='Lillypad',
 )
