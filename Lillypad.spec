@@ -29,10 +29,25 @@ if not _zaber_libs:
     raise SystemExit(f'No zaber-motion core library found in {_zaber_bindings_dir}; '
                      'reinstall zaber_motion.')
 
+# libusb-1.0.dll ships as data inside the libusb_package wheel, which
+# hardware._ensure_libusb_dll() resolves via libusb_package.get_library_path()
+# — seabreeze's pyseabreeze backend (the default; the only one supporting the
+# newer Ocean Insight models) is dead without it. PyInstaller does not collect
+# in-package binaries by itself, so put the DLL back inside the package dir.
+_libusb_spec = importlib.util.find_spec('libusb_package')
+if _libusb_spec is None:
+    raise SystemExit('libusb_package is not installed in the build environment; '
+                     'run: pip install --no-deps -r requirements.txt')
+_libusb_dlls = [(p, 'libusb_package') for p in
+                glob.glob(os.path.join(os.path.dirname(_libusb_spec.origin), '*.dll'))]
+if not _libusb_dlls:
+    raise SystemExit('No libusb DLL found inside libusb_package; '
+                     'reinstall libusb-package.')
+
 a = Analysis(
     ['frog_gui_fast.py'],
     pathex=[],
-    binaries=_zaber_libs,
+    binaries=_zaber_libs + _libusb_dlls,
     # calibration_files/*.txt are SEED data: frog_gui_fast.seed_calibration_dir
     # copies them from the bundle to a user-editable calibration_files/ folder
     # next to the .exe on first run (only top-level files — Old/ stays behind).

@@ -60,7 +60,7 @@ from hardware import (SimulatedStage, SimulatedSpectrometer,
                       KinesisStage, ZaberStage, PiezoJenaStage,
                       SeabreezeSpectrometer, StitchedSpectrometer,
                       list_kinesis_stages, list_seabreeze_spectrometers,
-                      load_calibration_file,
+                      load_calibration_file, SEABREEZE_BACKENDS,
                       PULSE_SHAPES, DEFAULT_PULSE)
 from scan import (FrogScanConfig, FrogScanWorker, autocorrelation, fwhm,
                   position_to_delay_fs, delay_to_position_um,
@@ -616,6 +616,22 @@ class HardwareDialog(QDialog):
         prow.addWidget(b_ps); prow.addWidget(b_pr)
         lay.addLayout(prow)
 
+        # seabreeze backend switch. pyseabreeze is the default because it is
+        # the only backend that knows the newer Ocean Insight models; cseabreeze
+        # stays available for devices that only enumerate through the vendor
+        # C library. Applied on the next connect.
+        berow = QGridLayout(); berow.setSpacing(6)
+        berow.setColumnStretch(0, 0); berow.setColumnStretch(1, 1)
+        berow.addWidget(QLabel("Backend"), 0, 0)
+        self.cmb_backend = QComboBox()
+        for name in SEABREEZE_BACKENDS:
+            self.cmb_backend.addItem(name, name)
+        self.cmb_backend.setCurrentIndex(
+            max(0, self.cmb_backend.findData(self.main.seabreeze_backend)))
+        self.cmb_backend.currentIndexChanged.connect(self._on_backend)
+        berow.addWidget(self.cmb_backend, 0, 1)
+        lay.addLayout(berow)
+
         # Full-scale override. Without this, a spectrometer that does not
         # report `max_intensity` leaves saturation unchecked with no way out
         # from the UI. Blank = trust the device.
@@ -689,6 +705,33 @@ class HardwareDialog(QDialog):
         self._do(lambda: (True, "Full scale: " + (
             f"{self.main.scan_cfg.saturation_counts:.0f} counts (override)."
             if self.main.scan_cfg.saturation_counts else "auto (from device).")))
+
+    def _on_backend(self):
+        backend = self.cmb_backend.currentData()
+        if backend == self.main.seabreeze_backend:
+            return
+        # A device opened through the other backend cannot survive the switch
+        # (selecting a backend shuts the previous backend's API down), so
+        # release it now rather than severing it mid-use on the next connect.
+        live = self.main._live_seabreeze_backend()
+        if live is not None and live != backend:
+            ok, err = self.main._apply_spectrometer(
+                self.main._make_sim_spectrometer())
+            if not ok:
+                # Refused (scan running / feed busy) — keep the old choice.
+                self.cmb_backend.setCurrentIndex(
+                    max(0, self.cmb_backend.findData(
+                        self.main.seabreeze_backend)))
+                self._do(lambda: (False, err))
+                return
+            self.main.seabreeze_backend = backend
+            self._do(lambda: (True, f"Backend: {backend}. The spectrometer "
+                                    f"was released — press Real (seabreeze) "
+                                    f"to reconnect through it."))
+        else:
+            self.main.seabreeze_backend = backend
+            self._do(lambda: (True, f"Backend: {backend} — used on the next "
+                                    f"connect."))
 
     def _on_beam(self):
         self.main.sim_pulse = self.cmb_pulse.currentData()
@@ -1672,6 +1715,10 @@ class FrogWindow(QMainWindow):
         # to real hardware and back.
         self.sim_pulse     = DEFAULT_PULSE
         self.sim_gate      = "shg"
+        # seabreeze backend used for every enumeration/connect. pyseabreeze
+        # (the default, SEABREEZE_BACKENDS[0]) also covers the newer Ocean
+        # Insight models that cseabreeze does not know about.
+        self.seabreeze_backend = SEABREEZE_BACKENDS[0]
 
         self._build_hardware_sim()
 
@@ -1902,13 +1949,38 @@ class FrogWindow(QMainWindow):
         self.status.showMessage(f"Spectrometer: {self.spec.name}.", 4000)
         return True, f"Simulated: {self.spec.pulse_label}."
 
+    def _live_seabreeze_backend(self):
+        """Backend name of the currently connected real spectrometer(s), or
+        None when the current device is simulated."""
+        spec = self.spec
+        if isinstance(spec, StitchedSpectrometer):
+            spec = spec.spec1
+        if isinstance(spec, SeabreezeSpectrometer):
+            return getattr(spec, "backend", None)
+        return None
+
+    def _list_spectrometers(self):
+        """Enumerate via the selected backend. Selecting a backend tears the
+        previous backend's API down, which would sever a device still open
+        through it — so any such device is released (swapped for the
+        simulator) first. Raises RuntimeError when that release is refused
+        (scan running / feed busy)."""
+        live = self._live_seabreeze_backend()
+        if live is not None and live != self.seabreeze_backend:
+            ok, err = self._apply_spectrometer(self._make_sim_spectrometer())
+            if not ok:
+                raise RuntimeError(err)
+        return list_seabreeze_spectrometers(self.seabreeze_backend)
+
     def _connect_real_spectrometer(self):
+        backend = self.seabreeze_backend
         try:
-            devices = list_seabreeze_spectrometers()  # quick USB descriptor query
+            devices = self._list_spectrometers()  # quick USB descriptor query
         except Exception as e:
             return False, f"Spectrometer connect failed: {e}"
         if not devices:
-            return False, "Spectrometer connect failed: No spectrometers found."
+            return False, (f"Spectrometer connect failed: No spectrometers "
+                           f"found (backend: {backend}).")
         if len(devices) > 1:
             serial = DevicePickerDialog.pick(
                 self.dlg_hardware, devices, "Select Spectrometer",
@@ -1919,8 +1991,9 @@ class FrogWindow(QMainWindow):
             serial = devices[0][1]
         try:
             # "?" = serial unreadable; fall back to first-device auto-connect.
-            spec = (SeabreezeSpectrometer(serial=serial)
-                    if serial and serial != "?" else SeabreezeSpectrometer())
+            spec = (SeabreezeSpectrometer(serial=serial, backend=backend)
+                    if serial and serial != "?"
+                    else SeabreezeSpectrometer(backend=backend))
         except Exception as e:
             return False, f"Spectrometer connect failed: {e}"
         ok, err = self._apply_spectrometer(spec)
@@ -2226,7 +2299,7 @@ class FrogWindow(QMainWindow):
     def _populate_slot_spec_menu(self, sub, slot):
         sub.clear()
         try:
-            devices = list_seabreeze_spectrometers()
+            devices = self._list_spectrometers()
         except Exception as e:
             act = QAction(f"(enumeration failed: {e})", sub)
             act.setEnabled(False)
@@ -2329,7 +2402,8 @@ class FrogWindow(QMainWindow):
         opened = []
         try:
             for serial in (s1, s2):
-                opened.append(SeabreezeSpectrometer(serial=serial))
+                opened.append(SeabreezeSpectrometer(
+                    serial=serial, backend=self.seabreeze_backend))
             for spec, cal in zip(opened, self._multi["cals"]):
                 if cal is not None:
                     spec.set_calibration(cal)
@@ -2368,7 +2442,8 @@ class FrogWindow(QMainWindow):
                 return False, err
             single = None
             try:
-                single = SeabreezeSpectrometer(serial=keep_serial)
+                single = SeabreezeSpectrometer(serial=keep_serial,
+                                               backend=self.seabreeze_backend)
                 if keep_cal is not None:
                     single.set_calibration(keep_cal)
             except Exception as e:

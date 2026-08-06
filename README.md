@@ -112,6 +112,19 @@ Kinesis and Seabreeze both enumerate first and pop a picker when more than one
 device is attached. Zaber and Piezo Jena auto-scan serial ports when no port is
 given.
 
+**Spectrometer backends.** python-seabreeze has two backends and the
+**Backend** box in the Hardware dialog switches between them (applied on the
+next connect). The default is **pyseabreeze**, the pure-Python backend — it is
+the only one that supports the newer Ocean Insight models (SR/ST/HDX series).
+**cseabreeze**, the vendor C library, remains selectable for older devices
+that misbehave through pyseabreeze. pyseabreeze talks USB through `pyusb`,
+which needs a libusb driver: the `libusb-package` wheel in
+`requirements.txt` provides the DLL on Windows (Lillypad puts it on `PATH`
+automatically), and the device itself must be bound to a WinUSB/libusb
+driver — `seabreeze_os_setup` (above) installs Ocean's drivers; if the device
+still does not enumerate, bind its USB interface to **WinUSB** with
+[Zadig](https://zadig.akeo.ie/).
+
 **Kinesis stages.** `KinesisStage` identifies the stage from the model number
 its controller reports before driving it, and calibrates it either from a
 `STAGE_CONFIGS` entry in [hardware.py](hardware.py) (needed for the LTS300C/M,

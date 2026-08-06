@@ -21,7 +21,9 @@ with only numpy installed (no pylablib / seabreeze needed to run the sims).
 from __future__ import annotations
 
 import abc
+import os
 import re
+import sys
 import time
 import numpy as np
 from pathlib import Path
@@ -656,14 +658,75 @@ class PiezoJenaStage(StageBase):
             self._ser = None
 
 
-def list_seabreeze_spectrometers(backend: str = "cseabreeze") -> list[tuple[str, str]]:
+# Both python-seabreeze backends, in the order the GUI offers them. pyseabreeze
+# first: it is the only backend that supports the newer Ocean Insight models
+# (SR/ST/HDX series), while the devices cseabreeze covers also work through it.
+SEABREEZE_BACKENDS = ("pyseabreeze", "cseabreeze")
+
+
+def _ensure_libusb_dll() -> None:
+    """pyseabreeze drives USB through pyusb, which on Windows locates
+    libusb-1.0.dll by searching PATH — it knows nothing about the pip-installed
+    `libusb-package` wheel that actually carries the DLL. Bridge the two by
+    prepending the wheel's DLL folder to PATH (idempotent, no-op if the wheel
+    is missing or a system-wide libusb already exists)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import libusb_package
+        dll_dir = str(Path(libusb_package.get_library_path()).parent)
+    except Exception:
+        return
+    if dll_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = dll_dir + os.pathsep + os.environ["PATH"]
+
+
+def select_seabreeze_backend(backend: str) -> None:
+    """Make `backend` ("pyseabreeze" or "cseabreeze") the active seabreeze
+    backend. seabreeze binds its backend lazily on first use and then caches
+    it in three places, so switching at runtime means clearing all three;
+    otherwise seabreeze.use() only warns and the old backend stays live.
+    Any spectrometer opened through the previous backend must already be
+    closed — its API is shut down here."""
+    if backend not in SEABREEZE_BACKENDS:
+        raise ValueError(f"backend must be one of {SEABREEZE_BACKENDS}, "
+                         f"got {backend!r}")
+    if backend == "pyseabreeze":
+        _ensure_libusb_dll()
+    import seabreeze
+    import seabreeze.backends
+    mod = sys.modules.get("seabreeze.spectrometers")
+    cached = None
+    if mod is not None:
+        # The lazy binding lands in either place first depending on whether
+        # list_devices() or Spectrometer() ran first — check both.
+        descriptor = mod.Spectrometer.__dict__["_backend"]
+        cached = mod.__dict__.get("_lib") or descriptor._backend
+    if cached is not None and cached.__name__.endswith(backend):
+        return                      # already live — nothing to reset
+    if cached is not None:
+        api = getattr(mod.list_devices, "_api", None)
+        if api is not None:
+            try:
+                api.shutdown()
+            except Exception:
+                pass
+            del mod.list_devices._api
+        mod.__dict__.pop("_lib", None)
+        mod.__dict__.pop("SeaBreezeDevice", None)
+        descriptor._backend = None
+    if (seabreeze.backends.BackendConfig.requested != backend
+            or cached is not None):
+        seabreeze.use(backend)
+
+
+def list_seabreeze_spectrometers(backend: str = "pyseabreeze") -> list[tuple[str, str]]:
     """Enumerate attached Ocean Optics spectrometers without adopting any.
     Returns [(model, serial), ...]; entries whose metadata cannot be read come
     back as "?" placeholders rather than being dropped. Lives here so the GUI
-    never touches the vendor SDK, and so seabreeze.use() precedes the
+    never touches the vendor SDK, and so backend selection precedes the
     spectrometers import."""
-    import seabreeze
-    seabreeze.use(backend)
+    select_seabreeze_backend(backend)
     from seabreeze.spectrometers import list_devices
     out = []
     for dev in list_devices():
@@ -679,9 +742,9 @@ def list_seabreeze_spectrometers(backend: str = "cseabreeze") -> list[tuple[str,
 class SeabreezeSpectrometer(SpectrometerBase):
     """Ocean Optics / Ocean Insight spectrometer via python-seabreeze."""
     def __init__(self, device=None, serial: str | None = None,
-                 backend: str = "cseabreeze"):
-        import seabreeze
-        seabreeze.use(backend)
+                 backend: str = "pyseabreeze"):
+        select_seabreeze_backend(backend)
+        self.backend = backend      # the GUI checks this before backend swaps
         from seabreeze.spectrometers import Spectrometer, list_devices
 
         if device is not None:
