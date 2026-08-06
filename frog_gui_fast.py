@@ -13,6 +13,12 @@ side-by-side and compared:
       actually produces frames), instead of a fixed 80 ms QTimer.
   (4) The scan build-up (FROG trace + autocorrelation) is blitted too, so each
       column costs at most one small redraw instead of two full-figure redraws.
+  (5) Latest-frame-wins display: worker signals only store their payload; a
+      fixed-rate GUI timer renders whatever is newest. On machines where a
+      render costs more than the acquisition interval, stale frames are
+      dropped instead of piling up in the event queue, so the display can no
+      longer fall progressively behind real time. Live-feed frames also use a
+      cheaper blit that skips re-rasterizing the (static) FROG trace image.
 
 Everything else (layout, controls, hardware layer, scan engine) is unchanged
 and shared with frog_gui.py via hardware.py / scan.py.
@@ -1077,6 +1083,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._trace_thresh = 0.0     # display floor, fraction of peak (0 = off)
         self._cmap_name    = "magma"
         self._cmap_rev     = False
+        self._bg_static    = None    # defined before _apply_cmap touches it
         self._apply_cmap()           # installs the masked-pixel colour
 
         # ── Mouse interaction: rubber-band zoom + axis-click log toggle ──
@@ -1098,6 +1105,15 @@ class FrogCanvas(FigureCanvasQTAgg):
                           (self.ax_trace, self.im),
                           (self.ax_ac, self.line_ac)]
         self._bg = None            # cached full-figure background (no animated)
+        # Background with the trace image + AC line already composited, so a
+        # live spectrum frame only has to draw the spectrum line on top.
+        # Invalidated whenever either of those artists (or the figure) changes.
+        self._bg_static = None
+        # batch(): collapse several update_* calls into one blit/draw.
+        self._batch = False
+        self._want_blit = False
+        self._want_full = False
+        self._clim_peak = None     # last clim top actually applied to the image
         # Cache last-applied limits so we only force a full redraw when they
         # actually move (autoscale otherwise re-sets identical limits each frame).
         self._xlim_cache = None
@@ -1137,6 +1153,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         name = self._cmap_name + ("_r" if self._cmap_rev else "")
         self.im.set_cmap(
             matplotlib.colormaps[name].with_extremes(bad=PALETTE["plot_bg"]))
+        self._bg_static = None   # composited trace pixels are now stale
 
     def apply_palette(self, pal):
         """Recolor the figure for a theme switch (light/dark)."""
@@ -1158,6 +1175,7 @@ class FrogCanvas(FigureCanvasQTAgg):
             p = self.ax_trace.get_position(); self._ay_trace = (p.y0, p.height)
             p = self.ax_ac.get_position();    self._ay_ac    = (p.y0, p.height)
         self._bg = self.copy_from_bbox(self.fig.bbox)
+        self._bg_static = None       # figure changed; recomposite lazily
         for ax, art in self._animated:
             ax.draw_artist(art)
 
@@ -1177,6 +1195,58 @@ class FrogCanvas(FigureCanvasQTAgg):
         for ax, art in self._animated:
             ax.draw_artist(art)
         self.blit(self.fig.bbox)
+
+    def _blit_spec(self):
+        """Cheaper fast path for live-feed frames, where only the spectrum
+        line moves: composite the (static) trace image and AC line into a
+        second cached background once, then each frame draw just the spectrum
+        line over it. Avoids re-rasterizing the AxesImage — by far the most
+        expensive artist — every frame. Uses only full-figure copy/restore,
+        never restore_region's sub-region path (see _blit's docstring).
+        """
+        if self._bg is None:
+            self.draw_idle()
+            return
+        if self._bg_static is None:
+            self.restore_region(self._bg)
+            self.ax_trace.draw_artist(self.im)
+            self.ax_ac.draw_artist(self.line_ac)
+            self._bg_static = self.copy_from_bbox(self.fig.bbox)
+        self.restore_region(self._bg_static)
+        self.ax_spec.draw_artist(self.line_spec)
+        self.blit(self.fig.bbox)
+
+    # ── Render-request coalescing ─────────────────────────────────────────
+    # update_spectrum/update_trace/update_ac end in one of these instead of
+    # calling _blit()/draw_idle() directly. Outside a batch the behavior is
+    # identical; inside canvas.batch() the requests are merged so a scan tick
+    # that updates all three plots costs one blit (or one full draw) total.
+    def _request_blit(self, spec_only=False):
+        if self._batch:
+            self._want_blit = True
+        elif spec_only:
+            self._blit_spec()
+        else:
+            self._blit()
+
+    def _request_full(self):
+        if self._batch:
+            self._want_full = True
+        else:
+            self.draw_idle()
+
+    @contextmanager
+    def batch(self):
+        self._batch = True
+        self._want_blit = self._want_full = False
+        try:
+            yield
+        finally:
+            self._batch = False
+            if self._want_full:
+                self.draw_idle()   # repaints everything + recaches background
+            elif self._want_blit:
+                self._blit()
 
     def _on_first_draw(self, _event):   # retained for API parity; unused
         pass
@@ -1427,9 +1497,9 @@ class FrogCanvas(FigureCanvasQTAgg):
             if yl != self._ylim_cache:
                 self._ylim_cache = yl; changed = True
         if changed:
-            self.draw_idle()          # limits moved: full redraw + re-cache bg
+            self._request_full()      # limits moved: full redraw + re-cache bg
         else:
-            self._blit()
+            self._request_blit(spec_only=True)
 
     def init_trace(self, delays, wl):
         # A new scan can span a different delay range; resume following it,
@@ -1437,6 +1507,8 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.autoscale_ac_x = True
         self.autoscale_ac_y = True
         self._trace_raw = np.zeros((wl.size, delays.size))
+        self._clim_peak = None
+        self._bg_static = None
         self.im.set_data(self._trace_raw)
         # The extent is the data -> axes mapping and must always track the new
         # scan, even under manual bounds — otherwise the columns would land in
@@ -1469,28 +1541,39 @@ class FrogCanvas(FigureCanvasQTAgg):
         data = (np.ma.masked_less(raw, self._trace_thresh * peak)
                 if self._trace_thresh > 0 else raw)
         self.im.set_data(data)
-        self.im.set_clim(0, peak)
+        # set_clim invalidates the image's cached RGBA (full re-normalize +
+        # re-colormap), so only touch it when the peak moved visibly (>0.5%).
+        if self._clim_peak is None or abs(peak - self._clim_peak) > 0.005 * self._clim_peak:
+            self.im.set_clim(0, peak)
+            self._clim_peak = peak
+        self._bg_static = None        # trace pixels changed
         # Extent/limits are fixed by init_trace, so this is always a fast blit.
-        self._blit()
+        self._request_blit()
 
     def update_ac(self, delays, ac):
         self.line_ac.set_data(delays, ac)
+        self._bg_static = None        # AC line changed
         changed = False
         if self.autoscale_ac_x and delays.size > 1:
             xl = (float(delays[0]), float(delays[-1]))
             if xl != self._ac_xlim_cache:
                 self.ax_ac.set_xlim(*xl); self._ac_xlim_cache = xl; changed = True
-        if self.autoscale_ac_y:
-            self.ax_ac.set_autoscaley_on(True)
-            self.ax_ac.relim()
-            self.ax_ac.autoscale_view(scalex=False)
-            yl = self.ax_ac.get_ylim()
-            if yl != self._ac_ylim_cache:
+        if self.autoscale_ac_y and ac.size:
+            # Stepped autoscale: during a scan the AC peak grows with nearly
+            # every column, and each ylim move forces a full redraw. Grow with
+            # 25% headroom so limits only step a handful of times per scan,
+            # and shrink only once the data has fallen well below the view.
+            dmax = float(ac.max())
+            dmin = min(0.0, float(ac.min()))
+            lo, hi = self._ac_ylim_cache if self._ac_ylim_cache else (0.0, 0.0)
+            if dmax > hi or dmax < 0.55 * hi or dmin < lo:
+                yl = (dmin, dmax * 1.25 if dmax > 0 else 1.0)
+                self.ax_ac.set_ylim(*yl)
                 self._ac_ylim_cache = yl; changed = True
         if changed:
-            self.draw_idle()
+            self._request_full()
         else:
-            self._blit()
+            self._request_blit()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1516,7 +1599,7 @@ class FrogWindow(QMainWindow):
         self._theme = "dark"
 
         self.scan_cfg      = FrogScanConfig(delay_start_fs=-500, delay_stop_fs=500,
-                                            delay_step_fs=13.3426, zero_pos_um=150000.0)
+                                            delay_step_fs=1.0, zero_pos_um=150000.0)
         self._stage_units_fs = True     # jog/move fields default to fs
         self.background    = None
         self.last_spectrum = None
@@ -1551,6 +1634,11 @@ class FrogWindow(QMainWindow):
 
         self._build_ui()
 
+        # The device default (100 ms) and the spinbox default differ; push the
+        # spinbox value so the display matches reality. Safe without the
+        # device lock — the feed thread doesn't exist yet.
+        self.spec.set_integration_time(self.spin_integration.value())
+
         self.stage.move_to(_um_to_stage(self.scan_cfg.zero_pos_um))
         self._refresh_positions()
 
@@ -1560,6 +1648,24 @@ class FrogWindow(QMainWindow):
         self._feed.start()
         if self.btn_feed.isChecked():
             self._feed.resume()
+
+        # FIX 5 — latest-frame-wins display. The worker signals above only
+        # *store* their payload (O(1)); all rendering happens here, at a fixed
+        # cadence, on whatever data is newest. On a machine where a render
+        # costs more than the acquisition interval, frames are overwritten
+        # (dropped) instead of piling up in the Qt event queue — the display
+        # can no longer fall progressively behind real time.
+        self._live_frame  = None     # newest (wl, raw) from the live feed
+        self._sat_frame   = None     # highest-peak raw frame since last tick
+        self._sat_peak    = -1.0     # ...so dropped frames can't hide clipping
+        self._scan_dirty  = False    # a scan column arrived since last tick
+        self._scan_last_i = -1
+        self._scan_col    = None
+        self._scan_pos_um = 0.0
+        self._display_timer = QTimer(self)
+        self._display_timer.setInterval(60)      # ~16 fps display cadence
+        self._display_timer.timeout.connect(self._display_tick)
+        self._display_timer.start()
 
     # ── Shared-device access ─────────────────────────────────────────────────
     def _scan_running(self):
@@ -1862,7 +1968,7 @@ class FrogWindow(QMainWindow):
         lay.addWidget(self.btn_feed)
         lay.addWidget(QLabel("Integration Time"))
         self.spin_integration = QSpinBox()
-        self.spin_integration.setRange(1, 10000); self.spin_integration.setValue(100)
+        self.spin_integration.setRange(1, 10000); self.spin_integration.setValue(10)
         self.spin_integration.setSuffix("  ms")
         # Debounced: set_integration_time is a device call, so it has to take
         # the hardware off the feed thread first. Doing that on every spinbox
@@ -1966,7 +2072,7 @@ class FrogWindow(QMainWindow):
         self.spin_step_fs = QDoubleSpinBox()
         self.eq_start = row(0, "Start", self.spin_start, " fs", 1, -1e6, 1e6, -500.0)
         self.eq_stop  = row(1, "Stop",  self.spin_stop,  " fs", 1, -1e6, 1e6,  500.0)
-        row(2, "Step", self.spin_step_fs, " fs", 4, 0.0001, 1e5, 13.3426)
+        row(2, "Step", self.spin_step_fs, " fs", 4, 0.0001, 1e5, 1.0)
         lay.addLayout(g)
         for s in (self.spin_start, self.spin_stop):
             s.valueChanged.connect(self._refresh_scan_um)
@@ -2088,13 +2194,20 @@ class FrogWindow(QMainWindow):
 
     # ── Live feed ─────────────────────────────────────────────────────────────
     def _on_spectrum(self, wl, raw):
-        """Slot for LiveFeedWorker.spectrum_ready — runs on the GUI thread."""
-        self.last_spectrum = raw
-        self._update_saturation(raw)
-        spectrum = raw
-        if self.chk_dark.isChecked() and self.background is not None:
-            spectrum = np.clip(raw - self.background, 0, None)
-        self.canvas.update_spectrum(wl, spectrum)
+        """Slot for LiveFeedWorker.spectrum_ready — runs on the GUI thread.
+
+        Deliberately O(1): it only records the newest frame for _display_tick
+        to render. Doing the rendering here let the event queue grow without
+        bound whenever a render outlasted the acquisition interval (weak
+        machines), and the display lagged further behind every second.
+        """
+        self._live_frame = (wl, raw)
+        # Keep the worst (highest-peak) frame between ticks so a transiently
+        # clipped frame that never gets displayed still trips the lamp.
+        p = float(raw.max()) if raw.size else 0.0
+        if p > self._sat_peak:
+            self._sat_peak = p
+            self._sat_frame = raw
         if self._pending_fit:
             self._pending_fit = False
             QTimer.singleShot(150, self._autofit_spectrum)
@@ -2102,6 +2215,25 @@ class FrogWindow(QMainWindow):
         # feed thread's own acquire() (which, for the simulator, itself reads
         # the stage). The readout is instead refreshed after every move we make
         # and from the scan worker's per-column read-back.
+
+    def _display_tick(self):
+        """Render the newest pending data — scan column or live frame."""
+        if self._scan_dirty:
+            self._render_scan_frame()
+            return
+        if self._live_frame is None:
+            return
+        wl, raw = self._live_frame
+        self._live_frame = None
+        self.last_spectrum = raw
+        self._update_saturation(self._sat_frame if self._sat_frame is not None
+                                else raw)
+        self._sat_frame = None
+        self._sat_peak = -1.0
+        spectrum = raw
+        if self.chk_dark.isChecked() and self.background is not None:
+            spectrum = np.clip(raw - self.background, 0, None)
+        self.canvas.update_spectrum(wl, spectrum)
 
     def _autofit_spectrum(self):
         """One-shot fit of spectrum X + Y; syncs Graphics Settings spinboxes."""
@@ -2332,6 +2464,11 @@ class FrogWindow(QMainWindow):
         self._scan_trace  = np.zeros((wl.size, delays.size))
         self._scan_delays = delays
         self._scan_wl     = wl
+        # A pending render from a previous (aborted) scan must not fire
+        # against the fresh, differently-sized arrays.
+        self._scan_dirty  = False
+        self._scan_last_i = -1
+        self._live_frame  = None     # park any leftover live-feed frame too
         self.canvas.init_trace(delays, wl)
         self._reset_saturation(); self.progress.setValue(0)
 
@@ -2353,29 +2490,43 @@ class FrogWindow(QMainWindow):
         self.progress.setValue(int(100 * done / total))
 
     def _on_column(self, i, delay_fs, pos_um, col):
+        """Slot for FrogScanWorker.column_ready — O(1), like _on_spectrum.
+
+        Every column is RECORDED here (the data path must never drop), but
+        rendering is deferred to _display_tick so a slow machine skips
+        intermediate redraws instead of queuing them up.
+        """
         self._scan_trace[:, i] = col
-        self.lbl_pos.setText(f"{pos_um:.2f} um")
-        # Keep the spectrum panel alive through the scan. The live feed is
-        # parked (the worker owns the device), so the column the scan just
-        # measured is the only spectrum there is — reusing it costs no extra
-        # device traffic. Cadence is one frame per delay point, i.e. the real
-        # acquisition rate, rather than the feed's.
-        #
-        # Trace only, never the headroom lamp: `col` is an average of
-        # n_average frames, so its peak sits below any single frame's and
-        # would under-report clipping. Saturation during a scan is reported
-        # per-frame by the worker via saturation_warning -> _on_saturation.
-        if self._scan_wl is not None:
-            spectrum = col
-            if self.chk_dark.isChecked() and self.background is not None:
-                spectrum = np.clip(col - self.background, 0, None)
-            self.canvas.update_spectrum(self._scan_wl, spectrum)
-        if i % 3 == 0 or i == self._scan_delays.size - 1:
+        self._scan_last_i = i
+        self._scan_col = col
+        self._scan_pos_um = pos_um
+        self._scan_dirty = True
+
+    def _render_scan_frame(self):
+        """Draw the in-progress scan from the newest recorded column."""
+        self._scan_dirty = False
+        i = self._scan_last_i
+        self.lbl_pos.setText(f"{self._scan_pos_um:.2f} um")
+        ac = autocorrelation(self._scan_trace[:, :i + 1])
+        # One blit for all three panels instead of three.
+        with self.canvas.batch():
+            # Keep the spectrum panel alive through the scan. The live feed is
+            # parked (the worker owns the device), so the column the scan just
+            # measured is the only spectrum there is.
+            #
+            # Trace only, never the headroom lamp: `col` is an average of
+            # n_average frames, so its peak sits below any single frame's and
+            # would under-report clipping. Saturation during a scan is reported
+            # per-frame by the worker via saturation_warning -> _on_saturation.
+            if self._scan_wl is not None:
+                spectrum = self._scan_col
+                if self.chk_dark.isChecked() and self.background is not None:
+                    spectrum = np.clip(spectrum - self.background, 0, None)
+                self.canvas.update_spectrum(self._scan_wl, spectrum)
             self.canvas.update_trace(self._scan_trace)
-            ac = autocorrelation(self._scan_trace[:, :i + 1])
             self.canvas.update_ac(self._scan_delays[:i + 1], ac)
-            f = fwhm(self._scan_delays[:i + 1], ac)
-            self.lbl_fwhm.setText(f"AC FWHM:  {f:.1f} fs" if np.isfinite(f) else "AC FWHM:  — fs")
+        f = fwhm(self._scan_delays[:i + 1], ac)
+        self.lbl_fwhm.setText(f"AC FWHM:  {f:.1f} fs" if np.isfinite(f) else "AC FWHM:  — fs")
 
     def _on_background(self, which, spectrum):
         self.status.showMessage(f"Background ({which}) captured.", 2500)
@@ -2403,6 +2554,8 @@ class FrogWindow(QMainWindow):
 
     def _on_finished(self, result):
         self.result = result
+        # The final render below supersedes any pending intermediate tick.
+        self._scan_dirty = False
         self.canvas.update_trace(result.trace)
         ac = result.autocorrelation()
         self.canvas.update_ac(result.delays_fs, ac)
@@ -2470,6 +2623,7 @@ class FrogWindow(QMainWindow):
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
     def closeEvent(self, event):
+        self._display_timer.stop()
         self._feed.stop()
         self._feed.wait(2000)
         if self._worker is not None and self._worker.isRunning():
