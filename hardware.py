@@ -24,8 +24,22 @@ import abc
 import re
 import time
 import numpy as np
+from pathlib import Path
 
 C_NM_PER_FS = 299.792458   # speed of light, nm/fs (used only by the simulator)
+
+
+def load_calibration_file(path) -> tuple[np.ndarray, np.ndarray]:
+    """Parse an intensity-calibration text file: two whitespace-separated
+    columns, wavelength (nm) and multiplicative factor, '#' comments allowed.
+    Returns (wavelengths, factors) sorted by wavelength."""
+    data = np.atleast_2d(np.loadtxt(path, comments="#"))
+    if data.shape[0] < 2 or data.shape[1] < 2:
+        raise RuntimeError(
+            f"{Path(path).name}: expected two columns (wavelength_nm factor) "
+            f"with at least two rows, got data of shape {data.shape}.")
+    order = np.argsort(data[:, 0])
+    return data[order, 0], data[order, 1]
 
 
 # ===========================================================================
@@ -95,6 +109,38 @@ class SpectrometerBase(abc.ABC):
     @abc.abstractmethod
     def acquire(self) -> np.ndarray:
         """Return a single spectrum (counts vs pixel)."""
+
+    # ── Intensity calibration ────────────────────────────────────────────────
+    # Per-pixel factors the raw counts are multiplied by, or None for raw
+    # output. Deliberately NOT folded into acquire(): saturation is a property
+    # of raw ADC counts, so consumers must check saturation on acquire()'s
+    # output and only then run it through calibrate().
+    calibration_name: str | None = None
+    _cal_pixels: np.ndarray | None = None
+
+    def set_calibration(self, path) -> None:
+        """Load a calibration file (see load_calibration_file) and hold it
+        interpolated onto this device's pixel grid. Pixels outside the file's
+        wavelength range hold the edge factor rather than extrapolating."""
+        wl, fac = load_calibration_file(path)
+        self._cal_pixels = np.interp(np.asarray(self.wavelengths, float),
+                                     wl, fac)
+        self.calibration_name = Path(path).stem
+
+    def clear_calibration(self) -> None:
+        self._cal_pixels = None
+        self.calibration_name = None
+
+    def calibrate(self, counts: np.ndarray) -> np.ndarray:
+        """Apply the loaded intensity calibration (identity when none)."""
+        cal = self._cal_pixels
+        return counts if cal is None else counts * cal
+
+    def calibration_targets(self) -> list["SpectrometerBase"]:
+        """The physical spectrometers a calibration file can be assigned to:
+        [self], except for composites like StitchedSpectrometer, which expose
+        their members so each can take its own file."""
+        return [self]
 
     def disconnect(self) -> None:
         pass
@@ -678,6 +724,114 @@ class SeabreezeSpectrometer(SpectrometerBase):
             self._spec.close()
         except Exception:
             pass
+
+
+class StitchedSpectrometer(SpectrometerBase):
+    """Two spectrometers with overlapping wavelength ranges presented as ONE
+    device on a common grid.
+
+    spec1 is whichever device reaches the lower maximum wavelength (the
+    "bluer" one). Each member's own intensity calibration is applied to its
+    raw frame BEFORE interpolation and stitching — that is what makes the two
+    halves comparable — so calibrate() on the stitched device itself stays the
+    identity and consumers cannot double-apply anything. spec1 is additionally
+    scaled by `stitch_factor` (fit or set by hand) to absorb any residual
+    sensitivity mismatch; in the overlap the two contributions are averaged.
+
+    max_counts is None on purpose: counts on the common grid mix two detectors
+    and two calibrations, so no single ADC full scale applies. Saturation goes
+    unchecked unless the user sets a Full scale override.
+    """
+    def __init__(self, spec_a: SpectrometerBase, spec_b: SpectrometerBase):
+        wl_a = np.asarray(spec_a.wavelengths, float)
+        wl_b = np.asarray(spec_b.wavelengths, float)
+        if wl_a.max() <= wl_b.max():
+            self.spec1, self.spec2 = spec_a, spec_b
+            wl1, wl2 = wl_a, wl_b
+        else:
+            self.spec1, self.spec2 = spec_b, spec_a
+            wl1, wl2 = wl_b, wl_a
+        if wl2.min() >= wl1.max():
+            raise RuntimeError(
+                f"No spectral overlap between {self.spec1.name} "
+                f"({wl1.min():.0f}–{wl1.max():.0f} nm) and {self.spec2.name} "
+                f"({wl2.min():.0f}–{wl2.max():.0f} nm) — stitching needs "
+                f"overlapping wavelength ranges.")
+        self._wl1, self._wl2 = wl1, wl2
+        # Common grid at the finer of the two pixel spacings (median: real
+        # spectrometer grids are not perfectly uniform).
+        dwl = min(float(np.median(np.diff(wl1))), float(np.median(np.diff(wl2))))
+        self._wl = np.arange(wl1.min(), wl2.max(), dwl)
+        #  |-- spec1 only --|== overlap: average ==|-- spec2 only --|
+        self._m1  = self._wl <= wl2.min()
+        self._m2  = self._wl >= wl1.max()
+        self._ovl = ~(self._m1 | self._m2)
+        self.stitch_factor = 1.0
+        self.name = f"stitched: {self.spec1.name} + {self.spec2.name}"
+        self.max_counts = None
+        self.integration_ms = float(getattr(self.spec1, "integration_ms", 100.0))
+        # RAW (pre-calibration) frames of the most recent acquire, one per
+        # member. This is what per-device saturation alarms judge: each frame
+        # against its own member's max_counts. Tuple assignment is atomic, so
+        # the GUI thread may read this while the feed thread acquires.
+        self.last_member_raw: tuple[np.ndarray, np.ndarray] | None = None
+
+    @property
+    def members(self) -> tuple[SpectrometerBase, SpectrometerBase]:
+        return (self.spec1, self.spec2)
+
+    @property
+    def wavelengths(self) -> np.ndarray:
+        return self._wl
+
+    def set_integration_time(self, ms: float) -> None:
+        self.spec1.set_integration_time(ms)
+        self.spec2.set_integration_time(ms)
+        self.integration_ms = float(ms)
+
+    def _acquire_pair(self) -> tuple[np.ndarray, np.ndarray]:
+        """One frame from each member, calibrated, on their native grids."""
+        raw1 = np.asarray(self.spec1.acquire(), float)
+        raw2 = np.asarray(self.spec2.acquire(), float)
+        self.last_member_raw = (raw1, raw2)
+        return self.spec1.calibrate(raw1), self.spec2.calibrate(raw2)
+
+    def acquire(self) -> np.ndarray:
+        i1, i2 = self._acquire_pair()
+        i1 = i1 * self.stitch_factor
+        out = np.empty_like(self._wl)
+        out[self._m1] = np.interp(self._wl[self._m1], self._wl1, i1)
+        out[self._m2] = np.interp(self._wl[self._m2], self._wl2, i2)
+        o = self._ovl
+        out[o] = 0.5 * (np.interp(self._wl[o], self._wl1, i1)
+                        + np.interp(self._wl[o], self._wl2, i2))
+        return out
+
+    def fit_stitch_factor(self) -> float:
+        """Take one frame from each member and choose the factor that makes
+        spec1 match spec2 over the overlap, least-squares. The residual is
+        quadratic in the factor, so the minimum is the closed form
+        s = sum(I1*I2) / sum(I1^2) — no iterative optimiser needed."""
+        i1, i2 = self._acquire_pair()
+        o = self._ovl
+        a = np.interp(self._wl[o], self._wl1, i1)
+        b = np.interp(self._wl[o], self._wl2, i2)
+        denom = float(np.dot(a, a))
+        if not np.isfinite(denom) or denom <= 0.0:
+            raise RuntimeError(
+                "No signal in the overlap region — cannot fit a stitch factor.")
+        self.stitch_factor = float(np.dot(a, b)) / denom
+        return self.stitch_factor
+
+    def calibration_targets(self) -> list[SpectrometerBase]:
+        return [self.spec1, self.spec2]
+
+    def disconnect(self) -> None:
+        for s in (self.spec1, self.spec2):
+            try:
+                s.disconnect()
+            except Exception:
+                pass
 
 
 # ===========================================================================

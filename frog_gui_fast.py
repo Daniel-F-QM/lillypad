@@ -29,6 +29,7 @@ and shared with frog_gui.py via hardware.py / scan.py.
 import sys
 import math
 import time
+import shutil
 import tempfile
 import threading
 import numpy as np
@@ -39,7 +40,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QDoubleSpinBox, QSpinBox, QCheckBox, QPushButton,
     QProgressBar, QFrame, QScrollArea, QSizePolicy, QStatusBar, QFileDialog,
-    QDialog, QToolBar, QSlider, QLineEdit, QMenu, QComboBox, QRubberBand
+    QDialog, QToolBar, QSlider, QLineEdit, QMenu, QComboBox, QRubberBand,
+    QMessageBox, QInputDialog
 )
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPointF, QSize, QRect, QPoint
 from PySide6.QtGui import (QPalette, QColor, QFont, QIcon, QPixmap, QPainter,
@@ -56,8 +58,9 @@ from matplotlib.figure import Figure
 
 from hardware import (SimulatedStage, SimulatedSpectrometer,
                       KinesisStage, ZaberStage, PiezoJenaStage,
-                      SeabreezeSpectrometer,
+                      SeabreezeSpectrometer, StitchedSpectrometer,
                       list_kinesis_stages, list_seabreeze_spectrometers,
+                      load_calibration_file,
                       PULSE_SHAPES, DEFAULT_PULSE)
 from scan import (FrogScanConfig, FrogScanWorker, autocorrelation, fwhm,
                   position_to_delay_fs, delay_to_position_um,
@@ -270,6 +273,37 @@ ICON_PATH    = resource_path("icons", "Lilypad.png")
 SUN_ICON     = resource_path("icons", "sun.png")
 MOON_ICON    = resource_path("icons", "moon.png")
 RESCALE_ICON = resource_path("icons", "rescale.png")
+
+
+def app_dir():
+    """Folder the program lives in — next to the .exe when frozen, else next
+    to this file. User-editable data (calibration files) belongs HERE, not in
+    resource_path()'s _MEIPASS bundle, which is read-only and re-extracted on
+    every launch — files added there would silently vanish."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+CALIBRATION_DIR = app_dir() / "calibration_files"
+
+
+def seed_calibration_dir():
+    """First-run seeding for the frozen build: the bundle ships the repo's
+    calibration files under _internal (sys._MEIPASS), but the user-editable
+    folder lives next to the .exe. Copy the bundled files over ONLY if the
+    folder does not exist yet — never touch a folder the user already owns."""
+    if CALIBRATION_DIR.exists():
+        return
+    bundled = resource_path("calibration_files")
+    if not bundled.is_dir() or bundled.resolve() == CALIBRATION_DIR.resolve():
+        return
+    try:
+        CALIBRATION_DIR.mkdir(parents=True)
+        for f in bundled.glob("*.txt"):
+            shutil.copyfile(f, CALIBRATION_DIR / f.name)
+    except OSError:
+        pass   # e.g. read-only install dir — the menu just shows no files
 
 
 
@@ -1618,6 +1652,12 @@ class FrogWindow(QMainWindow):
         self.result        = None
         self._worker       = None
         self._export_worker = None
+        # Multi-spectrometer mode: two slots, each holding a device choice and
+        # a calibration choice; _multi_members are the live SeabreezeSpectro-
+        # meter objects in SLOT order once the stitched pair is connected.
+        self._multi = {"on": False, "serials": [None, None],
+                       "labels": [None, None], "cals": [None, None]}
+        self._multi_members = [None, None]
         self._scan_trace   = None
         self._scan_delays  = None
         # Cached at scan start so _on_column can redraw the spectrum panel
@@ -1767,7 +1807,20 @@ class FrogWindow(QMainWindow):
                 except Exception:
                     pass
             self.spec = new_spec
+            if not isinstance(new_spec, StitchedSpectrometer):
+                # Any single device replaces a stitched pair wholesale — the
+                # slot->member mapping is only meaningful while the pair lives.
+                self._multi_members = [None, None]
             self.spec.set_integration_time(self.spin_integration.value())
+            # The old device's frames and dark are meaningless for the new one
+            # — and a different pixel count (certain with a stitched grid)
+            # would crash the dark subtraction outright.
+            self.background = None
+            self.chk_dark.setChecked(False); self.chk_dark.setEnabled(False)
+            self.last_spectrum = None
+            self._live_frame = None
+            self._sat_frame = None
+            self._sat_peak = -1.0
             # New device, new full scale — a latched warning about the old one
             # would be meaningless (and its threshold plain wrong).
             self._reset_saturation()
@@ -1899,6 +1952,8 @@ class FrogWindow(QMainWindow):
         b_gfx.clicked.connect(lambda: self.dlg_graphics.toggle())
         tb.addWidget(b_gfx)
         tb.addWidget(self._build_export_button())
+        tb.addWidget(self._build_calibration_button())
+        tb.addWidget(self._build_multispec_button())
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
@@ -1957,8 +2012,15 @@ class FrogWindow(QMainWindow):
         self.setStatusBar(self.status)
         self.lbl_sat = QLabel(""); self.lbl_sat.setObjectName("satok")
         self.lamp = StatusLamp()
+        # Second lamp pair for multi-spectrometer mode — one alarm per device.
+        # Hidden until the mode is enabled.
+        self.lbl_sat2 = QLabel(""); self.lbl_sat2.setObjectName("satok")
+        self.lamp2 = StatusLamp()
         self.status.addPermanentWidget(self.lbl_sat)
         self.status.addPermanentWidget(self.lamp)
+        self.status.addPermanentWidget(self.lbl_sat2)
+        self.status.addPermanentWidget(self.lamp2)
+        self.lbl_sat2.hide(); self.lamp2.hide()
         self._reset_saturation()
         self.status.showMessage("Simulated hardware — ready (fast build).", 4000)
 
@@ -1982,6 +2044,388 @@ class FrogWindow(QMainWindow):
         self.btn_export.setToolTip("Save the last scan — pick the output format")
         self.btn_export.setMenu(menu)
         return self.btn_export
+
+    # ── Calibration menu ──────────────────────────────────────────────────────
+    def _build_calibration_button(self):
+        """Header Calibration control — assigns an intensity-calibration file
+        to each connected physical spectrometer. Rebuilt on every open: both
+        the calibration_files folder and the connected devices change at
+        runtime."""
+        menu = QMenu(self)
+        menu.aboutToShow.connect(lambda: self._populate_calibration_menu(menu))
+        self.btn_cal = QPushButton("Calibration")
+        self.btn_cal.setToolTip(
+            "Apply an intensity calibration (wavelength/factor text file) to "
+            "the spectrometer — files live in calibration_files/ next to the "
+            "program")
+        self.btn_cal.setMenu(menu)
+        return self.btn_cal
+
+    @staticmethod
+    def _calibration_files():
+        try:
+            return sorted(CALIBRATION_DIR.glob("*.txt"),
+                          key=lambda p: p.name.lower())
+        except OSError:
+            return []
+
+    def _populate_calibration_menu(self, menu):
+        menu.clear()
+        files = self._calibration_files()
+        targets = self.spec.calibration_targets()
+        for spec in targets:
+            # Flat list for a single device; one submenu per member of a
+            # stitched pair, so each takes its own file.
+            dest = menu.addMenu(spec.name) if len(targets) > 1 else menu
+            group = QActionGroup(dest)
+            group.setExclusive(True)
+            act = QAction("None (raw counts)", dest)
+            act.setCheckable(True)
+            act.setChecked(spec.calibration_name is None)
+            act.triggered.connect(
+                lambda _=False, s=spec: self._apply_calibration(s, None))
+            group.addAction(act); dest.addAction(act)
+            for f in files:
+                act = QAction(f.stem, dest)
+                act.setCheckable(True)
+                act.setChecked(spec.calibration_name == f.stem)
+                act.triggered.connect(
+                    lambda _=False, s=spec, p=f: self._apply_calibration(s, p))
+                group.addAction(act); dest.addAction(act)
+            if not files:
+                act = QAction("(no .txt files in calibration_files)", dest)
+                act.setEnabled(False)
+                dest.addAction(act)
+        menu.addSeparator()
+        act_add = QAction("Add new calibration…", menu)
+        act_add.triggered.connect(self._add_calibration_file)
+        menu.addAction(act_add)
+
+    def _apply_calibration(self, spec, path):
+        """Assign `path` (or None = raw counts) to one physical spectrometer."""
+        if self._scan_running():
+            self.status.showMessage(
+                "A scan is running — stop it before changing calibration.", 4000)
+            return
+        if spec not in self.spec.calibration_targets():
+            self.status.showMessage(
+                "That spectrometer is no longer connected.", 4000)
+            return
+        with self._device_lock() as ok:
+            if not ok:
+                self.status.showMessage(FEED_BUSY_MSG, 4000)
+                return
+            try:
+                if path is None:
+                    spec.clear_calibration()
+                else:
+                    spec.set_calibration(path)
+            except Exception as e:
+                self.status.showMessage(f"Calibration failed: {e}", 6000)
+                return
+        self.status.showMessage(
+            f"{spec.name}: calibration "
+            + (f"'{path.stem}' applied." if path is not None
+               else "removed (raw counts)."), 4000)
+
+    def _add_calibration_file(self):
+        """Copy a calibration file into calibration_files/ so it shows up in
+        the menu — and, for the frozen build, survives next to the .exe."""
+        src, _ = QFileDialog.getOpenFileName(
+            self, "Add calibration file", "",
+            "Calibration files (*.txt);;All files (*)")
+        if not src:
+            return
+        src = Path(src)
+        try:
+            load_calibration_file(src)   # reject unparseable files up front
+        except Exception as e:
+            QMessageBox.warning(self, "Add calibration",
+                                f"Not a usable calibration file:\n{e}")
+            return
+        dest = CALIBRATION_DIR / src.name
+        try:
+            CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
+            if dest.exists() and not src.samefile(dest):
+                if QMessageBox.question(
+                        self, "Add calibration",
+                        f"{dest.name} already exists in calibration_files — "
+                        f"overwrite it?") != QMessageBox.Yes:
+                    return
+            if not (dest.exists() and src.samefile(dest)):
+                shutil.copyfile(src, dest)
+        except OSError as e:
+            QMessageBox.warning(self, "Add calibration",
+                                f"Could not copy into {CALIBRATION_DIR}:\n{e}")
+            return
+        self.status.showMessage(
+            f"Calibration '{src.stem}' added — assign it from the "
+            f"Calibration menu.", 5000)
+
+    # ── Multi-spectrometer menu ───────────────────────────────────────────────
+    def _build_multispec_button(self):
+        """Header Multi-Spectrometer control — connect two spectrometers as
+        one stitched device and manage the stitch factor."""
+        menu = QMenu(self)
+        menu.aboutToShow.connect(lambda: self._populate_multispec_menu(menu))
+        self.btn_multi = QPushButton("Multi-Spec")
+        self.btn_multi.setToolTip(
+            "Stitch two spectrometers with overlapping wavelength ranges into "
+            "one — each can take its own calibration file")
+        self.btn_multi.setMenu(menu)
+        return self.btn_multi
+
+    def _populate_multispec_menu(self, menu):
+        menu.clear()
+        if not self._multi["on"]:
+            act = QAction("Enable multi-spectrometer mode", menu)
+            act.triggered.connect(self._enable_multi_mode)
+            menu.addAction(act)
+            return
+        stitched = isinstance(self.spec, StitchedSpectrometer)
+        info = QAction(self.spec.name if stitched
+                       else "Select a spectrometer for each slot", menu)
+        info.setEnabled(False)
+        menu.addAction(info)
+        if stitched:
+            fct = QAction(f"Stitch factor: {self.spec.stitch_factor:.4g}", menu)
+            fct.setEnabled(False)
+            menu.addAction(fct)
+        menu.addSeparator()
+        for slot in (0, 1):
+            self._add_slot_spec_menu(menu, slot)
+            self._add_slot_cal_menu(menu, slot)
+            if slot == 0:
+                menu.addSeparator()
+        menu.addSeparator()
+        act_fit = QAction("Auto-stitch", menu)
+        act_fit.setEnabled(stitched)
+        act_fit.setToolTip("Fit the stitch factor from one frame — needs "
+                           "light across the overlap region")
+        act_fit.triggered.connect(
+            lambda: self._menu_result(self._fit_stitch_factor))
+        menu.addAction(act_fit)
+        act_set = QAction("Manual stitch…", menu)
+        act_set.setEnabled(stitched)
+        act_set.triggered.connect(self._set_stitch_factor)
+        menu.addAction(act_set)
+        menu.addSeparator()
+        act_off = QAction("Disable multi-spectrometer mode", menu)
+        act_off.triggered.connect(
+            lambda: self._menu_result(self._disable_multi_mode))
+        menu.addAction(act_off)
+
+    def _add_slot_spec_menu(self, menu, slot):
+        label = self._multi["labels"][slot]
+        sub = menu.addMenu(f"Spectrometer {slot + 1}:  {label or '(none)'}")
+        # Enumeration is a USB query — do it when the submenu opens, not for
+        # every open of the parent menu.
+        sub.aboutToShow.connect(
+            lambda s=sub, i=slot: self._populate_slot_spec_menu(s, i))
+
+    def _populate_slot_spec_menu(self, sub, slot):
+        sub.clear()
+        try:
+            devices = list_seabreeze_spectrometers()
+        except Exception as e:
+            act = QAction(f"(enumeration failed: {e})", sub)
+            act.setEnabled(False)
+            sub.addAction(act)
+            return
+        other = self._multi["serials"][1 - slot]
+        added = 0
+        for model, serial in devices:
+            if serial == other:
+                continue           # already claimed by the other slot
+            label = f"{model} [{serial}]"
+            act = QAction(label, sub)
+            act.setCheckable(True)
+            act.setChecked(serial == self._multi["serials"][slot])
+            act.triggered.connect(
+                lambda _=False, i=slot, s=serial, l=label:
+                self._select_slot_device(i, s, l))
+            sub.addAction(act)
+            added += 1
+        if not added:
+            act = QAction("(no free spectrometers found)", sub)
+            act.setEnabled(False)
+            sub.addAction(act)
+
+    def _add_slot_cal_menu(self, menu, slot):
+        cal = self._multi["cals"][slot]
+        sub = menu.addMenu(f"Calibration {slot + 1}:  "
+                           f"{cal.stem if cal else 'none'}")
+        group = QActionGroup(sub)
+        group.setExclusive(True)
+        act = QAction("None (raw counts)", sub)
+        act.setCheckable(True)
+        act.setChecked(cal is None)
+        act.triggered.connect(
+            lambda _=False, i=slot: self._select_slot_calibration(i, None))
+        group.addAction(act); sub.addAction(act)
+        for f in self._calibration_files():
+            act = QAction(f.stem, sub)
+            act.setCheckable(True)
+            act.setChecked(cal is not None and f.stem == cal.stem)
+            act.triggered.connect(
+                lambda _=False, i=slot, p=f: self._select_slot_calibration(i, p))
+            group.addAction(act); sub.addAction(act)
+
+    def _select_slot_device(self, slot, serial, label):
+        if self._scan_running():
+            self.status.showMessage(
+                "A scan is running — stop it before changing spectrometers.", 4000)
+            return
+        self._multi["serials"][slot] = serial
+        self._multi["labels"][slot]  = label
+        if all(self._multi["serials"]):
+            self._menu_result(self._connect_multi_pair)
+        else:
+            self.status.showMessage(
+                f"Slot {slot + 1}: {label}. Select the other slot to connect "
+                f"the pair.", 5000)
+
+    def _select_slot_calibration(self, slot, path):
+        self._multi["cals"][slot] = path
+        member = self._multi_members[slot]
+        if member is not None and isinstance(self.spec, StitchedSpectrometer):
+            self._apply_calibration(member, path)   # live: apply right away
+        else:
+            self.status.showMessage(
+                f"Slot {slot + 1} calibration: "
+                f"{path.stem if path else 'none'} — applied when the pair "
+                f"connects.", 4000)
+
+    def _enable_multi_mode(self):
+        self._multi["on"] = True
+        # Pre-fill slot 1 with an already-connected single Seabreeze device so
+        # entering the mode does not throw away the current connection.
+        if isinstance(self.spec, SeabreezeSpectrometer):
+            serial = getattr(getattr(self.spec, "_spec", None),
+                             "serial_number", None)
+            if serial:
+                self._multi["serials"][0] = str(serial)
+                self._multi["labels"][0]  = self.spec.name
+        self.lbl_sat2.show(); self.lamp2.show()
+        self._reset_saturation()
+        self.status.showMessage(
+            "Multi-spectrometer mode: pick a spectrometer for each slot in "
+            "the Multi-Spec menu.", 6000)
+
+    def _connect_multi_pair(self):
+        """Open both slot devices and swap in the stitched pair. (ok, msg)."""
+        if self._scan_running():
+            return False, "A scan is running — stop it before changing hardware."
+        s1, s2 = self._multi["serials"]
+        if s1 == s2:
+            return False, ("Both slots point at the same spectrometer — pick "
+                           "two different devices.")
+        # Release any handle we already hold on one of these devices first:
+        # seabreeze cannot open the same spectrometer twice.
+        if isinstance(self.spec, (SeabreezeSpectrometer, StitchedSpectrometer)):
+            ok, err = self._apply_spectrometer(self._make_sim_spectrometer())
+            if not ok:
+                return False, err
+        opened = []
+        try:
+            for serial in (s1, s2):
+                opened.append(SeabreezeSpectrometer(serial=serial))
+            for spec, cal in zip(opened, self._multi["cals"]):
+                if cal is not None:
+                    spec.set_calibration(cal)
+            stitched = StitchedSpectrometer(*opened)
+        except Exception as e:
+            for s in opened:
+                self._drop(s)
+            return False, f"Stitched connect failed: {e}"
+        ok, err = self._apply_spectrometer(stitched)
+        if not ok:
+            self._drop(stitched)   # disconnects both members
+            return False, err
+        self._multi_members = list(opened)      # slot order, not blue/red
+        self._reset_saturation()   # slot-ordered lamp tooltips need the mapping
+        wl = stitched.wavelengths
+        self.status.showMessage(f"Spectrometer: {stitched.name}", 5000)
+        return True, (f"Stitched pair connected: {stitched.name}, "
+                      f"{wl[0]:.0f}–{wl[-1]:.0f} nm. Use Auto-stitch with "
+                      f"light across the overlap to match the two devices.")
+
+    def _disable_multi_mode(self):
+        """Leave multi mode, keeping slot 1's device as the single
+        spectrometer when a pair is live. (ok, msg)."""
+        if self._scan_running():
+            return False, ("A scan is running — stop it before leaving "
+                           "multi-spectrometer mode.")
+        keep_serial = self._multi["serials"][0]
+        keep_label  = self._multi["labels"][0]
+        keep_cal    = self._multi["cals"][0]
+        was_live    = isinstance(self.spec, StitchedSpectrometer)
+        msg = "Multi-spectrometer mode disabled."
+        if was_live:
+            # Release both members before reopening slot 1 on its own.
+            ok, err = self._apply_spectrometer(self._make_sim_spectrometer())
+            if not ok:
+                return False, err
+            single = None
+            try:
+                single = SeabreezeSpectrometer(serial=keep_serial)
+                if keep_cal is not None:
+                    single.set_calibration(keep_cal)
+            except Exception as e:
+                msg = (f"Multi-spectrometer mode disabled, but reconnecting "
+                       f"{keep_label} failed ({e}) — using the simulated "
+                       f"spectrometer.")
+            if single is not None:
+                ok, err = self._apply_spectrometer(single)
+                if not ok:
+                    self._drop(single)
+                    msg = (f"Multi-spectrometer mode disabled ({err}) — "
+                           f"using the simulated spectrometer.")
+                else:
+                    msg = (f"Multi-spectrometer mode disabled — "
+                           f"{single.name} kept as the single spectrometer.")
+        self._multi = {"on": False, "serials": [None, None],
+                       "labels": [None, None], "cals": [None, None]}
+        self._multi_members = [None, None]
+        self.lbl_sat2.hide(); self.lamp2.hide()
+        self._reset_saturation()
+        return True, msg
+
+    def _menu_result(self, fn):
+        """Run an (ok, msg) action from a menu; failures pop a message box —
+        menus have no inline status label like the Hardware dialog's."""
+        ok, msg = fn()
+        if ok:
+            if msg:
+                self.status.showMessage(msg, 8000)
+        else:
+            QMessageBox.warning(self, "Multi-spectrometer", msg)
+
+    def _fit_stitch_factor(self):
+        if not isinstance(self.spec, StitchedSpectrometer):
+            return False, "No stitched pair is connected."
+        if self._scan_running():
+            return False, "A scan is running — stop it before fitting."
+        with self._device_lock() as ok:
+            if not ok:
+                return False, FEED_BUSY_MSG
+            try:
+                factor = self.spec.fit_stitch_factor()
+            except Exception as e:
+                return False, f"Stitch-factor fit failed: {e}"
+        return True, (f"Stitch factor fitted: {factor:.4g} "
+                      f"(applied to {self.spec.spec1.name}).")
+
+    def _set_stitch_factor(self):
+        if not isinstance(self.spec, StitchedSpectrometer):
+            return
+        val, ok = QInputDialog.getDouble(
+            self, "Set stitch factor",
+            f"Multiplier applied to {self.spec.spec1.name} before stitching:",
+            self.spec.stitch_factor, 1e-6, 1e6, 6)
+        if ok:
+            self.spec.stitch_factor = float(val)   # atomic — no lock needed
+            self.status.showMessage(f"Stitch factor set to {val:.4g}.", 4000)
 
     def _build_spectrum_group(self):
         grp = QGroupBox("Spectrum")
@@ -2148,15 +2592,17 @@ class FrogWindow(QMainWindow):
         self.status.showMessage(f"{name.capitalize()} mode.", 2000)
 
     # ── Saturation indicator ─────────────────────────────────────────────────
-    def _set_lamp(self, state, text, obj):
-        self.lamp.set_state(state)
-        self.lbl_sat.setText(text)
+    def _set_lamp(self, state, text, obj, which=0):
+        lamp = self.lamp if which == 0 else self.lamp2
+        lbl  = self.lbl_sat if which == 0 else self.lbl_sat2
+        lamp.set_state(state)
+        lbl.setText(text)
         # Colour via objectName + repolish (not setStyleSheet) so a later theme
         # switch restyles the label along with everything else.
-        if self.lbl_sat.objectName() != obj:
-            self.lbl_sat.setObjectName(obj)
-            self.lbl_sat.style().unpolish(self.lbl_sat)
-            self.lbl_sat.style().polish(self.lbl_sat)
+        if lbl.objectName() != obj:
+            lbl.setObjectName(obj)
+            lbl.style().unpolish(lbl)
+            lbl.style().polish(lbl)
 
     def _full_scale(self):
         """Effective detector full scale, in counts, or None if unknown.
@@ -2174,11 +2620,57 @@ class FrogWindow(QMainWindow):
         self.scan_cfg.saturation_fraction = percent / 100.0
         self._reset_saturation()    # re-judge; the old latch used a stale rule
 
+    def _slot_members(self):
+        """Live stitched members in SLOT order (slot 1 first). Falls back to
+        the stitched device's own (blue, red) order when the pair was not
+        connected through the multi-spectrometer slots."""
+        members = getattr(self.spec, "members", None)
+        if not members:
+            return []
+        if (all(m is not None for m in self._multi_members)
+                and set(map(id, self._multi_members)) == set(map(id, members))):
+            return list(self._multi_members)
+        return list(members)
+
+    def _member_full_scale(self, member):
+        """A member's effective full scale: the Hardware override, when set,
+        applies to every member; otherwise the member's own report."""
+        full = self.scan_cfg.saturation_counts
+        if full is None:
+            full = getattr(member, "max_counts", None)
+        return full if full else None
+
     def _reset_saturation(self):
-        """Clear a latched warning and re-read the effective full scale."""
+        """Clear a latched warning and re-read the effective full scale(s)."""
         self._sat_latched = False
         self._sat_frames  = 0            # saturated frames so far this scan
         self._sat_worst   = (0, 0.0, 0)  # (n_pixels, delay_fs, column index)
+        slots = self._slot_members() if self._multi["on"] else []
+        if slots:
+            # Multi mode with a live pair: one lamp per member, each judged
+            # against its own full scale.
+            for i, mem in enumerate(slots):
+                full = self._member_full_scale(mem)
+                lamp = self.lamp if i == 0 else self.lamp2
+                if full:
+                    src = ("override" if self.scan_cfg.saturation_counts
+                           else "device")
+                    lamp.setToolTip(
+                        f"{mem.name} headroom — full scale {full:.0f} counts "
+                        f"({src}), saturated at "
+                        f"{100 * self.scan_cfg.saturation_fraction:.0f}%")
+                    self._set_lamp("ok", f"S{i + 1}", "satok", i)
+                else:
+                    lamp.setToolTip(
+                        f"{mem.name} does not report a full-scale value, so "
+                        f"saturation cannot be checked. Set one in Hardware → "
+                        f"Full scale.")
+                    self._set_lamp("unknown", f"S{i + 1} — % FS", "satok", i)
+            return
+        if self._multi["on"]:
+            # Multi mode enabled but no pair connected yet — lamp 2 idles.
+            self.lamp2.setToolTip("Slot 2 — no stitched pair connected yet.")
+            self._set_lamp("unknown", "", "satok", 1)
         full = self._full_scale()
         if not full:
             self.lamp.setToolTip(
@@ -2192,6 +2684,27 @@ class FrogWindow(QMainWindow):
                 f"saturated at {100 * self.scan_cfg.saturation_fraction:.0f}%")
             self._set_lamp("ok", "", "satok")
 
+    def _judge_lamp(self, which, raw, full, prefix=""):
+        """Drive one lamp from one RAW frame and its full scale.
+
+        Same threshold the scan worker uses, so the live lamp and the scan
+        warning can never disagree about what counts as saturated.
+        """
+        if not full:
+            self._set_lamp("unknown", f"{prefix}— % FS", "satok", which)
+            return
+        peak = float(np.max(raw)) if raw.size else 0.0
+        frac = peak / full
+        sat_frac = self.scan_cfg.saturation_fraction
+        if frac >= sat_frac:
+            n = int(np.count_nonzero(raw >= sat_frac * full))
+            self._set_lamp("sat", f"{prefix}⚠ SATURATED  ({n} px)", "sat", which)
+        elif frac >= SAT_WARN_FRACTION:
+            self._set_lamp("warn", f"{prefix}⚠ {100 * frac:.0f}% FS",
+                           "satwarn", which)
+        else:
+            self._set_lamp("ok", f"{prefix}{100 * frac:.0f}% FS", "satok", which)
+
     def _update_saturation(self, raw):
         """Live headroom readout, driven by the feed's RAW (un-subtracted) frame.
 
@@ -2201,21 +2714,24 @@ class FrogWindow(QMainWindow):
         """
         if self._sat_latched:
             return
+        slots = self._slot_members() if self._multi["on"] else []
+        frames = getattr(self.spec, "last_member_raw", None)
+        if slots and frames is not None:
+            # Two separate alarms: each member's own raw frame against its own
+            # full scale. `raw` (the combined stitched frame) has no single
+            # ADC scale and is deliberately not judged.
+            members = self.spec.members
+            raw_by_id = {id(m): f for m, f in zip(members, frames)}
+            for i, mem in enumerate(slots):
+                frame = raw_by_id.get(id(mem))
+                if frame is not None:
+                    self._judge_lamp(i, frame, self._member_full_scale(mem),
+                                     prefix=f"S{i + 1} ")
+            return
         full = self._full_scale()
         if not full:
             return
-        peak = float(np.max(raw)) if raw.size else 0.0
-        frac = peak / full
-        # Same threshold the scan worker uses, so the live lamp and the scan
-        # warning can never disagree about what counts as saturated.
-        sat_frac = self.scan_cfg.saturation_fraction
-        if frac >= sat_frac:
-            n = int(np.count_nonzero(raw >= sat_frac * full))
-            self._set_lamp("sat", f"⚠ SATURATED  ({n} px)", "sat")
-        elif frac >= SAT_WARN_FRACTION:
-            self._set_lamp("warn", f"⚠ {100 * frac:.0f}% FS", "satwarn")
-        else:
-            self._set_lamp("ok", f"{100 * frac:.0f}% FS", "satok")
+        self._judge_lamp(0, raw, full)
 
     # ── Live feed ─────────────────────────────────────────────────────────────
     def _on_spectrum(self, wl, raw):
@@ -2258,6 +2774,9 @@ class FrogWindow(QMainWindow):
         spectrum = raw
         if self.chk_dark.isChecked() and self.background is not None:
             spectrum = np.clip(raw - self.background, 0, None)
+        # Calibration LAST, and never on what the lamp judged: saturation is a
+        # raw-ADC property, the calibration is display/data physics.
+        spectrum = self.spec.calibrate(spectrum)
         self.canvas.update_spectrum(wl, spectrum)
 
     def _autofit_spectrum(self):
@@ -2546,7 +3065,10 @@ class FrogWindow(QMainWindow):
             if self._scan_wl is not None:
                 spectrum = self._scan_col
                 if self.chk_dark.isChecked() and self.background is not None:
-                    spectrum = np.clip(spectrum - self.background, 0, None)
+                    # The worker's column is already calibrated; the stored
+                    # dark is raw — bring it to the same scale first.
+                    spectrum = np.clip(
+                        spectrum - self.spec.calibrate(self.background), 0, None)
                 self.canvas.update_spectrum(self._scan_wl, spectrum)
             self.canvas.update_trace(self._scan_trace)
             self.canvas.update_ac(self._scan_delays[:i + 1], ac)
@@ -2576,6 +3098,10 @@ class FrogWindow(QMainWindow):
                        f"{'' if self._sat_frames == 1 else 's'}, "
                        f"worst @ {where} ({npx_w} px)",
                        "sat")
+        # The worker's signal aggregates over stitched members; latch both
+        # lamps so neither device shows a green light over clipped data.
+        if self._multi["on"]:
+            self.lamp2.set_state("sat")
 
     def _on_finished(self, result):
         self.result = result
@@ -2681,6 +3207,7 @@ def main():
     app.setFont(QFont("Segoe UI", 10, QFont.Normal))
     apply_app_palette(app, PALETTE)
     app.setStyleSheet(build_stylesheet(PALETTE, "dark"))
+    seed_calibration_dir()
 
     win = FrogWindow()
     win.show()

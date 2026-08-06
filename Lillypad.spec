@@ -33,7 +33,11 @@ a = Analysis(
     ['frog_gui_fast.py'],
     pathex=[],
     binaries=_zaber_libs,
-    datas=[('icons', 'icons')],
+    # calibration_files/*.txt are SEED data: frog_gui_fast.seed_calibration_dir
+    # copies them from the bundle to a user-editable calibration_files/ folder
+    # next to the .exe on first run (only top-level files — Old/ stays behind).
+    datas=[('icons', 'icons')] + [
+        (p, 'calibration_files') for p in glob.glob('calibration_files/*.txt')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

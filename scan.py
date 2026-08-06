@@ -385,6 +385,7 @@ class FrogScanWorker(QThread):
         self.cfg      = config
         self._abort   = False
         self._sat_thr = None      # full-scale threshold, set in run()
+        self._member_thr = None   # per-member thresholds (stitched), set in run()
 
     def abort(self):
         """Request a clean stop after the current step."""
@@ -406,13 +407,24 @@ class FrogScanWorker(QThread):
         n_sat = 0
         for _ in range(n):
             s = np.asarray(self.spec.acquire(), float)
-            m = float(s.max())
-            if m > peak:
-                peak = m
-            if thr is not None and m >= thr:
-                n_sat += int(np.count_nonzero(s >= thr))
+            if self._member_thr is not None:
+                # Stitched device: per-member raw frames, per-member scales.
+                for raw, t in zip(self.spec.last_member_raw, self._member_thr):
+                    m = float(raw.max())
+                    if m > peak:
+                        peak = m
+                    if t is not None and m >= t:
+                        n_sat += int(np.count_nonzero(raw >= t))
+            else:
+                m = float(s.max())
+                if m > peak:
+                    peak = m
+                if thr is not None and m >= thr:
+                    n_sat += int(np.count_nonzero(s >= thr))
             acc = s if acc is None else acc + s
-        return acc / n, peak, n_sat
+        # Saturation was judged above on RAW counts (the threshold is an ADC
+        # property); only the returned column is intensity-calibrated.
+        return self.spec.calibrate(acc / n), peak, n_sat
 
     def run(self):
         try:
@@ -426,6 +438,20 @@ class FrogScanWorker(QThread):
             if max_counts is None:
                 max_counts = getattr(self.spec, "max_counts", None)
             self._sat_thr = (cfg.saturation_fraction * max_counts) if max_counts else None
+
+            # Composite (stitched) spectrometer: the combined column has no
+            # single full scale, so instead each member's RAW frame is judged
+            # against that member's own full scale (the override, if set,
+            # applies to every member).
+            members = getattr(self.spec, "members", None)
+            if members:
+                thr = []
+                for mem in members:
+                    full = cfg.saturation_counts
+                    if full is None:
+                        full = getattr(mem, "max_counts", None)
+                    thr.append(cfg.saturation_fraction * full if full else None)
+                self._member_thr = thr if any(t is not None for t in thr) else None
 
             # Travel-limit guard — catches a bad zero or range BEFORE moving.
             lo, hi = cfg.pos_min_um, cfg.pos_max_um
@@ -458,9 +484,14 @@ class FrogScanWorker(QThread):
                     if cfg.abort_on_saturation:
                         where = ("the background frame" if bg
                                  else f"delay {delay_fs:+.1f} fs")
+                        # In stitched mode there is no single threshold — each
+                        # member was judged against its own full scale.
+                        rule = (f">= {self._sat_thr:.0f} counts"
+                                if self._sat_thr is not None
+                                else "at their detector's full scale")
                         self.error.emit(
                             f"Spectrometer saturated at {where} "
-                            f"({n_sat} px >= {self._sat_thr:.0f} counts). Scan stopped.")
+                            f"({n_sat} px {rule}). Scan stopped.")
                         return True
                 return False
 

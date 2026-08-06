@@ -122,6 +122,29 @@ scale units are then verified, so a rotational or uncalibrated stage is
 would silently distort the delay axis instead of failing. To support a stage
 that matches neither, add a `STAGE_CONFIGS` entry.
 
+**Spectrometer calibration.** The toolbar's **Calibration** menu assigns an
+intensity calibration to each connected spectrometer: a two-column text file
+(wavelength in nm, multiplicative factor; `#` comments allowed) from the
+`calibration_files/` folder next to the program (next to the `.exe` for the
+frozen build — the folder is user-editable, drop new files in or use *Add new
+calibration…* in the menu). The factors are interpolated onto the device's
+pixel grid and multiply every displayed and recorded spectrum. Saturation is
+always judged on **raw** ADC counts, before calibration.
+
+**Multi-spectrometer mode.** *Enable multi-spectrometer mode* in the
+toolbar's **Multi-Spec** menu opens two slots, each with its own spectrometer
+and calibration submenu; once both slots are filled the pair connects
+automatically as one stitched device (`StitchedSpectrometer`): spectra are
+interpolated onto a common grid, each device's own calibration file is
+applied first, and the two are averaged across the overlap (the ranges must
+overlap). *Auto-stitch* least-squares-matches the bluer spectrometer to the
+redder one over the overlap (do this with light spanning the overlap);
+*Manual stitch…* enters the factor by hand. Entering the mode adds a second
+saturation lamp to the status bar: each device's RAW frames are judged
+against that device's own full scale, both live and during scans, so either
+detector clipping trips its own alarm. *Disable multi-spectrometer mode*
+keeps the slot-1 spectrometer connected as a normal single device.
+
 **Adding a device class.** Implement `StageBase` or `SpectrometerBase` in
 [hardware.py](hardware.py). Moves must block until settled, so the scan loop can
 read back a trustworthy position on the next line.
