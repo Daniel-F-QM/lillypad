@@ -55,7 +55,8 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 
 from hardware import (SimulatedStage, SimulatedSpectrometer,
-                      KinesisStage, ZaberStage, SeabreezeSpectrometer,
+                      KinesisStage, ZaberStage, PiezoJenaStage,
+                      SeabreezeSpectrometer,
                       list_kinesis_stages, list_seabreeze_spectrometers,
                       PULSE_SHAPES, DEFAULT_PULSE)
 from scan import (FrogScanConfig, FrogScanWorker, autocorrelation, fwhm,
@@ -558,6 +559,13 @@ class HardwareDialog(QDialog):
         b_zr = QPushButton("Real (Zaber)"); b_zr.setObjectName("accent")
         b_zr.clicked.connect(lambda: self._do(self._connect_zaber))
         sgrid.addWidget(self.edit_zaber_port, 1, 0); sgrid.addWidget(b_zr, 1, 1)
+
+        # Piezo Jena: optional serial port (blank = auto-scan), like Zaber.
+        self.edit_piezo_port = QLineEdit()
+        self.edit_piezo_port.setPlaceholderText("COM (auto)")
+        b_pj = QPushButton("Real (Piezo Jena)"); b_pj.setObjectName("accent")
+        b_pj.clicked.connect(lambda: self._do(self._connect_piezo))
+        sgrid.addWidget(self.edit_piezo_port, 2, 0); sgrid.addWidget(b_pj, 2, 1)
         lay.addLayout(sgrid)
 
         lay.addWidget(_hline())
@@ -621,6 +629,10 @@ class HardwareDialog(QDialog):
     def _connect_zaber(self):
         port = self.edit_zaber_port.text().strip() or None
         return self.main._connect_zaber_stage(port)
+
+    def _connect_piezo(self):
+        port = self.edit_piezo_port.text().strip() or None
+        return self.main._connect_piezo_jena_stage(port)
 
     def _on_full_scale(self):
         """Apply the typed full-scale override (blank clears it back to auto)."""
@@ -1809,6 +1821,19 @@ class FrogWindow(QMainWindow):
             stage = ZaberStage(port=port)     # blank port -> auto-scan
         except Exception as e:
             return False, f"Zaber connect failed: {e}"
+        ok, err = self._apply_stage(stage)
+        if not ok:
+            self._drop(stage)      # never adopted — release the serial port
+            return False, err
+        self.status.showMessage(f"Stage: {stage.name} — zero at current position.", 5000)
+        return True, (f"Stage connected: {stage.name}. Zero-delay set to current "
+                      f"position ({self.scan_cfg.zero_pos_um:.1f} um).")
+
+    def _connect_piezo_jena_stage(self, port=None):
+        try:
+            stage = PiezoJenaStage(port=port)     # blank port -> auto-scan
+        except Exception as e:
+            return False, f"Piezo Jena connect failed: {e}"
         ok, err = self._apply_stage(stage)
         if not ok:
             self._drop(stage)      # never adopted — release the serial port

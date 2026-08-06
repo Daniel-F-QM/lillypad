@@ -105,10 +105,12 @@ rather than the whole app.
 | --- | --- | --- |
 | Thorlabs Kinesis stage (LTS300C/M + autodetected stages) | `KinesisStage` | `pylablib` |
 | Zaber stage (serial / daisy-chain) | `ZaberStage` | `zaber-motion` |
+| piezosystems Jena piezo stage (serial, 320 um closed loop) | `PiezoJenaStage` | `pyserial` |
 | Ocean Optics / Ocean Insight spectrometer | `SeabreezeSpectrometer` | `seabreeze` |
 
 Kinesis and Seabreeze both enumerate first and pop a picker when more than one
-device is attached. Zaber auto-scans serial ports when no port is given.
+device is attached. Zaber and Piezo Jena auto-scan serial ports when no port is
+given.
 
 **Kinesis stages.** `KinesisStage` identifies the stage from the model number
 its controller reports before driving it, and calibrates it either from a

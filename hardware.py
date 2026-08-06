@@ -479,6 +479,137 @@ class ZaberStage(StageBase):
             self._conn = None
 
 
+class PiezoJenaStage(StageBase):
+    """piezosystems Jena closed-loop piezo stage over a plain serial port.
+
+    The controller speaks a bare ASCII protocol at 9600 baud ("i1" remote
+    mode, "cl" closed loop, "rd" position readback, "wr,<um>" absolute move).
+    It works in MICROMETRES over 0..320 um with 0.1 um resolution; this
+    adapter converts to the mm contract of StageBase.
+
+    `port` may be an explicit port name ("COM5") or None (the default) to
+    probe the machine's serial ports and use the first that answers like a
+    Piezo Jena controller: an unknown command is answered with "err,2", which
+    no other device on a bench is likely to say.
+
+    "wr" only sets the target — the controller settles on its own — so
+    move_to() polls "rd" until the readback is within tolerance, with a hard
+    deadline so a wedged controller raises instead of hanging the GUI.
+    """
+    _TOL_UM = 0.1   # settle tolerance = the stage's own resolution
+
+    def __init__(self, port: str | None = None, travel_um: float = 320.0,
+                 probe_timeout_s: float = 0.5):
+        import serial
+
+        self._ser = None
+        self._ser, used_port = self._open(port, probe_timeout_s, serial)
+        try:
+            self._ser.timeout = 2.0        # working timeout, per readline
+            self._command(b"i1")           # remote-control mode
+            time.sleep(0.05)
+            self._command(b"cl")           # closed-loop mode
+            time.sleep(0.05)
+            self.travel_mm = travel_um / 1000.0
+            self.name = f"Piezo Jena [{used_port}]"
+        except Exception:
+            self.disconnect()
+            raise
+
+    @staticmethod
+    def _candidate_ports() -> list[str]:
+        try:
+            from serial.tools import list_ports
+            # Bluetooth-link COM ports block for seconds on open — never a
+            # piezo controller, so don't even probe them.
+            return [p.device for p in list_ports.comports()
+                    if not p.description.startswith(
+                        "Standard Serial over Bluetooth link")]
+        except Exception:
+            return []
+
+    def _open(self, port, probe_timeout_s, serial):
+        """Open and identify the controller; return (Serial, port name).
+
+        Each candidate is probed with a deliberately unknown command — a
+        Piezo Jena controller answers "err,2", anything else is not ours.
+        """
+        ports = [port] if port else self._candidate_ports()
+        if not ports:
+            raise RuntimeError(
+                "No serial ports found. Pass an explicit port (e.g. 'COM5').")
+
+        last_err = None
+        for p in ports:
+            ser = None
+            try:
+                ser = serial.Serial(p, baudrate=9600,
+                                    timeout=probe_timeout_s)
+                ser.reset_input_buffer()
+                ser.write(b"hello\r")
+                if ser.readline().startswith(b"err,2"):
+                    return ser, p
+                ser.close()
+            except Exception as e:            # busy / no reply / not ours
+                last_err = e
+                if ser is not None:
+                    try:
+                        ser.close()
+                    except Exception:
+                        pass
+        if port:
+            raise RuntimeError(f"No Piezo Jena stage on {port!r}: {last_err}")
+        raise RuntimeError(
+            f"No Piezo Jena stage found on any serial port "
+            f"({', '.join(ports)}). Last error: {last_err}")
+
+    def _command(self, cmd: bytes) -> None:
+        self._ser.write(cmd + b"\r\n")
+
+    def move_to(self, position_mm: float) -> None:
+        # Clamp instead of raising: the scan worker pre-checks its targets
+        # against travel_mm, so anything out of range here is a manual move.
+        target_um = min(max(float(position_mm) * 1000.0, 0.0),
+                        self.travel_mm * 1000.0)
+        self._command(b"wr,%.2f" % target_um)
+        deadline = time.monotonic() + 5.0
+        while abs(self.get_position() * 1000.0 - target_um) > self._TOL_UM:
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"Stage did not settle at {target_um:.2f} um within 5 s "
+                    f"(readback {self.get_position() * 1000.0:.2f} um).")
+            time.sleep(0.05)
+
+    def move_by(self, delta_mm: float) -> None:
+        self.move_to(self.get_position() + float(delta_mm))
+
+    def get_position(self) -> float:
+        # Reply looks like b"rd,123.4\r\n" — the value follows the last comma.
+        self._ser.reset_input_buffer()
+        self._command(b"rd")
+        reply = self._ser.readline()
+        try:
+            return float(reply[reply.rfind(b",") + 1:]) / 1000.0
+        except ValueError:
+            raise RuntimeError(
+                f"Piezo Jena stage gave no usable position readback "
+                f"(reply: {reply!r}).") from None
+
+    def home(self) -> None:
+        # No homing routine exists for this closed-loop piezo; raising keeps
+        # the GUI's "homed to 0 mm" message from ever lying about it.
+        raise RuntimeError("home not defined for this stage")
+
+    def disconnect(self) -> None:
+        ser = getattr(self, "_ser", None)
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
+
 def list_seabreeze_spectrometers(backend: str = "cseabreeze") -> list[tuple[str, str]]:
     """Enumerate attached Ocean Optics spectrometers without adopting any.
     Returns [(model, serial), ...]; entries whose metadata cannot be read come
