@@ -64,15 +64,31 @@ Requires Visual C++ - e.g. x64 "Visual C++ Redistributable" (vc_redist.x64.exe)
 
 ```bash
 git clone https://github.com/Daniel-F-QM/lillypad.git
-cd lillypad
 
-conda deactivate                #only if your terminal launched with conda, you will see (Base)... in your terminal
+###
+Without anaconda installed
+###
+
 python -m venv .venv
 .venv\Scripts\activate          # Windows;  source .venv/bin/activate on POSIX
 pip install --no-deps -r requirements.txt
 seabreeze_os_setup              # Required for seabreeze to talk to the spectrometers
 
 python frog_gui_fast.py
+
+###
+With anaconda installed
+###
+
+conda deactivate                # in case conda is running in your terminal
+
+py -3.14  -m venv .venv         # e.g. for python 3.14, if you don't have non-conda python installed you need to install it
+.venv\Scripts\activate          # Windows;  source .venv/bin/activate on POSIX
+pip install --no-deps -r requirements.txt
+seabreeze_os_setup              # Required for seabreeze to talk to the spectrometers
+
+python frog_gui_fast.py
+
 ```
 
 > **`--no-deps` is required.** `requirements.txt` is a complete lockfile, and
