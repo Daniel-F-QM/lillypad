@@ -584,7 +584,7 @@ class AcquisitionSettingsDialog(QDialog):
         srow = QGridLayout(); srow.setSpacing(8)
         srow.addWidget(QLabel("Threshold"), 0, 0)
         self.spin_sat = DoubleSpinBox()
-        self.spin_sat.setRange(50.0, 100.0); self.spin_sat.setDecimals(1)
+        self.spin_sat.setRange(50.0, 100.0); self.spin_sat.setDecimals(0)
         self.spin_sat.setSingleStep(1.0); self.spin_sat.setSuffix(" % FS")
         self.spin_sat.setValue(100.0 * FrogScanConfig.saturation_fraction)
         srow.addWidget(self.spin_sat, 0, 1)
@@ -957,12 +957,12 @@ class GraphicsSettingsDialog(QDialog):
         # can produce; the tighter range keeps the spinbox from sizing itself
         # for a seven-figure number it will never show.
         self.spin_tmin = DoubleSpinBox()
-        self.spin_tmin.setRange(-1e5, 1e5); self.spin_tmin.setDecimals(1)
+        self.spin_tmin.setRange(-1e5, 1e5); self.spin_tmin.setDecimals(0)
         self.spin_tmin.setSingleStep(10); self.spin_tmin.setValue(-500)
         self.spin_tmin.setSuffix(" fs")
         tx_row.addWidget(self.spin_tmin)
         self.spin_tmax = DoubleSpinBox()
-        self.spin_tmax.setRange(-1e5, 1e5); self.spin_tmax.setDecimals(1)
+        self.spin_tmax.setRange(-1e5, 1e5); self.spin_tmax.setDecimals(0)
         self.spin_tmax.setSingleStep(10); self.spin_tmax.setValue(500)
         self.spin_tmax.setSuffix(" fs")
         tx_row.addWidget(self.spin_tmax)
@@ -1226,15 +1226,15 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.ax_trace = self.fig.add_subplot(gs[0, 1])
         self.ax_ac    = self.fig.add_subplot(gs[1, :])
 
-        (self.line_spec,) = self.ax_spec.plot([], [], color=PALETTE["accent"], lw=1.6)
-        (self.line_ac,)   = self.ax_ac.plot([], [], color=PALETTE["accent2"], lw=1.6)
+        (self.line_spec,) = self.ax_spec.plot([], [], color=PALETTE["accent"], lw=1)
+        (self.line_ac,)   = self.ax_ac.plot([], [], color=PALETTE["accent2"], lw=1)
         # Multi-spectrometer overlay: one curve per member, shown INSTEAD of
         # line_spec. Separate artists rather than a re-coloured line_spec, so
         # the single-device path stays exactly as it was. line_m1 is SLOT 1
         # and line_m2 slot 2, matching the S1/S2 saturation lamps and
         # integration spinboxes — not the internal blue/red member order.
-        (self.line_m1,) = self.ax_spec.plot([], [], color=MEMBER_COLORS[0], lw=1.6)
-        (self.line_m2,) = self.ax_spec.plot([], [], color=MEMBER_COLORS[1], lw=1.6)
+        (self.line_m1,) = self.ax_spec.plot([], [], color=MEMBER_COLORS[0], lw=1)
+        (self.line_m2,) = self.ax_spec.plot([], [], color=MEMBER_COLORS[1], lw=1)
         self.line_m1.set_visible(False)
         self.line_m2.set_visible(False)
         self._overlay = False
@@ -1258,7 +1258,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         # bites when a new scan calls init_trace: manual trace bounds are meant
         # to outlive the scan they were dialled in on.
         self.autoscale_trace = True
-        self._lw = 1.6
+        self._lw = 1
 
         # ── FROG-trace display settings ───────────────────────────────────
         # The threshold hides weak pixels from the PLOT only: the raw trace is
@@ -3033,7 +3033,7 @@ class FrogWindow(QMainWindow):
         self.spin_step_fs = DoubleSpinBox()
         self.eq_start = row(0, "Start", self.spin_start, " fs", 1, -1e6, 1e6, -500.0)
         self.eq_stop  = row(1, "Stop",  self.spin_stop,  " fs", 1, -1e6, 1e6,  500.0)
-        row(2, "Step", self.spin_step_fs, " fs", 4, 0.0001, 1e5, 1.0)
+        row(2, "Step", self.spin_step_fs, " fs", 1, 0.1, 1e5, 1.0)
         lay.addLayout(g)
         for s in (self.spin_start, self.spin_stop):
             s.valueChanged.connect(self._refresh_scan_um)
