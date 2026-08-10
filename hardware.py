@@ -801,6 +801,12 @@ class StitchedSpectrometer(SpectrometerBase):
     scaled by `stitch_factor` (fit or set by hand) to absorb any residual
     sensitivity mismatch; in the overlap the two contributions are averaged.
 
+    The two members hold INDEPENDENT integration times (see
+    set_member_integration_time). Frames stay in raw counts, so the exposure
+    ratio lands in `stitch_factor` along with the sensitivity ratio: change
+    either member's integration time and the factor must be re-fitted, or the
+    seam reappears. The GUI flags this rather than compensating silently.
+
     max_counts is None on purpose: counts on the common grid mix two detectors
     and two calibrations, so no single ADC full scale applies. Saturation goes
     unchecked unless the user sets a Full scale override.
@@ -832,7 +838,7 @@ class StitchedSpectrometer(SpectrometerBase):
         self.stitch_factor = 1.0
         self.name = f"stitched: {self.spec1.name} + {self.spec2.name}"
         self.max_counts = None
-        self.integration_ms = float(getattr(self.spec1, "integration_ms", 100.0))
+        self._sync_integration()
         # RAW (pre-calibration) frames of the most recent acquire, one per
         # member. This is what per-device saturation alarms judge: each frame
         # against its own member's max_counts. Tuple assignment is atomic, so
@@ -847,10 +853,51 @@ class StitchedSpectrometer(SpectrometerBase):
     def wavelengths(self) -> np.ndarray:
         return self._wl
 
+    def member_index(self, member: SpectrometerBase) -> int:
+        """0 for spec1 (bluer), 1 for spec2. Identity, not equality — the two
+        members are distinct live handles and nothing else can match them."""
+        return 0 if member is self.spec1 else 1
+
+    def member_scale(self, index: int) -> float:
+        """What acquire() multiplies member `index`'s calibrated frame by.
+
+        The single definition of that factor, so anything drawing the members
+        separately lands on the same scale as the combined frame instead of
+        re-deriving it and drifting.
+        """
+        return float(self.stitch_factor) if index == 0 else 1.0
+
+    def _sync_integration(self) -> None:
+        """Recompute `integration_ms` from the members' current exposures.
+
+        On a stitched device this is the cost of ONE acquire(), not an
+        exposure: acquire() drives the two members sequentially, so a frame
+        takes t1+t2. Its only consumers — the live feed's pacing sleep and the
+        timeout pause() waits out before handing the hardware over — both want
+        exactly that cycle time, and a max() here would under-estimate the
+        handover by up to 2x at long integrations.
+        """
+        self.integration_ms = (float(getattr(self.spec1, "integration_ms", 100.0))
+                               + float(getattr(self.spec2, "integration_ms", 100.0)))
+
     def set_integration_time(self, ms: float) -> None:
+        """Give BOTH members the same exposure. The single-value path, used
+        when a pair is first connected; see set_member_integration_time for
+        the per-device one."""
         self.spec1.set_integration_time(ms)
         self.spec2.set_integration_time(ms)
-        self.integration_ms = float(ms)
+        self._sync_integration()
+
+    def set_member_integration_time(self, index: int, ms: float) -> None:
+        """Expose one member independently of the other.
+
+        The two devices usually see very different signal levels, so a single
+        shared exposure means one of them is always either buried in read
+        noise or clipped. NOTE that this invalidates `stitch_factor` — frames
+        stay in raw counts, so the factor carries the exposure ratio too.
+        """
+        self.members[index].set_integration_time(ms)
+        self._sync_integration()
 
     def _acquire_pair(self) -> tuple[np.ndarray, np.ndarray]:
         """One frame from each member, calibrated, on their native grids."""
@@ -861,7 +908,7 @@ class StitchedSpectrometer(SpectrometerBase):
 
     def acquire(self) -> np.ndarray:
         i1, i2 = self._acquire_pair()
-        i1 = i1 * self.stitch_factor
+        i1 = i1 * self.member_scale(0)
         out = np.empty_like(self._wl)
         out[self._m1] = np.interp(self._wl[self._m1], self._wl1, i1)
         out[self._m2] = np.interp(self._wl[self._m2], self._wl2, i2)
@@ -874,7 +921,13 @@ class StitchedSpectrometer(SpectrometerBase):
         """Take one frame from each member and choose the factor that makes
         spec1 match spec2 over the overlap, least-squares. The residual is
         quadratic in the factor, so the minimum is the closed form
-        s = sum(I1*I2) / sum(I1^2) — no iterative optimiser needed."""
+        s = sum(I1*I2) / sum(I1^2) — no iterative optimiser needed.
+
+        The fit is over raw counts, so the result is the sensitivity ratio
+        TIMES the exposure ratio t2/t1. That makes it exposure-dependent: any
+        change to either member's integration time leaves it stale and it has
+        to be re-fitted.
+        """
         i1, i2 = self._acquire_pair()
         o = self._ovl
         a = np.interp(self._wl[o], self._wl1, i1)

@@ -158,6 +158,32 @@ against that device's own full scale, both live and during scans, so either
 detector clipping trips its own alarm. *Disable multi-spectrometer mode*
 keeps the slot-1 spectrometer connected as a normal single device.
 
+Each slot also offers a **simulated** member — *Simulated — blue half* and
+*Simulated — red half*, listed above the real devices and available even with
+no spectrometer attached — so the whole mode can be exercised offline. The two
+cover overlapping halves of the simulated signal band (roughly 65% each, so
+there is a genuine blue-only / shared / red-only geometry for *Auto-stitch* to
+work on) rather than two identical full-band copies, which would make the
+entire spectrum "overlap" and test nothing. Entering the mode while the
+simulator is connected pre-fills slot 1, so picking the red half in slot 2 is
+all it takes. Leaving the mode restores the normal full-band simulator.
+
+While a pair is connected the Spectrum panel offers **one integration time per
+spectrometer** (*S1* / *S2*, in slot order — the same numbering as the lamps),
+so an arm that sees little light can be exposed longer than a bright one.
+Frames stay in raw counts, so the exposure ratio ends up inside the stitch
+factor: after changing either time, re-run *Auto-stitch*, or the seam
+reappears. The Multi-Spec menu marks the factor *stale* until you do, and the
+dark is exposure-specific too, so re-record it.
+
+The button beside the auto-fit control on the plot switches the Spectrum panel
+between the combined stitched curve and **one curve per spectrometer** (S1 sky
+blue, S2 orange — a colourblind-safe pair), each on its own pixel grid with its
+own dark and calibration applied. That is the view for judging the stitch: with
+a good factor the two curves lie on top of each other across the overlap. The
+icon shows the view you get by clicking. The combined curve returns
+automatically during a scan, since the scan records stitched columns.
+
 **Adding a device class.** Implement `StageBase` or `SpectrometerBase` in
 [hardware.py](hardware.py). Moves must block until settled, so the scan loop can
 read back a trustworthy position on the next line.

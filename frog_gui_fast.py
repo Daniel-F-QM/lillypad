@@ -43,7 +43,8 @@ from PySide6.QtWidgets import (
     QDialog, QToolBar, QSlider, QLineEdit, QMenu, QComboBox, QRubberBand,
     QMessageBox, QInputDialog
 )
-from PySide6.QtCore import Qt, QTimer, QThread, Signal, QPointF, QSize, QRect, QPoint
+from PySide6.QtCore import (Qt, QTimer, QThread, Signal, QPointF, QSize, QRect,
+                            QPoint, QSignalBlocker)
 from PySide6.QtGui import (QPalette, QColor, QFont, QIcon, QPixmap, QPainter,
                            QPen, QPolygonF, QAction, QActionGroup)
 import matplotlib
@@ -93,6 +94,21 @@ LIGHT_PALETTE = {
 
 # Mutated in place on theme switch so every runtime PALETTE[...] lookup follows.
 PALETTE = dict(DARK_PALETTE)
+
+# Per-spectrometer curves in multi-spectrometer mode. Okabe-Ito sky blue and
+# orange — the highest-contrast pair in that set. Deliberately NOT palette
+# keys: both read clearly on the dark and the light plot background, and they
+# stay separable under deuteranopia, protanopia and tritanopia (and in
+# greyscale), which the theme accents do not.
+MEMBER_COLORS = ("#56B4E9", "#E69F00")      # SLOT order: (S1, S2)
+
+# Simulated members offered alongside real devices in the multi-spectrometer
+# slots, so the mode can be exercised without two spectrometers on the bench.
+# The "serials" are sentinels, not device serials — _open_slot_device branches
+# on them. Each covers one overlapping half of the simulated signal band; see
+# _make_sim_member for why halves and not two full-band copies.
+SIM_SLOT_DEVICES = (("__sim_blue__", "Simulated — blue half"),
+                    ("__sim_red__",  "Simulated — red half"))
 
 FONT_STACK = "'Segoe UI','DejaVu Sans',Arial,sans-serif"
 
@@ -273,6 +289,14 @@ ICON_PATH    = resource_path("icons", "Lilypad.png")
 SUN_ICON     = resource_path("icons", "sun.png")
 MOON_ICON    = resource_path("icons", "moon.png")
 RESCALE_ICON = resource_path("icons", "rescale.png")
+# Spectrum-panel view toggle, keyed by theme (the suffix names the theme each
+# icon was drawn for, not what it depicts). The icons advertise the ACTION:
+# the broken one means "split the pair apart", the continuous one "put it back
+# together" — so the button shows the view you get by clicking it.
+SPLIT_ICON = {"dark":  resource_path("icons", "broken_spectrum_dark.png"),
+              "light": resource_path("icons", "broken_spectrum_light.png")}
+MERGE_ICON = {"dark":  resource_path("icons", "continuous_spectrum_dark.png"),
+              "light": resource_path("icons", "continuous_spectrum_light.png")}
 
 
 def app_dir():
@@ -1148,6 +1172,16 @@ class FrogCanvas(FigureCanvasQTAgg):
 
         (self.line_spec,) = self.ax_spec.plot([], [], color=PALETTE["accent"], lw=1.6)
         (self.line_ac,)   = self.ax_ac.plot([], [], color=PALETTE["accent2"], lw=1.6)
+        # Multi-spectrometer overlay: one curve per member, shown INSTEAD of
+        # line_spec. Separate artists rather than a re-coloured line_spec, so
+        # the single-device path stays exactly as it was. line_m1 is SLOT 1
+        # and line_m2 slot 2, matching the S1/S2 saturation lamps and
+        # integration spinboxes — not the internal blue/red member order.
+        (self.line_m1,) = self.ax_spec.plot([], [], color=MEMBER_COLORS[0], lw=1.6)
+        (self.line_m2,) = self.ax_spec.plot([], [], color=MEMBER_COLORS[1], lw=1.6)
+        self.line_m1.set_visible(False)
+        self.line_m2.set_visible(False)
+        self._overlay = False
         self.im = self.ax_trace.imshow(np.zeros((2, 2)), origin="lower",
                                        aspect="auto", cmap="magma",
                                        extent=[-1, 1, 0, 1])
@@ -1186,11 +1220,20 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.mpl_connect('button_release_event', self._on_release)
 
         # ── Blitting state ────────────────────────────────────────────────
-        # These three are drawn by hand every frame; exclude them from draw().
+        # These are drawn by hand every frame; exclude them from draw().
+        # The member lines must be in here even while hidden, or they would
+        # appear on a blit and then vanish on the next full redraw (resize,
+        # theme switch) — _on_draw only repaints what this list names.
+        # Line2D.draw() returns immediately when invisible, so the two extra
+        # entries cost nothing outside overlay mode.
         self.line_spec.set_animated(True)
         self.line_ac.set_animated(True)
+        self.line_m1.set_animated(True)
+        self.line_m2.set_animated(True)
         self.im.set_animated(True)
         self._animated = [(self.ax_spec, self.line_spec),
+                          (self.ax_spec, self.line_m1),
+                          (self.ax_spec, self.line_m2),
                           (self.ax_trace, self.im),
                           (self.ax_ac, self.line_ac)]
         self._bg = None            # cached full-figure background (no animated)
@@ -1249,6 +1292,9 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.fig.set_facecolor(pal["plot_bg"])
         self.line_spec.set_color(pal["accent"])
         self.line_ac.set_color(pal["accent2"])
+        # line_m1/line_m2 keep MEMBER_COLORS in both themes — they are chosen
+        # to work on either background, and re-theming them would cost the
+        # colourblind separation that is the whole point.
         self._style()   # re-applies axes/tick/label/grid colors from PALETTE
         self._apply_cmap()   # masked pixels must follow the new background
         self.draw_idle()
@@ -1303,6 +1349,8 @@ class FrogCanvas(FigureCanvasQTAgg):
             self._bg_static = self.copy_from_bbox(self.fig.bbox)
         self.restore_region(self._bg_static)
         self.ax_spec.draw_artist(self.line_spec)
+        self.ax_spec.draw_artist(self.line_m1)
+        self.ax_spec.draw_artist(self.line_m2)
         self.blit(self.fig.bbox)
 
     # ── Render-request coalescing ─────────────────────────────────────────
@@ -1466,7 +1514,7 @@ class FrogCanvas(FigureCanvasQTAgg):
     def fit_y(self):
         """One-shot Y auto-fit; returns new (ymin, ymax)."""
         self.ax_spec.set_autoscaley_on(True)
-        self.ax_spec.relim()
+        self.ax_spec.relim(visible_only=True)
         self.ax_spec.autoscale_view(scalex=False)
         self._ylim_cache = self.ax_spec.get_ylim()
         self.draw_idle()
@@ -1478,7 +1526,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         # matplotlib's internal autoscale off, making autoscale_view a no-op.
         self.ax_spec.set_autoscalex_on(True)
         self.ax_spec.set_autoscaley_on(True)
-        self.ax_spec.relim()
+        self.ax_spec.relim(visible_only=True)
         self.ax_spec.autoscale_view()
         self.autoscale_x = False
         self.autoscale_y = False
@@ -1546,7 +1594,39 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._lw = lw
         self.line_spec.set_linewidth(lw)
         self.line_ac.set_linewidth(lw)
+        self.line_m1.set_linewidth(lw)
+        self.line_m2.set_linewidth(lw)
         self.draw_idle()
+
+    # ── Spectrum panel: combined curve vs one curve per spectrometer ──────
+    def _set_spec_mode(self, overlay):
+        """Switch the spectrum panel between the combined curve and the two
+        per-spectrometer curves. Idempotent — every update_* path calls it.
+
+        Whichever lines go dark have their data CLEARED, not just hidden:
+        matplotlib's relim() defaults to visible_only=False, so a hidden line
+        still holding a frame would go on driving the y auto-scale.
+        """
+        if overlay == self._overlay:
+            return
+        self._overlay = overlay
+        self.line_spec.set_visible(not overlay)
+        self.line_m1.set_visible(overlay)
+        self.line_m2.set_visible(overlay)
+        for ln in ((self.line_spec,) if overlay else (self.line_m1, self.line_m2)):
+            ln.set_data([], [])
+        # Switching views is rare and changes which curves exist on screen; a
+        # full draw re-caches both blit backgrounds, so nothing from the
+        # previous view can survive in them. _request_full (not draw_idle)
+        # keeps it batch-safe — a scan column reaches here inside batch().
+        self._request_full()
+
+    def clear_members(self):
+        """Drop back to the combined curve and forget the member frames —
+        used on a device swap, so a dead pair's curves cannot linger."""
+        self._set_spec_mode(False)
+        self.line_m1.set_data([], [])
+        self.line_m2.set_data([], [])
 
     def set_proportions(self, spec_frac):
         """Resize spectrum vs FROG trace columns; spec_frac = 0.15–0.55."""
@@ -1572,6 +1652,10 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.draw_idle()
 
     def update_spectrum(self, wl, spectrum):
+        # Last writer owns the panel: whoever has a combined frame to show
+        # (live feed, scan column) takes it back from the overlay without any
+        # coordination, and the overlay takes it back on its next frame.
+        self._set_spec_mode(False)
         self.line_spec.set_data(wl, spectrum)
         changed = False
         if self.autoscale_x:
@@ -1580,13 +1664,42 @@ class FrogCanvas(FigureCanvasQTAgg):
                 self.ax_spec.set_xlim(*xl); self._xlim_cache = xl; changed = True
         if self.autoscale_y:
             self.ax_spec.set_autoscaley_on(True)
-            self.ax_spec.relim()
+            self.ax_spec.relim(visible_only=True)
             self.ax_spec.autoscale_view(scalex=False)
             yl = self.ax_spec.get_ylim()
             if yl != self._ylim_cache:
                 self._ylim_cache = yl; changed = True
         if changed:
             self._request_full()      # limits moved: full redraw + re-cache bg
+        else:
+            self._request_blit(spec_only=True)
+
+    def update_member_spectra(self, wl1, s1, wl2, s2):
+        """Draw one curve per spectrometer instead of the combined one.
+
+        Each member sits on its OWN pixel grid, so the two x arrays differ and
+        the panel spans their union — which is exactly the stitched grid's
+        span, so toggling the view never jumps the x-axis.
+        """
+        if not (len(wl1) and len(wl2)):
+            return
+        self._set_spec_mode(True)
+        self.line_m1.set_data(wl1, s1)
+        self.line_m2.set_data(wl2, s2)
+        changed = False
+        if self.autoscale_x:
+            xl = (float(min(wl1[0], wl2[0])), float(max(wl1[-1], wl2[-1])))
+            if xl != self._xlim_cache:
+                self.ax_spec.set_xlim(*xl); self._xlim_cache = xl; changed = True
+        if self.autoscale_y:
+            self.ax_spec.set_autoscaley_on(True)
+            self.ax_spec.relim(visible_only=True)
+            self.ax_spec.autoscale_view(scalex=False)
+            yl = self.ax_spec.get_ylim()
+            if yl != self._ylim_cache:
+                self._ylim_cache = yl; changed = True
+        if changed:
+            self._request_full()
         else:
             self._request_blit(spec_only=True)
 
@@ -1691,6 +1804,16 @@ class FrogWindow(QMainWindow):
                                             delay_step_fs=1.0, zero_pos_um=150000.0)
         self._stage_units_fs = True     # jog/move fields default to fs
         self.background    = None
+        # Per-member dark frames for the per-spectrometer view. self.background
+        # lives on the stitched grid and cannot be un-mixed (its overlap region
+        # is an average of both devices), so each member needs its own.
+        self.background_members = None
+        self._dark_member_warned = False
+        self._overlay_on   = False   # spectrum panel showing the members apart
+        # Set when an integration time changes under a stitched pair: frames
+        # are raw counts, so stitch_factor carries the exposure ratio and goes
+        # stale. Surfaced in the Multi-Spec menu rather than silently re-fitted.
+        self._stitch_stale = False
         self.last_spectrum = None
         self.result        = None
         self._worker       = None
@@ -1800,6 +1923,46 @@ class FrogWindow(QMainWindow):
             position_to_delay=lambda pos_mm: position_to_delay_fs(
                 _stage_to_um(pos_mm), self.scan_cfg.zero_pos_um, self.scan_cfg.pass_factor))
 
+    def _make_sim_member(self, half):
+        """A simulated spectrometer covering one half of the simulated signal
+        band, for use as a stitched-pair member.
+
+        Halves, not two full-band copies: identical grids would make the whole
+        spectrum "overlap", so the stitch geometry — a blue-only region, a
+        shared middle, a red-only region — would never be exercised. The 30%
+        shared middle is what Auto-stitch fits over. The band itself is only
+        known to a constructed simulator (it is sized from the signal), hence
+        the throwaway probe; construction touches no hardware and costs a
+        handful of FFTs.
+        """
+        probe = self._make_sim_spectrometer()
+        wl = np.asarray(probe.wavelengths, float)
+        lo, hi = float(wl[0]), float(wl[-1])
+        span = hi - lo
+        start, end = ((lo, lo + 0.65 * span) if half == 0
+                      else (lo + 0.35 * span, hi))
+        sim = SimulatedSpectrometer(
+            self.stage, gate=self.sim_gate, pulse=self.sim_pulse,
+            wl_start=start, wl_end=end, n_pixels=512,
+            position_to_delay=lambda pos_mm: position_to_delay_fs(
+                _stage_to_um(pos_mm), self.scan_cfg.zero_pos_um,
+                self.scan_cfg.pass_factor))
+        # Distinct names: the two members share a class, so the saturation-lamp
+        # tooltips and the Auto-stitch message would otherwise name both
+        # identically and give no way to tell which is which.
+        sim.name = (f"simulated {'blue' if half == 0 else 'red'} half "
+                    f"[{start:.0f}–{end:.0f} nm]")
+        return sim
+
+    def _open_slot_device(self, serial):
+        """Open whatever a multi-spectrometer slot points at — a simulated
+        half, or a real device by serial."""
+        for half, (sim_serial, _label) in enumerate(SIM_SLOT_DEVICES):
+            if serial == sim_serial:
+                return self._make_sim_member(half)
+        return SeabreezeSpectrometer(serial=serial,
+                                     backend=self.seabreeze_backend)
+
     def _build_hardware_sim(self):
         self.stage = SimulatedStage(travel_mm=300.0)
         self.spec  = self._make_sim_spectrometer()
@@ -1863,6 +2026,9 @@ class FrogWindow(QMainWindow):
             # — and a different pixel count (certain with a stitched grid)
             # would crash the dark subtraction outright.
             self.background = None
+            self.background_members = None
+            self._dark_member_warned = False
+            self.canvas.clear_members()   # a dead pair's curves must not linger
             self.chk_dark.setChecked(False); self.chk_dark.setEnabled(False)
             self.last_spectrum = None
             self._live_frame = None
@@ -1876,6 +2042,8 @@ class FrogWindow(QMainWindow):
             self.canvas.autoscale_x = True
             if hasattr(self, 'dlg_graphics'):
                 self.dlg_graphics.chk_auto_x.setChecked(True)
+        # Outside the lock: pure widget state, no device I/O.
+        self._sync_multi_ui()
         return True, ""
 
     def _use_sim_stage(self):
@@ -2074,6 +2242,18 @@ class FrogWindow(QMainWindow):
         self.btn_autofit.show()
         self.btn_autofit.clicked.connect(self._autofit_spectrum)
 
+        # Per-spectrometer view toggle, beside the auto-fit button. Only
+        # meaningful for a stitched pair, so it stays hidden otherwise; its
+        # icon and tooltip are set by _refresh_overlay_button.
+        self.btn_overlay = QPushButton(self.canvas)
+        self.btn_overlay.setObjectName("overlay")
+        self.btn_overlay.setCheckable(True)
+        self.btn_overlay.setFixedSize(30, 30)
+        self.btn_overlay.setIconSize(QSize(18, 18))
+        self.btn_overlay.move(42, 6)        # 6 + 30 + 6, right of auto-fit
+        self.btn_overlay.hide()
+        self.btn_overlay.toggled.connect(self._on_overlay_toggled)
+
         self.dlg_graphics = GraphicsSettingsDialog(self.canvas, self)
         # Mouse zoom/reset keeps the dialog's spinboxes and auto-scale
         # checkboxes truthful; the y-axis click routes through chk_log so the
@@ -2261,7 +2441,10 @@ class FrogWindow(QMainWindow):
         info.setEnabled(False)
         menu.addAction(info)
         if stitched:
-            fct = QAction(f"Stitch factor: {self.spec.stitch_factor:.4g}", menu)
+            stale = ("  (stale — integration times changed)"
+                     if self._stitch_stale else "")
+            fct = QAction(f"Stitch factor: {self.spec.stitch_factor:.4g}{stale}",
+                          menu)
             fct.setEnabled(False)
             menu.addAction(fct)
         menu.addSeparator()
@@ -2298,19 +2481,9 @@ class FrogWindow(QMainWindow):
 
     def _populate_slot_spec_menu(self, sub, slot):
         sub.clear()
-        try:
-            devices = self._list_spectrometers()
-        except Exception as e:
-            act = QAction(f"(enumeration failed: {e})", sub)
-            act.setEnabled(False)
-            sub.addAction(act)
-            return
         other = self._multi["serials"][1 - slot]
-        added = 0
-        for model, serial in devices:
-            if serial == other:
-                continue           # already claimed by the other slot
-            label = f"{model} [{serial}]"
+
+        def add(serial, label):
             act = QAction(label, sub)
             act.setCheckable(True)
             act.setChecked(serial == self._multi["serials"][slot])
@@ -2318,6 +2491,26 @@ class FrogWindow(QMainWindow):
                 lambda _=False, i=slot, s=serial, l=label:
                 self._select_slot_device(i, s, l))
             sub.addAction(act)
+
+        # Simulated halves first, and BEFORE enumeration: they are the only
+        # way to try the mode without two spectrometers on the bench, so they
+        # have to stay reachable even when the USB query fails outright.
+        for serial, label in SIM_SLOT_DEVICES:
+            if serial != other:            # already claimed by the other slot
+                add(serial, label)
+        sub.addSeparator()
+        try:
+            devices = self._list_spectrometers()
+        except Exception as e:
+            act = QAction(f"(enumeration failed: {e})", sub)
+            act.setEnabled(False)
+            sub.addAction(act)
+            return
+        added = 0
+        for model, serial in devices:
+            if serial == other:
+                continue
+            add(serial, f"{model} [{serial}]")
             added += 1
         if not added:
             act = QAction("(no free spectrometers found)", sub)
@@ -2379,8 +2572,15 @@ class FrogWindow(QMainWindow):
             if serial:
                 self._multi["serials"][0] = str(serial)
                 self._multi["labels"][0]  = self.spec.name
+        elif isinstance(self.spec, SimulatedSpectrometer):
+            # Entering the mode from the simulator: pre-pick the blue half, so
+            # picking the red half in slot 2 is all it takes to get a working
+            # pair to try the mode on.
+            self._multi["serials"][0], self._multi["labels"][0] = \
+                SIM_SLOT_DEVICES[0]
         self.lbl_sat2.show(); self.lamp2.show()
         self._reset_saturation()
+        self._sync_multi_ui()
         self.status.showMessage(
             "Multi-spectrometer mode: pick a spectrometer for each slot in "
             "the Multi-Spec menu.", 6000)
@@ -2402,8 +2602,7 @@ class FrogWindow(QMainWindow):
         opened = []
         try:
             for serial in (s1, s2):
-                opened.append(SeabreezeSpectrometer(
-                    serial=serial, backend=self.seabreeze_backend))
+                opened.append(self._open_slot_device(serial))
             for spec, cal in zip(opened, self._multi["cals"]):
                 if cal is not None:
                     spec.set_calibration(cal)
@@ -2417,7 +2616,13 @@ class FrogWindow(QMainWindow):
             self._drop(stitched)   # disconnects both members
             return False, err
         self._multi_members = list(opened)      # slot order, not blue/red
+        self._stitch_stale = False              # fresh pair, equal exposures
         self._reset_saturation()   # slot-ordered lamp tooltips need the mapping
+        # Again, now that the slot mapping exists: _apply_spectrometer ran
+        # before _multi_members was assigned, so its _sync_multi_ui saw
+        # _slot_members() fall back to (blue, red) and would have seeded the
+        # S1/S2 spinboxes from the wrong members.
+        self._sync_multi_ui()
         wl = stitched.wavelengths
         self.status.showMessage(f"Spectrometer: {stitched.name}", 5000)
         return True, (f"Stitched pair connected: {stitched.name}, "
@@ -2434,16 +2639,24 @@ class FrogWindow(QMainWindow):
         keep_label  = self._multi["labels"][0]
         keep_cal    = self._multi["cals"][0]
         was_live    = isinstance(self.spec, StitchedSpectrometer)
+        keep_is_sim = any(keep_serial == s for s, _l in SIM_SLOT_DEVICES)
         msg = "Multi-spectrometer mode disabled."
         if was_live:
             # Release both members before reopening slot 1 on its own.
             ok, err = self._apply_spectrometer(self._make_sim_spectrometer())
             if not ok:
                 return False, err
+        if was_live and keep_is_sim:
+            # Nothing to reopen: the swap above already put the FULL-band
+            # simulator back. Keeping slot 1 would instead leave its half-band
+            # member behind, which outside a stitched pair just looks like a
+            # truncated spectrometer.
+            msg = ("Multi-spectrometer mode disabled — back to the simulated "
+                   "spectrometer.")
+        elif was_live:
             single = None
             try:
-                single = SeabreezeSpectrometer(serial=keep_serial,
-                                               backend=self.seabreeze_backend)
+                single = self._open_slot_device(keep_serial)
                 if keep_cal is not None:
                     single.set_calibration(keep_cal)
             except Exception as e:
@@ -2462,8 +2675,10 @@ class FrogWindow(QMainWindow):
         self._multi = {"on": False, "serials": [None, None],
                        "labels": [None, None], "cals": [None, None]}
         self._multi_members = [None, None]
+        self._stitch_stale = False
         self.lbl_sat2.hide(); self.lamp2.hide()
         self._reset_saturation()
+        self._sync_multi_ui()
         return True, msg
 
     def _menu_result(self, fn):
@@ -2488,6 +2703,7 @@ class FrogWindow(QMainWindow):
                 factor = self.spec.fit_stitch_factor()
             except Exception as e:
                 return False, f"Stitch-factor fit failed: {e}"
+        self._stitch_stale = False
         return True, (f"Stitch factor fitted: {factor:.4g} "
                       f"(applied to {self.spec.spec1.name}).")
 
@@ -2500,6 +2716,7 @@ class FrogWindow(QMainWindow):
             self.spec.stitch_factor, 1e-6, 1e6, 6)
         if ok:
             self.spec.stitch_factor = float(val)   # atomic — no lock needed
+            self._stitch_stale = False   # the user just said what they want
             self.status.showMessage(f"Stitch factor set to {val:.4g}.", 4000)
 
     def _build_spectrum_group(self):
@@ -2510,7 +2727,8 @@ class FrogWindow(QMainWindow):
         self.btn_feed.setCheckable(True); self.btn_feed.setChecked(True)
         self.btn_feed.toggled.connect(self._toggle_feed)
         lay.addWidget(self.btn_feed)
-        lay.addWidget(QLabel("Integration Time"))
+        self.lbl_integration = QLabel("Integration Time")
+        lay.addWidget(self.lbl_integration)
         self.spin_integration = QSpinBox()
         self.spin_integration.setRange(1, 10000); self.spin_integration.setValue(10)
         self.spin_integration.setSuffix("  ms")
@@ -2525,6 +2743,23 @@ class FrogWindow(QMainWindow):
         self.spin_integration.valueChanged.connect(
             lambda _v: self._integration_timer.start())
         lay.addWidget(self.spin_integration)
+        # Second exposure, shown only for a stitched pair. The two devices see
+        # very different signal levels, so one shared value always leaves one
+        # of them either buried in read noise or clipped. S1/S2 are SLOT order
+        # — the same numbering as the saturation lamps and the Multi-Spec menu.
+        self.lbl_integration2 = QLabel("Integration Time — S2")
+        lay.addWidget(self.lbl_integration2)
+        self.spin_integration2 = QSpinBox()
+        self.spin_integration2.setRange(1, 10000); self.spin_integration2.setValue(10)
+        self.spin_integration2.setSuffix("  ms")
+        # Same debounce timer as S1 on purpose: editing both boxes then costs
+        # ONE feed handover instead of two, and a handover blocks until the
+        # in-flight acquire returns.
+        self.spin_integration2.valueChanged.connect(
+            lambda _v: self._integration_timer.start())
+        lay.addWidget(self.spin_integration2)
+        self.lbl_integration2.setVisible(False)
+        self.spin_integration2.setVisible(False)
         lay.addWidget(_hline())
         self.btn_dark = QPushButton("Record Dark")
         self.btn_dark.setObjectName("accent")
@@ -2664,6 +2899,7 @@ class FrogWindow(QMainWindow):
         self.btn_theme.setIcon(QIcon(str(MOON_ICON if name == "light" else SUN_ICON)))
         self.btn_theme.setToolTip(
             "Switch to dark mode" if name == "light" else "Switch to light mode")
+        self._refresh_overlay_button()   # its icons are per-theme too
         self.status.showMessage(f"{name.capitalize()} mode.", 2000)
 
     # ── Saturation indicator ─────────────────────────────────────────────────
@@ -2706,6 +2942,75 @@ class FrogWindow(QMainWindow):
                 and set(map(id, self._multi_members)) == set(map(id, members))):
             return list(self._multi_members)
         return list(members)
+
+    def _sync_multi_ui(self):
+        """Bring every stitched-vs-single widget into line with self.spec.
+
+        One owner for the second integration spinbox and the overlay button,
+        so no caller has to remember the set. Pure widget state — no device
+        I/O, so it is safe to call outside _device_lock.
+        """
+        stitched = isinstance(self.spec, StitchedSpectrometer)
+        slots = self._slot_members() if stitched else []
+        self.lbl_integration.setText("Integration Time — S1" if stitched
+                                     else "Integration Time")
+        self.lbl_integration2.setVisible(stitched)
+        self.spin_integration2.setVisible(stitched)
+        if len(slots) == 2:
+            for mem, spin in zip(slots, (self.spin_integration,
+                                         self.spin_integration2)):
+                ms = int(round(float(getattr(mem, "integration_ms", 10.0))))
+                # Blocked: seeding must not restart the debounce, or 250 ms
+                # later we would take another feed handover to write back a
+                # value the device already holds.
+                with QSignalBlocker(spin):
+                    spin.setValue(max(1, min(10000, ms)))
+        else:
+            # No live pair: the per-spectrometer view has nothing to show.
+            if self.btn_overlay.isChecked():
+                with QSignalBlocker(self.btn_overlay):
+                    self.btn_overlay.setChecked(False)
+            self._overlay_on = False
+            self.canvas.clear_members()
+        self._refresh_overlay_button()
+
+    def _refresh_overlay_button(self):
+        """Icon, tooltip and availability of the per-spectrometer view toggle.
+
+        The icon shows the view a CLICK produces, not the current one: broken
+        spectrum while the combined curve is up, continuous once the members
+        are drawn apart.
+        """
+        stitched = isinstance(self.spec, StitchedSpectrometer)
+        self.btn_overlay.setVisible(stitched and len(self._slot_members()) == 2)
+        self.btn_overlay.setEnabled(not self._scan_running())
+        on = self.btn_overlay.isChecked()
+        icon = (MERGE_ICON if on else SPLIT_ICON)[self._theme]
+        if icon.exists():
+            self.btn_overlay.setIcon(QIcon(str(icon)))
+            self.btn_overlay.setText("")
+        else:
+            self.btn_overlay.setIcon(QIcon())
+            self.btn_overlay.setText("∿" if on else "⌇")
+        self.btn_overlay.setToolTip(
+            "Show the combined stitched spectrum as one curve" if on else
+            "Show each spectrometer as its own curve — compare the two across "
+            "the overlap to judge the stitch factor")
+
+    def _on_overlay_toggled(self, on):
+        if on and not (isinstance(self.spec, StitchedSpectrometer)
+                       and len(self._slot_members()) == 2):
+            with QSignalBlocker(self.btn_overlay):
+                self.btn_overlay.setChecked(False)
+            return
+        self._overlay_on = bool(on)
+        if not on:
+            # Don't wait for the next frame to put the combined curve back.
+            self.canvas.clear_members()
+        self._refresh_overlay_button()
+        self.status.showMessage(
+            "Spectrum panel: one curve per spectrometer." if on else
+            "Spectrum panel: combined stitched spectrum.", 4000)
 
     def _member_full_scale(self, member):
         """A member's effective full scale: the Hardware override, when set,
@@ -2846,6 +3151,8 @@ class FrogWindow(QMainWindow):
                                 else raw)
         self._sat_frame = None
         self._sat_peak = -1.0
+        if self._overlay_on and self._render_overlay():
+            return
         spectrum = raw
         if self.chk_dark.isChecked() and self.background is not None:
             spectrum = np.clip(raw - self.background, 0, None)
@@ -2853,6 +3160,52 @@ class FrogWindow(QMainWindow):
         # raw-ADC property, the calibration is display/data physics.
         spectrum = self.spec.calibrate(spectrum)
         self.canvas.update_spectrum(wl, spectrum)
+
+    def _render_overlay(self):
+        """Draw one curve per stitched member. False = nothing to draw yet, so
+        the caller falls back to the combined frame.
+
+        Reproduces the decomposition of what acquire() merges — raw, dark,
+        calibrate, member scale — so with a fitted stitch factor the two curves
+        lie on the combined one instead of telling a different story. Each
+        member keeps its NATIVE pixel grid; no interpolation happens here.
+
+        Reads self.spec.last_member_raw from the GUI thread without the device
+        lock, exactly as _update_saturation does: the tuple assignment is
+        atomic, and calibrate() plus the wavelength arrays are pure.
+        """
+        spec = self.spec
+        frames = getattr(spec, "last_member_raw", None)
+        slots = self._slot_members()
+        if frames is None or len(slots) != 2:
+            return False
+        raw_by_id = {id(m): f for m, f in zip(spec.members, frames)}
+        darks = self.background_members if self.chk_dark.isChecked() else None
+        # All or nothing: subtracting from one curve but not the other would
+        # put the two on different baselines, which is exactly the comparison
+        # this view exists to make.
+        subtract = darks is not None and all(
+            d.shape == np.shape(f) for d, f in zip(darks, frames))
+        curves = []
+        for mem in slots:
+            raw = raw_by_id.get(id(mem))
+            if raw is None:
+                return False
+            idx = spec.member_index(mem)
+            y = np.asarray(raw, float)
+            if subtract:
+                y = np.clip(y - darks[idx], 0, None)
+            y = mem.calibrate(y) * spec.member_scale(idx)
+            curves.append((np.asarray(mem.wavelengths, float), y))
+        if self.chk_dark.isChecked() and not subtract and not self._dark_member_warned:
+            # One shot only — this runs every 60 ms and would bury the status bar.
+            self._dark_member_warned = True
+            self.status.showMessage(
+                "Dark does not match this pair — not subtracted in the "
+                "per-spectrometer view. Re-record it.", 6000)
+        self.canvas.update_member_spectra(curves[0][0], curves[0][1],
+                                          curves[1][0], curves[1][1])
+        return True
 
     def _autofit_spectrum(self):
         """One-shot fit of spectrum X + Y; syncs Graphics Settings spinboxes."""
@@ -2873,20 +3226,50 @@ class FrogWindow(QMainWindow):
         self.btn_feed.style().unpolish(self.btn_feed); self.btn_feed.style().polish(self.btn_feed)
 
     def _apply_integration_time(self):
-        """Push the (debounced) integration time to the spectrometer."""
-        ms = self.spin_integration.value()
+        """Push the (debounced) integration time(s) to the spectrometer.
+
+        A stitched pair takes one value per member, from the S1/S2 spinboxes
+        in slot order; anything else takes the single spinbox. Both boxes
+        share this one debounce, so editing them together costs a single feed
+        handover.
+        """
         if self._scan_running():
             self.status.showMessage(
                 "A scan is running — integration time applies to the next scan.", 4000)
             return
+        slots = self._slot_members() if isinstance(self.spec,
+                                                   StitchedSpectrometer) else []
+        changed = []
         with self._device_lock() as ok:
             if not ok:
                 self.status.showMessage(FEED_BUSY_MSG, 4000)
                 return
             try:
-                self.spec.set_integration_time(ms)
+                if len(slots) == 2:
+                    for i, (mem, spin) in enumerate(
+                            zip(slots, (self.spin_integration,
+                                        self.spin_integration2))):
+                        ms = spin.value()
+                        if float(getattr(mem, "integration_ms", -1.0)) == float(ms):
+                            continue   # already there — don't disturb the device
+                        self.spec.set_member_integration_time(
+                            self.spec.member_index(mem), ms)
+                        changed.append(f"S{i + 1} {ms} ms")
+                else:
+                    self.spec.set_integration_time(self.spin_integration.value())
             except Exception as e:
                 self.status.showMessage(f"Integration time failed: {e}", 5000)
+                return
+        if changed:
+            # Frames stay in raw counts, so stitch_factor now carries the wrong
+            # exposure ratio and the seam will show. Say so rather than let the
+            # user discover it in the data.
+            self._stitch_stale = True
+            msg = (f"{', '.join(changed)} — the two spectrometers no longer "
+                   f"share a scale; re-run Multi-Spec → Auto-stitch.")
+            if self.background is not None:
+                msg += " The dark is exposure-specific too — re-record it."
+            self.status.showMessage(msg, 8000)
 
     def _capture_dark(self):
         if self.last_spectrum is None:
@@ -2899,6 +3282,19 @@ class FrogWindow(QMainWindow):
                     return
                 self.last_spectrum = np.asarray(self.spec.acquire(), float)
         self.background = self.last_spectrum.copy()
+        # The per-spectrometer view plots each member's own raw frame, and the
+        # stitched dark cannot be un-mixed into those (its overlap region is an
+        # average of both devices), so keep the members' darks as well. Stored
+        # positionally in self.spec.members order — NOT keyed by id(), which is
+        # recycled across reconnects; _apply_spectrometer clears the field on
+        # every swap, so the order can never go stale.
+        self.background_members = None
+        self._dark_member_warned = False
+        frames = getattr(self.spec, "last_member_raw", None)   # atomic tuple read
+        if frames is not None:
+            # May be one feed frame newer than last_spectrum; both are darks.
+            self.background_members = tuple(np.asarray(f, float).copy()
+                                            for f in frames)
         self.chk_dark.setEnabled(True); self.chk_dark.setChecked(True)
         self.status.showMessage("Dark recorded.", 3000)
 
@@ -3103,6 +3499,10 @@ class FrogWindow(QMainWindow):
         self._worker.finished_scan.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
+        # The worker only hands back combined columns, so the panel falls back
+        # to the stitched curve on its own (update_spectrum owns the mode);
+        # grey the toggle out rather than let it look broken for the duration.
+        self._refresh_overlay_button()
         self.status.showMessage(f"FROG scan: {delays.size} points…", 0)
 
     def _on_progress(self, done, total):
@@ -3202,6 +3602,7 @@ class FrogWindow(QMainWindow):
         self.btn_scan.style().unpolish(self.btn_scan); self.btn_scan.style().polish(self.btn_scan)
         self.btn_hw.setEnabled(True)
         self._set_stage_controls_enabled(True)
+        self._refresh_overlay_button()
         if self._feed_was_on and self.btn_feed.isChecked():
             self._feed.resume()
 
