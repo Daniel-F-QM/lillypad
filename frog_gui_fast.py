@@ -56,6 +56,7 @@ matplotlib.rcParams.update({
 })
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
+from matplotlib.transforms import ScaledTranslation
 
 from hardware import (SimulatedStage, SimulatedSpectrometer,
                       KinesisStage, ZaberStage, PiezoJenaStage,
@@ -111,6 +112,23 @@ SIM_SLOT_DEVICES = (("__sim_blue__", "Simulated — blue half"),
                     ("__sim_red__",  "Simulated — red half"))
 
 FONT_STACK = "'Segoe UI','DejaVu Sans',Arial,sans-serif"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Value widgets that ignore the mouse wheel. Scrolling a panel must never edit
+# a setting: ev.ignore() propagates the wheel event to the enclosing
+# QScrollArea, so the panel under the cursor still scrolls. Keyboard, arrows
+# and typing are untouched. Qt stylesheet type selectors match subclasses, so
+# the QDoubleSpinBox/QSpinBox rules in build_stylesheet still apply.
+class _NoWheel:
+    def wheelEvent(self, ev):
+        ev.ignore()
+
+
+class SpinBox(_NoWheel, QSpinBox):             pass
+class DoubleSpinBox(_NoWheel, QDoubleSpinBox): pass
+class ComboBox(_NoWheel, QComboBox):           pass
+class Slider(_NoWheel, QSlider):               pass
 
 
 def _make_arrow_icons(color, tag):
@@ -180,6 +198,9 @@ QPushButton#accent {{ border-color:{pal['accent']}; color:{pal['accent']}; }}
 QPushButton#accent:hover {{ background-color:{pal['accent']}; color:{pal['bg']}; }}
 QPushButton#danger {{ border-color:{pal['danger']}; color:{pal['danger']}; }}
 QPushButton#danger:hover {{ background-color:{pal['danger']}; color:{pal['bg']}; }}
+/* Narrow unit toggle: the default 14px side padding leaves too little text box
+   inside its fixed width, and clipped "um". */
+QPushButton#unit {{ padding:7px 4px; }}
 QPushButton#overlay {{ border-color:{pal['accent']}; color:{pal['accent']};
     padding:0px; font-size:12px; border-radius:4px; }}
 QPushButton#overlay:hover {{ background-color:{pal['accent']}; color:{pal['bg']}; }}
@@ -297,6 +318,13 @@ SPLIT_ICON = {"dark":  resource_path("icons", "broken_spectrum_dark.png"),
               "light": resource_path("icons", "broken_spectrum_light.png")}
 MERGE_ICON = {"dark":  resource_path("icons", "continuous_spectrum_dark.png"),
               "light": resource_path("icons", "continuous_spectrum_light.png")}
+# Plot-layout toggle, same convention as above: each icon DEPICTS the layout you
+# get by clicking it. horizontal_* shows the tall spectrum beside the stacked
+# trace/AC pair, vertical_* the two top panels over a full-width bottom one.
+HORIZ_ICON = {"dark":  resource_path("icons", "horizontal_dark.png"),
+              "light": resource_path("icons", "horizontal_light.png")}
+VERT_ICON  = {"dark":  resource_path("icons", "vertical_dark.png"),
+              "light": resource_path("icons", "vertical_light.png")}
 
 
 def app_dir():
@@ -533,13 +561,13 @@ class AcquisitionSettingsDialog(QDialog):
 
         grid = QGridLayout(); grid.setSpacing(8)
         grid.addWidget(QLabel("Averages / point"), 0, 0)
-        self.spin_avg = QSpinBox(); self.spin_avg.setRange(1, 1000); self.spin_avg.setValue(1)
+        self.spin_avg = SpinBox(); self.spin_avg.setRange(1, 1000); self.spin_avg.setValue(1)
         grid.addWidget(self.spin_avg, 0, 1)
         grid.addWidget(QLabel("Idle shots"), 1, 0)
-        self.spin_idle = QSpinBox(); self.spin_idle.setRange(0, 1000); self.spin_idle.setValue(0)
+        self.spin_idle = SpinBox(); self.spin_idle.setRange(0, 1000); self.spin_idle.setValue(0)
         grid.addWidget(self.spin_idle, 1, 1)
         grid.addWidget(QLabel("Wait after move"), 2, 0)
-        self.spin_wait = QSpinBox(); self.spin_wait.setRange(0, 10000)
+        self.spin_wait = SpinBox(); self.spin_wait.setRange(0, 10000)
         self.spin_wait.setValue(0); self.spin_wait.setSuffix(" ms")
         grid.addWidget(self.spin_wait, 2, 1)
         lay.addLayout(grid)
@@ -555,7 +583,7 @@ class AcquisitionSettingsDialog(QDialog):
         lay.addWidget(self._hdr("Saturation"))
         srow = QGridLayout(); srow.setSpacing(8)
         srow.addWidget(QLabel("Threshold"), 0, 0)
-        self.spin_sat = QDoubleSpinBox()
+        self.spin_sat = DoubleSpinBox()
         self.spin_sat.setRange(50.0, 100.0); self.spin_sat.setDecimals(1)
         self.spin_sat.setSingleStep(1.0); self.spin_sat.setSuffix(" % FS")
         self.spin_sat.setValue(100.0 * FrogScanConfig.saturation_fraction)
@@ -647,7 +675,7 @@ class HardwareDialog(QDialog):
         berow = QGridLayout(); berow.setSpacing(6)
         berow.setColumnStretch(0, 0); berow.setColumnStretch(1, 1)
         berow.addWidget(QLabel("Backend"), 0, 0)
-        self.cmb_backend = QComboBox()
+        self.cmb_backend = ComboBox()
         for name in SEABREEZE_BACKENDS:
             self.cmb_backend.addItem(name, name)
         self.cmb_backend.setCurrentIndex(
@@ -677,13 +705,13 @@ class HardwareDialog(QDialog):
         lay.addWidget(self._header("Simulated beam"))
         brow = QGridLayout(); brow.setSpacing(6)
         brow.setColumnStretch(0, 1); brow.setColumnStretch(1, 0)
-        self.cmb_pulse = QComboBox()
+        self.cmb_pulse = ComboBox()
         for key, shape in PULSE_SHAPES.items():
             self.cmb_pulse.addItem(shape["label"], key)
         self.cmb_pulse.setCurrentIndex(
             max(0, self.cmb_pulse.findData(self.main.sim_pulse)))
         self.cmb_pulse.currentIndexChanged.connect(self._on_beam)
-        self.cmb_gate = QComboBox()
+        self.cmb_gate = ComboBox()
         self.cmb_gate.addItem("SHG", "shg")
         self.cmb_gate.addItem("PG", "pg")
         self.cmb_gate.setCurrentIndex(
@@ -820,7 +848,7 @@ class DevicePickerDialog(QDialog):
         lbl.setObjectName("dim")
         lbl.setWordWrap(True)
         lay.addWidget(lbl)
-        self.cmb = QComboBox()
+        self.cmb = ComboBox()
         for label, ident in devices:
             self.cmb.addItem(f"{label}  [{ident}]", ident)
         lay.addWidget(self.cmb)
@@ -867,12 +895,12 @@ class GraphicsSettingsDialog(QDialog):
 
         ylim_row = QHBoxLayout(); ylim_row.setSpacing(6)
         ylim_row.addWidget(QLabel("Min"))
-        self.spin_ymin = QDoubleSpinBox()
+        self.spin_ymin = DoubleSpinBox()
         self.spin_ymin.setRange(-1e6, 1e6); self.spin_ymin.setDecimals(0)
         self.spin_ymin.setSingleStep(100); self.spin_ymin.setValue(0)
         ylim_row.addWidget(self.spin_ymin)
         ylim_row.addWidget(QLabel("Max"))
-        self.spin_ymax = QDoubleSpinBox()
+        self.spin_ymax = DoubleSpinBox()
         self.spin_ymax.setRange(-1e6, 1e6); self.spin_ymax.setDecimals(0)
         self.spin_ymax.setSingleStep(100); self.spin_ymax.setValue(5000)
         ylim_row.addWidget(self.spin_ymax)
@@ -897,13 +925,13 @@ class GraphicsSettingsDialog(QDialog):
 
         xlim_row = QHBoxLayout(); xlim_row.setSpacing(6)
         xlim_row.addWidget(QLabel("Min"))
-        self.spin_xmin = QDoubleSpinBox()
+        self.spin_xmin = DoubleSpinBox()
         self.spin_xmin.setRange(0, 4000); self.spin_xmin.setDecimals(1)
         self.spin_xmin.setSingleStep(0.5); self.spin_xmin.setValue(500)
         self.spin_xmin.setSuffix(" nm")
         xlim_row.addWidget(self.spin_xmin)
         xlim_row.addWidget(QLabel("Max"))
-        self.spin_xmax = QDoubleSpinBox()
+        self.spin_xmax = DoubleSpinBox()
         self.spin_xmax.setRange(0, 4000); self.spin_xmax.setDecimals(1)
         self.spin_xmax.setSingleStep(0.5); self.spin_xmax.setValue(600)
         self.spin_xmax.setSuffix(" nm")
@@ -928,12 +956,12 @@ class GraphicsSettingsDialog(QDialog):
         # ±100 ps of delay axis is already far beyond any FROG scan this stage
         # can produce; the tighter range keeps the spinbox from sizing itself
         # for a seven-figure number it will never show.
-        self.spin_tmin = QDoubleSpinBox()
+        self.spin_tmin = DoubleSpinBox()
         self.spin_tmin.setRange(-1e5, 1e5); self.spin_tmin.setDecimals(1)
         self.spin_tmin.setSingleStep(10); self.spin_tmin.setValue(-500)
         self.spin_tmin.setSuffix(" fs")
         tx_row.addWidget(self.spin_tmin)
-        self.spin_tmax = QDoubleSpinBox()
+        self.spin_tmax = DoubleSpinBox()
         self.spin_tmax.setRange(-1e5, 1e5); self.spin_tmax.setDecimals(1)
         self.spin_tmax.setSingleStep(10); self.spin_tmax.setValue(500)
         self.spin_tmax.setSuffix(" fs")
@@ -946,12 +974,12 @@ class GraphicsSettingsDialog(QDialog):
 
         ty_row = QHBoxLayout(); ty_row.setSpacing(6)
         ty_row.addWidget(QLabel("Wavel."))
-        self.spin_twmin = QDoubleSpinBox()
+        self.spin_twmin = DoubleSpinBox()
         self.spin_twmin.setRange(0, 4000); self.spin_twmin.setDecimals(1)
         self.spin_twmin.setSingleStep(0.5); self.spin_twmin.setValue(380)
         self.spin_twmin.setSuffix(" nm")
         ty_row.addWidget(self.spin_twmin)
-        self.spin_twmax = QDoubleSpinBox()
+        self.spin_twmax = DoubleSpinBox()
         self.spin_twmax.setRange(0, 4000); self.spin_twmax.setDecimals(1)
         self.spin_twmax.setSingleStep(0.5); self.spin_twmax.setValue(620)
         self.spin_twmax.setSuffix(" nm")
@@ -968,7 +996,7 @@ class GraphicsSettingsDialog(QDialog):
         lay.addWidget(self._hdr("FROG Trace Colour"))
         cm_row = QHBoxLayout(); cm_row.setSpacing(6)
         cm_row.addWidget(QLabel("Colormap"))
-        self.cmb_cmap = QComboBox()
+        self.cmb_cmap = ComboBox()
         self.cmb_cmap.addItems(TRACE_COLORMAPS)
         self.cmb_cmap.setCurrentText(canvas._cmap_name)
         self.cmb_cmap.currentTextChanged.connect(canvas.set_cmap)
@@ -980,7 +1008,7 @@ class GraphicsSettingsDialog(QDialog):
 
         thr_row = QHBoxLayout(); thr_row.setSpacing(6)
         thr_row.addWidget(QLabel("Hide below"))
-        self.spin_thresh = QDoubleSpinBox()
+        self.spin_thresh = DoubleSpinBox()
         self.spin_thresh.setRange(0.0, 100.0); self.spin_thresh.setDecimals(1)
         self.spin_thresh.setSingleStep(0.5); self.spin_thresh.setValue(0.0)
         self.spin_thresh.setSuffix(" %")
@@ -999,7 +1027,7 @@ class GraphicsSettingsDialog(QDialog):
         lay.addWidget(self._hdr("Line Width"))
         lw_row = QHBoxLayout(); lw_row.setSpacing(6)
         lw_row.addWidget(QLabel("Width"))
-        self.spin_lw = QDoubleSpinBox()
+        self.spin_lw = DoubleSpinBox()
         self.spin_lw.setRange(0.3, 6.0); self.spin_lw.setDecimals(1)
         self.spin_lw.setSingleStep(0.1); self.spin_lw.setValue(canvas._lw)
         self.spin_lw.setSuffix(" px")
@@ -1014,8 +1042,8 @@ class GraphicsSettingsDialog(QDialog):
         prop_hint = QLabel("Spectrum column width  (% of total plot area)")
         prop_hint.setObjectName("dim"); prop_hint.setWordWrap(True)
         lay.addWidget(prop_hint)
-        self.sld_prop = QSlider(Qt.Horizontal)
-        self.sld_prop.setRange(15, 55); self.sld_prop.setValue(50)
+        self.sld_prop = Slider(Qt.Horizontal)
+        self.sld_prop.setRange(20, 80); self.sld_prop.setValue(50)
         self.sld_prop.setTickInterval(5); self.sld_prop.setTickPosition(QSlider.TicksBelow)
         lay.addWidget(self.sld_prop)
         self.lbl_prop = QLabel("50%")
@@ -1149,6 +1177,31 @@ class GraphicsSettingsDialog(QDialog):
 # the background via the draw_event handler) is only issued when something static
 # actually changes — axis limits, theme, log scale, line width, proportions.
 # ─────────────────────────────────────────────────────────────────────────────
+# ── Plot geometry, in figure fractions (see FrogCanvas._layout_axes) ─────────
+# Margins are sized for the 9-pt plot fonts: LEFT holds the spectrum's y label
+# plus its tick labels, COLGAP the right column's y label, and BOT the bottom
+# row's tick labels and x label.
+_GEO_L, _GEO_R, _GEO_TOP = 0.10, 0.99, 0.95
+_GEO_ROW_RATIO = 1.8        # tall row : short row, both modes
+_GEO_V_BOT     = 0.095
+_GEO_V_COLGAP  = 0.055
+_GEO_V_HSPACE  = 0.31       # the gridspec hspace the vertical layout was tuned with
+_GEO_H_BOT     = 0.095
+_GEO_H_COLGAP  = 0.065      # wider: two stacked y-axes share this gap, and the
+                            # autocorrelation's tick labels run longer than the
+                            # trace's, so 0.055 leaves its y label touching.
+_GEO_H_ROWGAP  = 0.0        # flush: the stacked pair shares one delay axis, so
+                            # the trace's bottom spine IS the AC's top spine
+
+# The autocorrelation panel is drawn normalized to its own peak, so its view is
+# fixed: 0…1 plus a little headroom to keep the peak off the top spine.
+_AC_YLIM = (0.0, 1.05)
+
+# Title offsets in inches, so the gaps are DPI- and resize-independent.
+_TITLE_ABOVE_IN  = 5 / 72   # matches the original pad=5
+_TITLE_INSET_IN  = (0.08, 0.06)   # (right, down) from the axes' top-left corner
+
+
 class FrogCanvas(FigureCanvasQTAgg):
     limits_changed = Signal()        # zoom/reset happened → window syncs dialog
     log_toggle_requested = Signal()  # click on spectrum y-axis strip
@@ -1157,9 +1210,12 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.fig = Figure(facecolor=PALETTE["plot_bg"])
         super().__init__(self.fig)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # hspace must leave room for the x-labels of the top row plus the
-        # title of the bottom row, or they collide. Margins sized for the
-        # 9-pt plot fonts; keep left in sync with set_proportions.
+        # Layout state, read by _style()/_apply_mode_decorations() below.
+        self._layout_mode = "horizontal"
+        self._spec_frac   = 0.50
+        # The gridspec only creates the axes and seeds the vertical arrangement;
+        # _layout_axes() positions all three explicitly at the end of __init__
+        # and on every mode/proportion change.
         gs = self.fig.add_gridspec(2, 2,
                                    height_ratios=[1.8, 1.0],
                                    width_ratios=[1.0, 1.0],
@@ -1185,6 +1241,13 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.im = self.ax_trace.imshow(np.zeros((2, 2)), origin="lower",
                                        aspect="auto", cmap="magma",
                                        extent=[-1, 1, 0, 1])
+        # Empty-state ranges. Autoscaling an empty line gives -0.05…0.05, whose
+        # delay range contradicts the trace it shares that axis with; matching
+        # the image extent makes the two plots agree before the first scan. The
+        # y range is the normalized one update_ac keeps, set here too so the
+        # first frame of a scan needs no relimit at all.
+        self.ax_ac.set_xlim(-1.0, 1.0)
+        self.ax_ac.set_ylim(*_AC_YLIM)
         self._style()
 
         self.autoscale_y = False
@@ -1250,16 +1313,16 @@ class FrogCanvas(FigureCanvasQTAgg):
         # actually move (autoscale otherwise re-sets identical limits each frame).
         self._xlim_cache = None
         self._ylim_cache = None
-        self._ac_xlim_cache = None
-        self._ac_ylim_cache = None
+        self._ac_xlim_cache = (-1.0, 1.0)     # the empty-state ranges set above
+        self._ac_ylim_cache = _AC_YLIM
         self._trace_xlim_cache = None
         self._trace_ylim_cache = None
-        # Axis y-positions are cached after first draw so set_proportions can
-        # reposition axes without touching the row heights.
-        self._ay_spec = self._ay_trace = self._ay_ac = None
         # Re-captures the background after every real draw (init, resize, or any
         # of our draw_idle() calls) and re-renders the animated artists on top.
         self.mpl_connect('draw_event', self._on_draw)
+        # Place the axes for the startup layout mode (must come after the blit
+        # state above: it invalidates both caches and requests a draw).
+        self._layout_axes()
 
     def _style(self):
         specs = [(self.ax_spec,  "Wavelength (nm)", "Counts",          "Spectrum"),
@@ -1272,10 +1335,118 @@ class FrogCanvas(FigureCanvasQTAgg):
                 s.set_edgecolor(PALETTE["border"])
             ax.set_xlabel(xl, color=PALETTE["text_dim"], fontsize=9.5, labelpad=2)
             ax.set_ylabel(yl, color=PALETTE["text_dim"], fontsize=9.5)
-            ax.set_title(title, color=PALETTE["accent"], fontsize=10.5,
-                         fontweight="bold", loc="left", pad=5)
+            self._place_title(ax, title)
         self.ax_spec.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
         self.ax_ac.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
+        # Last: this re-does the two decorations the loop just reset to their
+        # vertical-mode defaults, so a theme switch cannot undo the layout mode.
+        self._apply_mode_decorations()
+
+    # ── Layout: plot arrangement and proportions ──────────────────────────
+    def _place_title(self, ax, text, inside=False):
+        """Anchor an axes title an inch-offset from its top-left corner, either
+        just above the axes or (horizontal mode's autocorrelation, which has the
+        trace's x-axis immediately above it) just inside the plot area.
+
+        Passing y to set_title switches matplotlib's per-draw title
+        auto-positioning off, so our own placement survives every redraw, and
+        offsetting in inches rather than axes fractions keeps the gap constant
+        as the window is resized.
+        """
+        # set_title returns the artist that actually carries the text, which for
+        # loc="left" is ax._left_title and NOT ax.title — style the return value.
+        t = ax.set_title(text, color=PALETTE["accent"], fontsize=10.5,
+                         fontweight="bold", loc="left", y=1.0)
+        t.set_va("top" if inside else "bottom")
+        dx, dy = (_TITLE_INSET_IN[0], -_TITLE_INSET_IN[1]) if inside \
+            else (0.0, _TITLE_ABOVE_IN)
+        t.set_transform(
+            ax.transAxes + ScaledTranslation(dx, dy, self.fig.dpi_scale_trans))
+
+    def _apply_mode_decorations(self):
+        """Labelling that differs between the two layout modes.
+
+        Horizontal mode stacks the FROG trace over the autocorrelation on one
+        shared delay axis, so only the bottom plot carries the delay ticks and
+        label. That leaves no room for the AC's title above it (the trace's
+        x-axis is right there), so it moves inside the plot area.
+        """
+        horiz = self._layout_mode == "horizontal"
+        self.ax_trace.set_xlabel("" if horiz else "Delay (fs)",
+                                 color=PALETTE["text_dim"], fontsize=9.5,
+                                 labelpad=2)
+        # Inward ticks in horizontal mode: with the two plots flush, outward
+        # ticks on the trace's bottom spine would poke down into the AC's panel.
+        self.ax_trace.tick_params(axis="x", labelbottom=not horiz,
+                                  direction="in" if horiz else "out")
+        self._place_title(self.ax_ac, "Autocorrelation", inside=horiz)
+
+    def _layout_axes(self):
+        """Position all three axes for the current mode and spectrum width.
+
+        Single source of truth for the plot geometry: the axes are placed
+        explicitly instead of being left where the gridspec put them, so the
+        proportion slider works in either mode (and before the first draw).
+        """
+        L, R, TOP = _GEO_L, _GEO_R, _GEO_TOP
+        horiz   = self._layout_mode == "horizontal"
+        cgap    = _GEO_H_COLGAP if horiz else _GEO_V_COLGAP
+        # Clamped, not rejected: the slider must never be a silent no-op.
+        frac    = min(max(self._spec_frac, 0.05), 0.95)
+        spec_w  = frac * (R - L - cgap)
+        right_x = L + spec_w + cgap
+        right_w = R - right_x
+        if horiz:
+            BOT, rgap = _GEO_H_BOT, _GEO_H_ROWGAP
+            h_ac = (TOP - BOT - rgap) / (1.0 + _GEO_ROW_RATIO)
+            h_tr = TOP - BOT - rgap - h_ac
+            self.ax_spec.set_position([L, BOT, spec_w, TOP - BOT])
+            self.ax_trace.set_position([right_x, BOT + h_ac + rgap, right_w, h_tr])
+            self.ax_ac.set_position([right_x, BOT, right_w, h_ac])
+        else:
+            BOT = _GEO_V_BOT
+            # Reproduce the original gridspec spacing exactly: hspace is a
+            # fraction of the MEAN row height, so rows + gap = TOP - BOT gives
+            # rows = (TOP - BOT) / (1 + hspace/2).
+            rows  = (TOP - BOT) / (1.0 + _GEO_V_HSPACE / 2.0)
+            rgap  = (TOP - BOT) - rows
+            h_ac  = rows / (1.0 + _GEO_ROW_RATIO)
+            h_top = rows - h_ac
+            self.ax_spec.set_position([L, BOT + h_ac + rgap, spec_w, h_top])
+            self.ax_trace.set_position([right_x, BOT + h_ac + rgap, right_w, h_top])
+            self.ax_ac.set_position([L, BOT, R - L, h_ac])
+        # Everything moved, so both cached backgrounds describe the old geometry.
+        self._bg = None
+        self._bg_static = None
+        self.draw_idle()
+
+    def set_layout_mode(self, mode):
+        """"horizontal": spectrum at full height on the left, FROG trace over
+        the autocorrelation on a shared delay axis on the right. "vertical":
+        spectrum beside the trace with the autocorrelation full-width below."""
+        if mode == self._layout_mode:
+            return
+        self._layout_mode = mode
+        self._apply_mode_decorations()
+        self._sync_ac_x()        # horizontal: adopt the trace's delay range now
+        self._layout_axes()      # ends in draw_idle()
+
+    def _sync_ac_x(self):
+        """Horizontal mode: the FROG trace owns the shared delay axis and the
+        autocorrelation mirrors it. Returns True if the AC view moved.
+
+        Deliberately does NOT touch autoscale_ac_x: the flag keeps whatever the
+        user left it on, so switching back to vertical resumes independent AC
+        autoscaling with no bookkeeping. No-op in vertical mode.
+        """
+        if self._layout_mode != "horizontal":
+            return False
+        xl = self.ax_trace.get_xlim()
+        if xl == self._ac_xlim_cache:
+            return False
+        self.ax_ac.set_xlim(*xl)
+        self._ac_xlim_cache = xl
+        return True
 
     def _apply_cmap(self):
         """Install the selected colormap, with sub-threshold ('bad') pixels
@@ -1305,10 +1476,6 @@ class FrogCanvas(FigureCanvasQTAgg):
         animated artists on top so they survive resizes and forced redraws."""
         if event is not None and event.canvas is not self:
             return
-        if self._ay_spec is None:
-            p = self.ax_spec.get_position();  self._ay_spec  = (p.y0, p.height)
-            p = self.ax_trace.get_position(); self._ay_trace = (p.y0, p.height)
-            p = self.ax_ac.get_position();    self._ay_ac    = (p.y0, p.height)
         self._bg = self.copy_from_bbox(self.fig.bbox)
         self._bg_static = None       # figure changed; recomposite lazily
         for ax, art in self._animated:
@@ -1475,6 +1642,12 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.autoscale_ac_y = False
             self._ac_xlim_cache = (xlo, xhi)
             self._ac_ylim_cache = (ylo, yhi)
+            if self._layout_mode == "horizontal":
+                # Shared delay axis: hand the zoom to its owner, the trace, so
+                # both stay registered (and the dialog's trace bounds truthful).
+                self.ax_trace.set_xlim(xlo, xhi)
+                self.autoscale_trace = False
+                self._trace_xlim_cache = (xlo, xhi)
         elif ax is self.ax_trace:
             # update_trace never touches limits, so nothing to freeze for the
             # rest of this scan — but the NEXT scan's init_trace would snap the
@@ -1482,6 +1655,7 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.autoscale_trace = False
             self._trace_xlim_cache = (xlo, xhi)
             self._trace_ylim_cache = (ylo, yhi)
+            self._sync_ac_x()
         self.draw_idle()
         self.limits_changed.emit()
 
@@ -1498,16 +1672,23 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.ax_trace.set_ylim(y0, y1)
             self._trace_xlim_cache = self.ax_trace.get_xlim()
             self._trace_ylim_cache = self.ax_trace.get_ylim()
+            self._sync_ac_x()
         elif ax is self.ax_ac:
             self.autoscale_ac_x = True
             self.autoscale_ac_y = True
+            # The curve is normalized, so y has one canonical view to go back to.
+            self.ax_ac.set_ylim(*_AC_YLIM)
+            self._ac_ylim_cache = _AC_YLIM
             if len(self.line_ac.get_xdata()) > 1:
                 self.ax_ac.set_autoscalex_on(True)
-                self.ax_ac.set_autoscaley_on(True)
                 self.ax_ac.relim()
-                self.ax_ac.autoscale_view()
+                self.ax_ac.autoscale_view(scaley=False)
                 self._ac_xlim_cache = self.ax_ac.get_xlim()
-                self._ac_ylim_cache = self.ax_ac.get_ylim()
+            if self._layout_mode == "horizontal":
+                # Shared delay axis: resetting either plot resets both, via the
+                # trace's own reset (which re-syncs the AC to the scan range).
+                self.reset_axes(self.ax_trace)
+                return
         self.draw_idle()
         self.limits_changed.emit()
 
@@ -1552,6 +1733,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         if xmin < xmax:
             self.ax_trace.set_xlim(xmin, xmax)
             self._trace_xlim_cache = (xmin, xmax)
+            self._sync_ac_x()
             self.draw_idle()
 
     def set_trace_ylim(self, ymin, ymax):
@@ -1629,27 +1811,10 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_m2.set_data([], [])
 
     def set_proportions(self, spec_frac):
-        """Resize spectrum vs FROG trace columns; spec_frac = 0.15–0.55."""
-        if self._ay_spec is None:
-            return
-        L, R = 0.10, 0.99
-        total_w = R - L
-        # Gap matches the initial gridspec spacing so the default 50% split
-        # reproduces the startup layout (equal columns) with no jump, and the
-        # FROG trace's y-axis label never collides with the spectrum plot.
-        gap = 0.055
-        avail = total_w - gap
-        spec_w = spec_frac * avail
-        trace_w = avail - spec_w
-        if trace_w < 0.12:
-            return
-        sy0, sh = self._ay_spec
-        ty0, th = self._ay_trace
-        ay0, ah = self._ay_ac
-        self.ax_spec.set_position([L, sy0, spec_w, sh])
-        self.ax_trace.set_position([L + spec_w + gap, ty0, trace_w, th])
-        self.ax_ac.set_position([L, ay0, total_w, ah])
-        self.draw_idle()
+        """Width of the spectrum column as a fraction of the plot area
+        (slider range 0.20–0.80). Applies in both layout modes."""
+        self._spec_frac = float(spec_frac)
+        self._layout_axes()
 
     def update_spectrum(self, wl, spectrum):
         # Last writer owns the panel: whoever has a combined frame to show
@@ -1723,6 +1888,7 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.ax_trace.set_ylim(wl[0], wl[-1])
             self._trace_xlim_cache = self.ax_trace.get_xlim()
             self._trace_ylim_cache = self.ax_trace.get_ylim()
+        self._sync_ac_x()      # horizontal: the AC follows the new delay range
         self.draw_idle()
 
     def update_trace(self, trace):
@@ -1753,25 +1919,32 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._request_blit()
 
     def update_ac(self, delays, ac):
-        self.line_ac.set_data(delays, ac)
+        # Normalized to its own peak for DISPLAY only: the panel always reads
+        # 0…1, so its tick labels stay short whatever the count level (they used
+        # to grow a digit per decade and steal width from the plot beside them in
+        # horizontal mode) and a scan's partial curve fills the panel from the
+        # first column. Nothing reads this line back — the stored trace, the
+        # exports and the autocorrelation the scan computed keep raw counts.
+        peak = float(ac.max()) if ac.size else 0.0
+        self.line_ac.set_data(delays, ac / peak if peak > 0 else ac)
         self._bg_static = None        # AC line changed
         changed = False
-        if self.autoscale_ac_x and delays.size > 1:
+        if self._layout_mode == "horizontal":
+            # Shared delay axis: the trace dictates it, so the AC's own x
+            # autoscale sits this one out (its flag is left untouched, and takes
+            # over again the moment the layout goes back to vertical).
+            changed = self._sync_ac_x()
+        elif self.autoscale_ac_x and delays.size > 1:
             xl = (float(delays[0]), float(delays[-1]))
             if xl != self._ac_xlim_cache:
                 self.ax_ac.set_xlim(*xl); self._ac_xlim_cache = xl; changed = True
-        if self.autoscale_ac_y and ac.size:
-            # Stepped autoscale: during a scan the AC peak grows with nearly
-            # every column, and each ylim move forces a full redraw. Grow with
-            # 25% headroom so limits only step a handful of times per scan,
-            # and shrink only once the data has fallen well below the view.
-            dmax = float(ac.max())
-            dmin = min(0.0, float(ac.min()))
-            lo, hi = self._ac_ylim_cache if self._ac_ylim_cache else (0.0, 0.0)
-            if dmax > hi or dmax < 0.55 * hi or dmin < lo:
-                yl = (dmin, dmax * 1.25 if dmax > 0 else 1.0)
-                self.ax_ac.set_ylim(*yl)
-                self._ac_ylim_cache = yl; changed = True
+        if self.autoscale_ac_y and self._ac_ylim_cache != _AC_YLIM:
+            # The normalized curve needs one fixed view, so this fires at most
+            # once (after a zoom was reset). The old stepped autoscale existed
+            # only because the raw AC peak grew with nearly every column, and
+            # each ylim move costs a full redraw.
+            self.ax_ac.set_ylim(*_AC_YLIM)
+            self._ac_ylim_cache = _AC_YLIM; changed = True
         if changed:
             self._request_full()
         else:
@@ -2205,6 +2378,12 @@ class FrogWindow(QMainWindow):
         self.btn_theme.setToolTip("Switch to light mode")
         self.btn_theme.clicked.connect(self._toggle_theme)
         tb.addWidget(self.btn_theme)
+        # Plot layout toggle; icon and tooltip come from _refresh_layout_button.
+        self.btn_layout = QPushButton()
+        self.btn_layout.setIconSize(QSize(18, 18))
+        self.btn_layout.setFixedWidth(42)
+        self.btn_layout.clicked.connect(self._toggle_layout)
+        tb.addWidget(self.btn_layout)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -2253,6 +2432,8 @@ class FrogWindow(QMainWindow):
         self.btn_overlay.move(42, 6)        # 6 + 30 + 6, right of auto-fit
         self.btn_overlay.hide()
         self.btn_overlay.toggled.connect(self._on_overlay_toggled)
+
+        self._refresh_layout_button()    # needs the canvas for the current mode
 
         self.dlg_graphics = GraphicsSettingsDialog(self.canvas, self)
         # Mouse zoom/reset keeps the dialog's spinboxes and auto-scale
@@ -2729,7 +2910,7 @@ class FrogWindow(QMainWindow):
         lay.addWidget(self.btn_feed)
         self.lbl_integration = QLabel("Integration Time")
         lay.addWidget(self.lbl_integration)
-        self.spin_integration = QSpinBox()
+        self.spin_integration = SpinBox()
         self.spin_integration.setRange(1, 10000); self.spin_integration.setValue(10)
         self.spin_integration.setSuffix("  ms")
         # Debounced: set_integration_time is a device call, so it has to take
@@ -2749,7 +2930,7 @@ class FrogWindow(QMainWindow):
         # — the same numbering as the saturation lamps and the Multi-Spec menu.
         self.lbl_integration2 = QLabel("Integration Time — S2")
         lay.addWidget(self.lbl_integration2)
-        self.spin_integration2 = QSpinBox()
+        self.spin_integration2 = SpinBox()
         self.spin_integration2.setRange(1, 10000); self.spin_integration2.setValue(10)
         self.spin_integration2.setSuffix("  ms")
         # Same debounce timer as S1 on purpose: editing both boxes then costs
@@ -2778,11 +2959,12 @@ class FrogWindow(QMainWindow):
         self.btn_minus = QPushButton("−"); self.btn_plus = QPushButton("+")
         self.btn_minus.clicked.connect(lambda: self._jog(-1))
         self.btn_plus.clicked.connect(lambda: self._jog(+1))
-        self.spin_step = QDoubleSpinBox()
+        self.spin_step = DoubleSpinBox()
         self.spin_step.setDecimals(0)
         self.spin_step.setSuffix(" fs")     # value set after ranges, below
         self.btn_units = QPushButton("fs")
-        self.btn_units.setFixedWidth(38)
+        self.btn_units.setObjectName("unit")   # trimmed padding — see stylesheet
+        self.btn_units.setFixedWidth(42)
         self.btn_units.setToolTip("Toggle jog/move units between optical delay (fs) "
                                   "and stage position (um)")
         self.btn_units.clicked.connect(self._toggle_stage_units)
@@ -2791,7 +2973,7 @@ class FrogWindow(QMainWindow):
         lay.addLayout(jog)
 
         mv = QHBoxLayout()
-        self.spin_moveto = QDoubleSpinBox()
+        self.spin_moveto = DoubleSpinBox()
         self.spin_moveto.setDecimals(0)
         self.spin_moveto.setSuffix(" fs")
         self.btn_moveto = QPushButton("Move")
@@ -2846,9 +3028,9 @@ class FrogWindow(QMainWindow):
             g.addWidget(eq, r, 2)
             return eq
 
-        self.spin_start = QDoubleSpinBox()
-        self.spin_stop  = QDoubleSpinBox()
-        self.spin_step_fs = QDoubleSpinBox()
+        self.spin_start = DoubleSpinBox()
+        self.spin_stop  = DoubleSpinBox()
+        self.spin_step_fs = DoubleSpinBox()
         self.eq_start = row(0, "Start", self.spin_start, " fs", 1, -1e6, 1e6, -500.0)
         self.eq_stop  = row(1, "Stop",  self.spin_stop,  " fs", 1, -1e6, 1e6,  500.0)
         row(2, "Step", self.spin_step_fs, " fs", 4, 0.0001, 1e5, 1.0)
@@ -2900,7 +3082,37 @@ class FrogWindow(QMainWindow):
         self.btn_theme.setToolTip(
             "Switch to dark mode" if name == "light" else "Switch to light mode")
         self._refresh_overlay_button()   # its icons are per-theme too
+        self._refresh_layout_button()    # …and so are this one's
         self.status.showMessage(f"{name.capitalize()} mode.", 2000)
+
+    # ── Plot layout ──────────────────────────────────────────────────────────
+    def _toggle_layout(self):
+        mode = ("vertical" if self.canvas._layout_mode == "horizontal"
+                else "horizontal")
+        self.canvas.set_layout_mode(mode)
+        self._refresh_layout_button()
+        self.status.showMessage(
+            "Horizontal layout — trace and autocorrelation share the delay axis."
+            if mode == "horizontal" else
+            "Vertical layout — autocorrelation full width below.", 4000)
+
+    def _refresh_layout_button(self):
+        """Icon and tooltip of the plot-layout toggle. Like the theme and
+        overlay buttons, it advertises the layout a CLICK produces, so the
+        vertical icon is shown while the horizontal layout is active."""
+        horiz = self.canvas._layout_mode == "horizontal"
+        icon = (VERT_ICON if horiz else HORIZ_ICON)[self._theme]
+        if icon.exists():
+            self.btn_layout.setIcon(QIcon(str(icon)))
+            self.btn_layout.setText("")
+        else:
+            self.btn_layout.setIcon(QIcon())
+            self.btn_layout.setText("▤" if horiz else "▥")
+        self.btn_layout.setToolTip(
+            "Vertical layout: autocorrelation full width below the spectrum "
+            "and FROG trace" if horiz else
+            "Horizontal layout: FROG trace above the autocorrelation, sharing "
+            "one delay axis, beside a full-height spectrum")
 
     # ── Saturation indicator ─────────────────────────────────────────────────
     def _set_lamp(self, state, text, obj, which=0):
