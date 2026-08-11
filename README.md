@@ -119,7 +119,7 @@ rather than the whole app.
 
 | Device | Adapter | Backend |
 | --- | --- | --- |
-| Thorlabs Kinesis stage (LTS300C/M + autodetected stages) | `KinesisStage` | `pylablib` |
+| Thorlabs Kinesis stage (LTS150C/M, LTS300C/M + autodetected stages) | `KinesisStage` | `pylablib` |
 | Zaber stage (serial / daisy-chain) | `ZaberStage` | `zaber-motion` |
 | piezosystems Jena piezo stage (serial, 320 um closed loop) | `PiezoJenaStage` | `pyserial` |
 | Ocean Optics / Ocean Insight spectrometer | `SeabreezeSpectrometer` | `seabreeze` |
@@ -143,8 +143,8 @@ still does not enumerate, bind its USB interface to **WinUSB** with
 
 **Kinesis stages.** `KinesisStage` identifies the stage from the model number
 its controller reports before driving it, and calibrates it either from a
-`STAGE_CONFIGS` entry in [hardware.py](hardware.py) (needed for the LTS300C/M,
-which pylablib cannot calibrate itself) or from pylablib's own stage
+`STAGE_CONFIGS` entry in [hardware.py](hardware.py) (needed for the LTS150C/M
+and LTS300C/M, which pylablib cannot calibrate itself) or from pylablib's own stage
 autodetection (the Z6xx/Z7xx/Z8xx and MTS families, K10CR1, …). The resulting
 scale units are then verified, so a rotational or uncalibrated stage is
 *refused* rather than driven with somebody else's steps-per-mm — a wrong scale
@@ -268,7 +268,7 @@ wrong time axis.
 
 - **Delay: femtoseconds.** The master unit for the FROG axis.
 - **Positions: micrometres** everywhere user-facing and throughout `scan.py`.
-- **Stage adapters: millimetres.** `pylablib` reports the LTS300 in mm, so that
+- **Stage adapters: millimetres.** `pylablib` reports the LTS150/LTS300 in mm, so that
   boundary is isolated in `_um_to_stage` / `_stage_to_um` — the only two places
   mm appears. Make them identity if an adapter is ever changed to report µm.
 - **Wavelength: nanometres**; spectra are **raw counts**.

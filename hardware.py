@@ -216,8 +216,9 @@ class SpectrometerBase(abc.ABC):
 #
 #   1. An entry below, selected by matching the model number the CONTROLLER
 #     reports against that entry's `models` patterns. This is for stages
-#     pylablib cannot calibrate itself — the LTS300C/M is one: its controller
-#     reports no stage ID, so pylablib would silently fall back to raw steps.
+#     pylablib cannot calibrate itself — the LTS150/LTS300 are two: their
+#     controllers report no stage ID, so pylablib would silently fall back to
+#     raw steps.
 #   2. pylablib's own calibration (KinesisMotor(scale="stage")), which covers
 #     the stages it can identify — the Z6xx/Z7xx/Z8xx and MTS families on a
 #     KDC101/TDC001, K10CR1, MPC…
@@ -250,13 +251,19 @@ STAGE_CONFIGS: dict[str, dict] = {
         "scale": (409600, 21990232, 4506),
         "travel_mm": 300.0,
     },
-    # Example — the LTS150 shares the LTS300's controller and step scale and
-    # differs only in travel (adapt / uncomment):
-    # "LTS150C/M": {
-    #     "models": (r"LTS150",),
-    #     "scale": (409600, 21990232, 4506),
-    #     "travel_mm": 150.0,
-    # },
+    "LTS150C/M": {
+        # Matches LTS150/M, LTS150C/M, … The LTS150 shares the LTS300's
+        # controller and step scale and differs only in travel. Verified
+        # against a connected LTS150 (fw 3.0.8), whose factory defaults read
+        # back exactly right through this scale: 50 um backlash distance,
+        # 0.5 mm home offset, 20 mm/s max velocity, 2 mm/s homing velocity,
+        # 20 mm/s^2 acceleration.
+        "models": (r"LTS150",),
+        "scale": (409600, 21990232, 4506),
+        "travel_mm": 150.0,
+    },
+    # To add another stage pylablib cannot calibrate, copy an entry above:
+    # match its reported model number and give the APT steps per mm/mm/s/mm/s^2.
 }
 
 # Travel of the stages pylablib identifies by itself, so an auto-calibrated
