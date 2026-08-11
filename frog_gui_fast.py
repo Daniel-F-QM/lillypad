@@ -1983,6 +1983,12 @@ EXPORT_FORMATS = {
 
 
 class FrogWindow(QMainWindow):
+    # Raised by the stage layer (StageBase.warn_cb) when it has to do something
+    # the operator should know about — currently only a long move being split.
+    # A signal, not a direct status-bar call: the scan worker drives the same
+    # stage from its own thread, and Qt queues cross-thread emissions for us.
+    stage_warning = Signal(str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Lillypad — Fast")
@@ -2054,6 +2060,12 @@ class FrogWindow(QMainWindow):
 
         self.stage.move_to(_um_to_stage(self.scan_cfg.zero_pos_um))
         self._refresh_positions()
+
+        # Wired up AFTER the parking move above: that one is a long move on the
+        # simulated stage and would open the app on a "split into N steps"
+        # message about a move the operator never asked for.
+        self.stage_warning.connect(self._on_stage_warning)
+        self._attach_stage_warnings(self.stage)
 
         # FIX 2/3 — acquisition runs on a worker thread, paced to integration.
         self._feed = LiveFeedWorker(lambda: self.spec)
@@ -2158,6 +2170,14 @@ class FrogWindow(QMainWindow):
         self.stage = SimulatedStage(travel_mm=300.0)
         self.spec  = self._make_sim_spectrometer()
 
+    def _attach_stage_warnings(self, stage):
+        """Route a stage's warnings into the status bar. Safe from any thread —
+        emit() is what crosses back to the GUI one."""
+        stage.warn_cb = self.stage_warning.emit
+
+    def _on_stage_warning(self, message):
+        self.status.showMessage(f"Stage: {message}", 5000)
+
     def _apply_stage(self, new_stage):
         """Swap in a new stage. Returns (ok, error) — on failure NOTHING has
         changed and `new_stage` is still the caller's to dispose of.
@@ -2180,6 +2200,7 @@ class FrogWindow(QMainWindow):
                 except Exception:
                     pass
             self.stage = new_stage
+            self._attach_stage_warnings(new_stage)
             # A simulated spectrometer reads the live stage, so re-point it.
             if isinstance(self.spec, SimulatedSpectrometer):
                 self.spec.stage = self.stage

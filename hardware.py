@@ -21,11 +21,13 @@ with only numpy installed (no pylablib / seabreeze needed to run the sims).
 from __future__ import annotations
 
 import abc
+import math
 import os
 import re
 import sys
 import time
 import numpy as np
+from collections.abc import Callable
 from pathlib import Path
 
 C_NM_PER_FS = 299.792458   # speed of light, nm/fs (used only by the simulator)
@@ -72,12 +74,28 @@ class StageBase(abc.ABC):
 
     Leave backlash_mm at 0 when the controller already does this in firmware
     (Thorlabs Kinesis does) or when there is no backlash to correct (piezo).
+
+    Step limit
+    ----------
+    A move is blocking and cannot be interrupted — stop() has no call site — so a
+    mistyped target, a stale zero or a fs/um mix-up becomes one long traverse at
+    full speed with nothing to halt it. max_step_mm caps how far a single raw
+    move may travel: anything longer is carried out as a run of sub-moves of at
+    most that far, each one settling before the next is issued, and the operator
+    is warned. The landing point is unchanged — the last sub-move is the exact
+    target — so this costs nothing but time, and only on moves that were already
+    long. Scan points are microns apart and never trip it.
     """
     units = "mm"
     name  = "stage"
     travel_mm:     float | None = None
     travel_min_mm: float = 0.0
     backlash_mm:   float = 0.0
+    # Longest single raw move, in mm. 0 disables the split entirely.
+    max_step_mm:   float = 5.0
+    # Where long-move warnings go. The GUI points this at a status-bar signal;
+    # left None (headless, self-tests) they go to stderr.
+    warn_cb: Callable[[str], None] | None = None
     # True when the axis has no valid reference and its readback is meaningless
     # until homed. Adapters that can tell set this; the GUI refuses to adopt a
     # zero-delay position from a stage that reports it.
@@ -89,18 +107,69 @@ class StageBase(abc.ABC):
         With backlash_mm > 0 the stage always arrives travelling in the +
         direction: if we would otherwise come down onto the target, undershoot
         by backlash_mm first and take the slack up on the way back.
+
+        Both legs go through _move_stepped, so neither can travel further than
+        max_step_mm in one go. The position is read once here and then carried
+        through, so a move costs the same device I/O it always did.
         """
         target = float(position_mm)
         b = self.backlash_mm
+        if b <= 0.0 and (self.max_step_mm or 0.0) <= 0.0:
+            self._move_to_raw(target)      # nothing to arrange — no readback
+            return
+        cur = self.get_position()
         if b > 0.0:
             pre = max(target - b, self.travel_min_mm)
             # pre == target means the target sits inside the backlash margin at
             # the bottom of travel and there is no room to undershoot. Move
             # directly rather than refuse — the range checks in scan.py and the
             # GUI reserve this margin so it should not normally happen.
-            if pre < target and self.get_position() > target - 1e-9:
-                self._move_to_raw(pre)
-        self._move_to_raw(target)
+            if pre < target and cur > target - 1e-9:
+                self._move_stepped(cur, pre)
+                cur = pre
+        # The run-up from pre to target is backlash_mm (tens of um), so it stays
+        # one move and the arrival is still unidirectional.
+        self._move_stepped(cur, target)
+
+    def _move_stepped(self, cur_mm: float, target_mm: float) -> None:
+        """Absolute move to target_mm from a known cur_mm, in sub-moves of at
+        most max_step_mm. No backlash logic — move_to owns that."""
+        step = float(self.max_step_mm or 0.0)
+        dist = abs(target_mm - cur_mm)
+        if step <= 0.0 or dist <= step + 1e-9:
+            self._move_to_raw(target_mm)
+            return
+
+        n = int(math.ceil(dist / step - 1e-9))
+        self._warn(f"{self.name}: {dist:.3f} mm move ({cur_mm:.3f} -> "
+                   f"{target_mm:.3f} mm) split into {n} steps of at most "
+                   f"{step:g} mm")
+        sign = 1.0 if target_mm > cur_mm else -1.0
+        lo = self.travel_min_mm
+        hi = self.travel_mm
+        for k in range(1, n):
+            # Stepped off cur_mm rather than off a fresh readback: no extra I/O,
+            # and no room for readback error to accumulate along the way. The
+            # clamp guards the case where cur_mm was never trustworthy in the
+            # first place (needs_homing) and the arithmetic walks out of travel.
+            mid = cur_mm + sign * step * k
+            mid = max(mid, lo)
+            if hi is not None:
+                mid = min(mid, hi)
+            self._move_to_raw(mid)
+        self._move_to_raw(target_mm)       # exact target, always
+
+    def _warn(self, message: str) -> None:
+        """Report something the operator should see. Goes to warn_cb when the
+        UI has set one, otherwise to stderr."""
+        cb = self.warn_cb
+        if cb is None:
+            print(f"warning: {message}", file=sys.stderr)
+            return
+        try:
+            cb(message)
+        except Exception:
+            print(f"warning: {message}", file=sys.stderr)
 
     def move_by(self, delta_mm: float) -> None:
         """Relative move by delta_mm; blocks until settled."""
@@ -1562,3 +1631,17 @@ if __name__ == "__main__":
               f"{spec.wavelengths[0]:6.1f}–{spec.wavelengths[-1]:6.1f} nm   "
               f"scan ±{spec.suggested_delay_fs:4.0f} fs   "
               f"peak {col.max():7.1f} counts")
+
+    # Long-move split: a 47 mm move at the 5 mm default is 10 sub-moves, and the
+    # stage still lands exactly on target. A short one stays a single move.
+    stage = SimulatedStage(travel_mm=300.0)
+    raw = [0]
+    stage._move_to_raw = (lambda f: lambda mm: (raw.__setitem__(0, raw[0] + 1), f(mm))[1]
+                          )(stage._move_to_raw)
+    stage.move_to(47.0)
+    assert raw[0] == 10, f"expected 10 sub-moves for 47 mm, got {raw[0]}"
+    assert stage.get_position() == 47.0, stage.get_position()
+    raw[0] = 0
+    stage.move_to(45.0)
+    assert raw[0] == 1, f"expected 1 move for 2 mm, got {raw[0]}"
+    print(f"  long-move split: 47 mm -> {10} steps of <=5 mm, 2 mm -> 1 step")

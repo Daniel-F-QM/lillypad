@@ -176,6 +176,16 @@ Defaults are per adapter, and you can override them:
 This is why the same rig can show a zero shift on a Zaber and none on a
 Thorlabs stage.
 
+**Long moves are split up.** A move blocks until the stage has settled and
+nothing in the app can interrupt one, so a mistyped target or a fs/um mix-up
+would otherwise become a single full-speed traverse across the travel. Any move
+longer than `StageBase.max_step_mm` (**5 mm**, the same for every adapter; set it
+to 0 to switch this off) is instead carried out as a run of sub-moves of at most
+that far, each settling before the next is issued, and the status bar reports the
+split. The stage still lands on exactly the position you asked for — the last
+sub-move is the target itself — and the backlash approach above is unaffected.
+Scan points are microns apart, so a scan never trips it.
+
 **Zaber stages.** Two Zaber-specific things are worth knowing.
 
 `get_position()` reads Zaber's `pos` setting, which on a stepper is the
