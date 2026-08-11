@@ -600,6 +600,24 @@ class AcquisitionSettingsDialog(QDialog):
         sat_hint.setObjectName("dim"); sat_hint.setWordWrap(True)
         lay.addWidget(sat_hint)
 
+        lay.addWidget(_hline())
+
+        # ── Stage health ─────────────────────────────────────────────────────
+        lay.addWidget(self._hdr("Stage"))
+        self.chk_abort_stage_fault = QCheckBox(
+            "Abort scan on stage fault")
+        self.chk_abort_stage_fault.setChecked(FrogScanConfig.abort_on_stage_fault)
+        lay.addWidget(self.chk_abort_stage_fault)
+
+        stage_hint = QLabel(
+            "A stall, a knob nudge or an unhomed axis means the stage is not "
+            "where the program thinks it is, so every later column carries a "
+            "delay that never happened. Checked (the default), the scan stops "
+            "at the first one. Unchecked, it runs to the end and the affected "
+            "columns are marked in the .npz.")
+        stage_hint.setObjectName("dim"); stage_hint.setWordWrap(True)
+        lay.addWidget(stage_hint)
+
         btn = QPushButton("Close"); btn.clicked.connect(self.hide)
         lay.addWidget(btn)
 
@@ -2170,9 +2188,14 @@ class FrogWindow(QMainWindow):
             else:
                 # Real stage: adopt its ACTUAL position as zero-delay so
                 # "Move to 0 fs" can never slam it into a travel limit.
+                # Except when the axis has no reference — that readback is an
+                # arbitrary number, and homing later would move the frame under
+                # it. Adopt it anyway so the travel maths has something sane to
+                # work with, but _start_scan refuses to run until it is homed.
                 self.scan_cfg.zero_pos_um = _stage_to_um(new_stage.get_position())
             self._update_stage_unit_ranges()  # new travel + possibly new zero
             self._refresh_positions()   # inside the lock — we still own the stage
+        self._sync_backlash_ui()        # the new stage brings its own default
         self._refresh_scan_um()         # zero may have moved: fs→um previews
         return True, ""
 
@@ -2266,9 +2289,22 @@ class FrogWindow(QMainWindow):
         if not ok:
             self._drop(stage)      # never adopted — release the serial port
             return False, err
+        if stage.needs_homing:
+            self.status.showMessage(
+                f"Stage: {stage.name} — NOT HOMED, home it before scanning.", 0)
+            return True, (
+                f"Stage connected: {stage.name}, but the axis is NOT HOMED. Its "
+                f"position readback has no physical meaning until you press "
+                f"Home, and homing will move the coordinate frame — so home "
+                f"first, then set zero. Scans are blocked until then.")
         self.status.showMessage(f"Stage: {stage.name} — zero at current position.", 5000)
+        backlash_um = _stage_to_um(stage.backlash_mm)
         return True, (f"Stage connected: {stage.name}. Zero-delay set to current "
-                      f"position ({self.scan_cfg.zero_pos_um:.1f} um).")
+                      f"position ({self.scan_cfg.zero_pos_um:.1f} um). "
+                      f"Backlash approach {backlash_um:.0f} um — Zaber does no "
+                      f"backlash correction of its own, and without this the "
+                      f"marked zero and a scan sweep sit in frames that differ "
+                      f"by the screw slack.")
 
     def _connect_piezo_jena_stage(self, port=None):
         try:
@@ -3010,8 +3046,31 @@ class FrogWindow(QMainWindow):
         self.btn_set_zero.setObjectName("accent")
         self.btn_set_zero.clicked.connect(self._mark_zero)
         lay.addWidget(self.btn_set_zero)
+
+        # Backlash approach margin. Every move undershoots by this much when it
+        # would otherwise arrive from above, so the zero you mark by jogging and
+        # the positions a scan sweeps through sit in the same frame.
+        brow = QHBoxLayout()
+        bl = QLabel("Backlash"); bl.setObjectName("dim")
+        self.spin_backlash = DoubleSpinBox()
+        self.spin_backlash.setRange(0.0, 1000.0); self.spin_backlash.setDecimals(1)
+        self.spin_backlash.setSingleStep(10.0); self.spin_backlash.setSuffix(" um")
+        self.spin_backlash.setToolTip(
+            "Approach margin. Lead-screw stages land in a different place "
+            "depending on which way they arrived; undershooting by more than "
+            "the slack and coming back up makes every move repeatable.\n\n"
+            "0 disables it — correct for a Thorlabs controller (its firmware "
+            "already does this) or a piezo, wrong for a Zaber.")
+        self.spin_backlash.valueChanged.connect(self._on_backlash_changed)
+        brow.addWidget(bl); brow.addWidget(self.spin_backlash)
+        lay.addLayout(brow)
+        self.lbl_backlash_fs = QLabel("—"); self.lbl_backlash_fs.setObjectName("dim")
+        self.lbl_backlash_fs.setWordWrap(True)
+        lay.addWidget(self.lbl_backlash_fs)
+
         self._update_stage_unit_ranges()   # stage + scan_cfg exist by now
         self.spin_step.setValue(100.0)     # after ranges: default 100 fs jog
+        self._sync_backlash_ui()           # seed from whatever stage is loaded
         return grp
 
     def _build_scan_group(self):
@@ -3514,7 +3573,7 @@ class FrogWindow(QMainWindow):
     def _set_stage_controls_enabled(self, on):
         for w in (self.btn_minus, self.btn_plus, self.btn_moveto,
                   self.btn_home, self.btn_goto_zero, self.btn_set_zero,
-                  self.btn_units):
+                  self.btn_units, self.spin_backlash):
             w.setEnabled(on)
 
     def _moving(self, on):
@@ -3554,28 +3613,69 @@ class FrogWindow(QMainWindow):
             self._moving(False)
             self._set_stage_controls_enabled(True)
 
-    def _travel_um(self):
-        """Stage travel in um; 300 mm fallback when the adapter reports none."""
+    def _travel_range_um(self):
+        """Reachable position range (lo, hi) in um.
+
+        Not [0, travel]: limit.min is not always 0 (a soft limit protecting the
+        optics is common), and the low end has to leave room for the backlash
+        pre-move to undershoot into. Falls back to 300 mm of travel when the
+        adapter reports none.
+        """
         t = getattr(self.stage, "travel_mm", None)
-        return _stage_to_um(t if t else 300.0)
+        hi = _stage_to_um(t if t else 300.0)
+        lo = _stage_to_um(float(getattr(self.stage, "travel_min_mm", 0.0) or 0.0)
+                          + float(getattr(self.stage, "backlash_mm", 0.0) or 0.0))
+        return lo, hi
 
     def _update_stage_unit_ranges(self):
         """Set spin_step/spin_moveto ranges for the active unit, the connected
         stage's travel, and the current zero. Call after: unit toggle, stage
-        swap, zero change."""
-        travel_um = self._travel_um()
+        swap, zero change, backlash change."""
+        lo_um, hi_um = self._travel_range_um()
         pf, z = self.scan_cfg.pass_factor, self.scan_cfg.zero_pos_um
         if self._stage_units_fs:
             # Inward rounding (ceil min, floor max) so every integer fs in
-            # range maps to a position strictly inside [0, travel].
+            # range maps to a position strictly inside the travel range.
             self.spin_step.setRange(
-                1, math.floor(float(position_to_delay_fs(travel_um, 0.0, pf))))
+                1, max(1, math.floor(float(
+                    position_to_delay_fs(hi_um - lo_um, 0.0, pf)))))
             self.spin_moveto.setRange(
-                math.ceil(float(position_to_delay_fs(0.0, z, pf))),
-                math.floor(float(position_to_delay_fs(travel_um, z, pf))))
+                math.ceil(float(position_to_delay_fs(lo_um, z, pf))),
+                math.floor(float(position_to_delay_fs(hi_um, z, pf))))
         else:
-            self.spin_step.setRange(0.01, travel_um)
-            self.spin_moveto.setRange(0.0, travel_um)
+            self.spin_step.setRange(0.01, hi_um - lo_um)
+            self.spin_moveto.setRange(lo_um, hi_um)
+
+    def _sync_backlash_ui(self):
+        """Push the active stage's backlash into the spin box and its fs hint.
+
+        Blocks signals: this reflects the stage, it must not write back to it.
+        """
+        b_um = _stage_to_um(float(getattr(self.stage, "backlash_mm", 0.0) or 0.0))
+        self.spin_backlash.blockSignals(True)
+        self.spin_backlash.setValue(b_um)
+        self.spin_backlash.blockSignals(False)
+        self._refresh_backlash_hint(b_um)
+
+    def _refresh_backlash_hint(self, b_um):
+        if b_um <= 0.0:
+            self.lbl_backlash_fs.setText(
+                "Off — moves arrive from whichever side they came from.")
+            return
+        fs = float(position_to_delay_fs(b_um, 0.0, self.scan_cfg.pass_factor))
+        self.lbl_backlash_fs.setText(
+            f"Approach from below, undershooting {b_um:.1f} um ({fs:.0f} fs).")
+
+    def _on_backlash_changed(self, value_um):
+        if self._scan_running():
+            self.status.showMessage("A scan is running — the stage is busy.", 3000)
+            self._sync_backlash_ui()      # snap back to what the stage has
+            return
+        # Plain attribute write, no device I/O — no lock needed. Ranges shift
+        # because the low end reserves the margin.
+        self.stage.backlash_mm = _um_to_stage(float(value_um))
+        self._refresh_backlash_hint(float(value_um))
+        self._update_stage_unit_ranges()
 
     def _toggle_stage_units(self):
         pf, z = self.scan_cfg.pass_factor, self.scan_cfg.zero_pos_um
@@ -3600,11 +3700,12 @@ class FrogWindow(QMainWindow):
         v = self.spin_step.value()
         step_um = (float(delay_to_position_um(v, 0.0, self.scan_cfg.pass_factor))
                    if self._stage_units_fs else v)
+        lo, hi = self._travel_range_um()
         def do():
             # Clamped move_to instead of move_by: the target can never leave
             # the travel range. get_position() runs inside the device lock.
             cur = _stage_to_um(self.stage.get_position())
-            target = min(max(cur + sign * step_um, 0.0), self._travel_um())
+            target = min(max(cur + sign * step_um, lo), hi)
             self.stage.move_to(_um_to_stage(target))
         self._stage_action(do)
 
@@ -3612,7 +3713,8 @@ class FrogWindow(QMainWindow):
         v = self.spin_moveto.value()
         pf, z = self.scan_cfg.pass_factor, self.scan_cfg.zero_pos_um
         target_um = float(delay_to_position_um(v, z, pf)) if self._stage_units_fs else v
-        target_um = min(max(target_um, 0.0), self._travel_um())
+        lo, hi = self._travel_range_um()
+        target_um = min(max(target_um, lo), hi)
         self._stage_action(lambda: self.stage.move_to(_um_to_stage(target_um)))
 
     def _move_to_zero(self):
@@ -3620,7 +3722,36 @@ class FrogWindow(QMainWindow):
             lambda: self.stage.move_to(_um_to_stage(self.scan_cfg.zero_pos_um)))
 
     def _home_stage(self):
-        self._stage_action(lambda: self.stage.home(), "Stage homed to 0 mm.")
+        """Home the axis, and drop a zero that homing has invalidated.
+
+        Homing an axis that had no reference re-establishes the coordinate
+        frame, which moves any zero marked in the old one. Silently keeping it
+        would shift the whole delay axis by the home offset, so it goes.
+        """
+        was_unreferenced = bool(getattr(self.stage, "needs_homing", False))
+        landed = []          # stays empty if home() raised or the feed was busy
+
+        def do():
+            self.stage.home()
+            # Read it here, inside the lock — get_position() is device I/O and
+            # the live feed drives the same stage from its own thread.
+            landed.append(_stage_to_um(self.stage.get_position()))
+
+        self._stage_action(do)
+        if not landed:
+            return           # _stage_action already reported why
+        pos_um = landed[0]
+        if was_unreferenced:
+            self.scan_cfg.zero_pos_um = pos_um
+            self._update_stage_unit_ranges()
+            self._refresh_positions()
+            self._refresh_scan_um()
+            self.status.showMessage(
+                f"Homed to {pos_um:.2f} um. The axis had no reference before, "
+                f"so the old zero-delay was in a different frame — set zero "
+                f"again before scanning.", 0)
+        else:
+            self.status.showMessage(f"Stage homed to {pos_um:.2f} um.", 3000)
 
     def _mark_zero(self):
         def mark():
@@ -3653,6 +3784,14 @@ class FrogWindow(QMainWindow):
             return
         if self.spec is None:
             self.status.showMessage("Connect a spectrometer first.", 4000); return
+        # An unreferenced axis has no usable coordinate frame: every delay the
+        # scan would record is measured from a zero that means nothing, and
+        # homing afterwards moves the frame again. Refuse rather than save it.
+        if getattr(self.stage, "needs_homing", False):
+            self.status.showMessage(
+                "Stage is not homed — press Home, then set zero, then scan.",
+                6000)
+            return
 
         c = self.scan_cfg
         c.delay_start_fs = self.spin_start.value()
@@ -3664,6 +3803,7 @@ class FrogWindow(QMainWindow):
         c.capture_background = self.chk_bg.isChecked()
         c.saturation_fraction  = self.dlg_settings.spin_sat.value() / 100.0
         c.abort_on_saturation  = self.dlg_settings.chk_abort_sat.isChecked()
+        c.abort_on_stage_fault = self.dlg_settings.chk_abort_stage_fault.isChecked()
         # c.saturation_counts is owned by the Hardware dialog's override field.
 
         try:
@@ -3708,6 +3848,7 @@ class FrogWindow(QMainWindow):
         self._worker.column_ready.connect(self._on_column)
         self._worker.background_ready.connect(self._on_background)
         self._worker.saturation_warning.connect(self._on_saturation)
+        self._worker.stage_fault.connect(self._on_stage_fault)
         self._worker.finished_scan.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
@@ -3765,6 +3906,17 @@ class FrogWindow(QMainWindow):
     def _on_background(self, which, spectrum):
         self.status.showMessage(f"Background ({which}) captured.", 2500)
 
+    def _on_stage_fault(self, i, delay_fs, reason):
+        """Slot for FrogScanWorker.stage_fault.
+
+        With the abort enabled the worker's error() follows immediately and
+        supersedes this; the message matters in the override case, where the
+        scan carries on and this is the only live sign that it has stopped
+        tracking. Timeout 0 — it must not quietly disappear.
+        """
+        where = "the background frame" if i < 0 else f"{delay_fs:+.0f} fs"
+        self.status.showMessage(f"⚠ STAGE FAULT @ {where} — {reason}", 0)
+
     def _on_saturation(self, i, delay_fs, npx, peak):
         """Slot for FrogScanWorker.saturation_warning — one signal per frame.
 
@@ -3800,7 +3952,18 @@ class FrogWindow(QMainWindow):
         f = result.fwhm_fs()
         self.lbl_fwhm.setText(f"AC FWHM:  {f:.1f} fs" if np.isfinite(f) else "AC FWHM:  — fs")
         self.progress.setValue(100)
-        self.status.showMessage(f"Scan complete — {result.trace.shape[1]} columns.", 5000)
+        n_bad = int(result.faulted_columns().size)
+        if n_bad:
+            # Only reachable with the abort override off — the scan ran to the
+            # end over a stage that had stopped tracking. Say so permanently
+            # rather than for five seconds; the delay axis is compromised.
+            self.status.showMessage(
+                f"Scan complete — {result.trace.shape[1]} columns, but the "
+                f"stage reported a fault on {n_bad} of them. Their delays are "
+                f"not trustworthy; the .npz marks which.", 0)
+        else:
+            self.status.showMessage(
+                f"Scan complete — {result.trace.shape[1]} columns.", 5000)
         self.btn_save.setEnabled(True)
         self._reset_scan_ui()
 

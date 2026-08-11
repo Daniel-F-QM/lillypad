@@ -151,6 +151,63 @@ scale units are then verified, so a rotational or uncalibrated stage is
 would silently distort the delay axis instead of failing. To support a stage
 that matches neither, add a `STAGE_CONFIGS` entry.
 
+**Backlash and approach direction.** A lead-screw stage lands in a different
+place depending on which way it arrived. A scan sweeps monotonically, so every
+scan point is approached from one side — but you mark zero-delay after jogging,
+which arrives from whichever side you happened to be on. Left uncorrected, the
+two sit in frames that differ by the mechanical backlash and the whole delay
+axis is offset: at double pass, 8 um of slack is **53 fs**.
+
+The **Backlash** box in the Stage panel is the fix. With it set, every move —
+jog, *Move*, *Move to 0 fs*, *Set Current Position as 0 fs* and each scan point
+— undershoots by that margin and comes back up when it would otherwise arrive
+from above, so everything shares one approach direction. A monotonic sweep only
+reverses once (on the way into the range), so it costs one extra move per scan,
+not one per point.
+
+Defaults are per adapter, and you can override them:
+
+| Adapter | Default | Why |
+| --- | --- | --- |
+| `ZaberStage` | **50 um** | Zaber does no backlash correction of its own |
+| `KinesisStage` | 0 | Thorlabs controllers already do it in firmware (`get_gen_move_parameters`) |
+| `PiezoJenaStage` | 0 | Closed-loop flexure — no screw, and every move verifies itself |
+
+This is why the same rig can show a zero shift on a Zaber and none on a
+Thorlabs stage.
+
+**Zaber stages.** Two Zaber-specific things are worth knowing.
+
+`get_position()` reads Zaber's `pos` setting, which on a stepper is the
+*trajectory counter*, not a measurement: after a completed move it returns what
+was commanded whether or not the carriage got there. A readback alone therefore
+cannot reveal a stall, a knob nudge or a lost reference. `ZaberStage` instead
+reads the device's warning flags after every scan point (`FS` stalled, `WM`
+displaced while stationary, `NC` moved by manual control, `WH`/`WR` unhomed, …)
+and, on devices with an encoder, cross-checks `pos` against `encoder.pos`.
+Anything it finds stops the scan — *Abort scan on stage fault* in **Acquisition
+Settings**, on by default. Unchecked, the scan finishes and the affected
+columns are marked in the `.npz` (`stage_faults`, one entry per column).
+
+An **unhomed** axis is refused outright: its `pos` has no physical meaning, and
+homing afterwards moves the coordinate frame under any zero marked before it.
+Home first, then set zero. (Homing an axis that *was* unhomed also clears the
+stored zero-delay, for the same reason.)
+
+To measure the backlash on your own stage:
+
+```bash
+python zaber_diagnostics.py                     # report only, moves nothing
+python zaber_diagnostics.py --measure           # MOVES: measures the backlash
+python zaber_diagnostics.py --check-compensation    # MOVES: verifies the fix
+```
+
+The report covers firmware, peripheral, microstep size (in um *and* fs),
+`limit.min`/`limit.max`, homed state and active warning flags. `--measure`
+approaches one target from both directions and reads the difference off the
+encoder, printing it in um and fs — that number is the zero shift to expect
+without correction, and it is what the **Backlash** box needs to exceed.
+
 **Spectrometer calibration.** The toolbar's **Calibration** menu assigns an
 intensity calibration to each connected spectrometer: a two-column text file
 (wavelength in nm, multiplicative factor; `#` comments allowed) from the

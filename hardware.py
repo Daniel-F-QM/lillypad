@@ -52,22 +52,83 @@ class StageBase(abc.ABC):
 
     Absolute/relative moves MUST block until the stage has settled, so the
     scan loop can read back a trustworthy position immediately afterwards.
+    Subclasses implement the raw vendor move as _move_to_raw; move_to on this
+    base wraps it with the unidirectional approach described below.
+
+    Backlash / approach direction
+    -----------------------------
+    On a lead-screw stage the position you land on depends on which way you
+    were travelling when you got there. A FROG scan sweeps monotonically, so
+    every scan point is approached from one side — but the zero-delay position
+    is marked after jogging, which arrives from whichever side the operator
+    happened to be on. The two frames then differ by the mechanical backlash,
+    and the whole trace sits at the wrong delay. At double pass, 8 um of
+    backlash is 53 fs.
+
+    Setting backlash_mm > 0 makes EVERY move on this stage arrive travelling in
+    the + direction, so the marked zero and the scan share one frame. The
+    pre-move only happens when the move would otherwise arrive from above, so a
+    monotonic ascending sweep pays nothing for it.
+
+    Leave backlash_mm at 0 when the controller already does this in firmware
+    (Thorlabs Kinesis does) or when there is no backlash to correct (piezo).
     """
     units = "mm"
     name  = "stage"
-    travel_mm: float | None = None
+    travel_mm:     float | None = None
+    travel_min_mm: float = 0.0
+    backlash_mm:   float = 0.0
+    # True when the axis has no valid reference and its readback is meaningless
+    # until homed. Adapters that can tell set this; the GUI refuses to adopt a
+    # zero-delay position from a stage that reports it.
+    needs_homing:  bool = False
 
-    @abc.abstractmethod
     def move_to(self, position_mm: float) -> None:
-        """Absolute move to position_mm; block until settled."""
+        """Absolute move to position_mm; blocks until settled.
+
+        With backlash_mm > 0 the stage always arrives travelling in the +
+        direction: if we would otherwise come down onto the target, undershoot
+        by backlash_mm first and take the slack up on the way back.
+        """
+        target = float(position_mm)
+        b = self.backlash_mm
+        if b > 0.0:
+            pre = max(target - b, self.travel_min_mm)
+            # pre == target means the target sits inside the backlash margin at
+            # the bottom of travel and there is no room to undershoot. Move
+            # directly rather than refuse — the range checks in scan.py and the
+            # GUI reserve this margin so it should not normally happen.
+            if pre < target and self.get_position() > target - 1e-9:
+                self._move_to_raw(pre)
+        self._move_to_raw(target)
+
+    def move_by(self, delta_mm: float) -> None:
+        """Relative move by delta_mm; blocks until settled."""
+        self.move_to(self.get_position() + float(delta_mm))
 
     @abc.abstractmethod
-    def move_by(self, delta_mm: float) -> None:
-        """Relative move by delta_mm; block until settled."""
+    def _move_to_raw(self, position_mm: float) -> None:
+        """Vendor absolute move to position_mm; block until settled.
+
+        No backlash handling here — move_to owns that.
+        """
 
     @abc.abstractmethod
     def get_position(self) -> float:
         """Read back the *actual* current position in mm."""
+
+    def position_fault(self) -> str | None:
+        """Human-readable reason the readback cannot be trusted, or None.
+
+        Checked by the scan loop after every point, so a stall, a knob nudge or
+        an unhomed axis stops the scan instead of silently mis-labelling the
+        trace. Adapters that cannot report health leave this at None.
+        """
+        return None
+
+    def clear_position_faults(self) -> None:
+        """Clear latched controller warnings, so a scan only ever sees faults
+        that happened during that scan."""
 
     def home(self) -> None:
         pass
@@ -282,9 +343,17 @@ class KinesisStage(StageBase):
       model  — force a STAGE_CONFIGS entry instead of identifying the stage.
                An escape hatch for a controller whose reported model number no
                entry matches; you are then asserting the scale is right.
+      backlash_mm — software approach margin (see StageBase). Defaults to 0
+               because Kinesis controllers already do this in FIRMWARE: the APT
+               "general move parameters" carry a backlash distance which the
+               controller applies to every move that would arrive from the
+               wrong side (pylablib: get_gen_move_parameters / setup_gen_move).
+               Doing it twice would only add travel. Read the firmware value
+               with firmware_backlash_mm(); if a controller comes back with 0
+               there, set this instead.
     """
     def __init__(self, serial: str | None = None, index: int = 0,
-                 model: str | None = None):
+                 model: str | None = None, backlash_mm: float = 0.0):
         from pylablib.devices import Thorlabs
 
         devices = Thorlabs.list_kinesis_devices()
@@ -341,6 +410,7 @@ class KinesisStage(StageBase):
         self.scale_units  = units
         self.travel_mm    = travel_mm
         self.name         = f"{self._label(key, reported, stage_name)} [{conn}]"
+        self.backlash_mm  = float(backlash_mm)
         self._mm_per_unit = mm_per_unit
         self._motor       = motor
 
@@ -365,12 +435,17 @@ class KinesisStage(StageBase):
         return (f"Stage {who} has no millimetre calibration: {why}. "
                 f"Add an entry for it to STAGE_CONFIGS in hardware.py.")
 
-    def move_to(self, position_mm: float) -> None:
-        self._motor.move_to(float(position_mm) / self._mm_per_unit)
-        self._motor.wait_move()
+    def firmware_backlash_mm(self) -> float | None:
+        """The controller's own backlash-correction distance, or None if it
+        cannot be read. Reported only — see backlash_mm in __init__."""
+        try:
+            p = self._motor.get_gen_move_parameters()
+            return float(p.backlash_distance) * self._mm_per_unit
+        except Exception:
+            return None
 
-    def move_by(self, delta_mm: float) -> None:
-        self._motor.move_by(float(delta_mm) / self._mm_per_unit)
+    def _move_to_raw(self, position_mm: float) -> None:
+        self._motor.move_to(float(position_mm) / self._mm_per_unit)
         self._motor.wait_move()
 
     def get_position(self) -> float:
@@ -409,18 +484,54 @@ class ZaberStage(StageBase):
     (both default to the first). The connection is kept open for the life of the
     object and closed by disconnect().
 
-    Moves block (zaber-motion's wait_until_idle) so the scan loop can read back a
-    trustworthy position immediately afterwards. Travel is read from the axis's
-    own limit.max setting when the caller does not override it.
+    Moves block (wait_until_idle is passed explicitly) so the scan loop can read
+    back a trustworthy position immediately afterwards. The travel range is read
+    from the axis's own limit.min / limit.max settings when the caller does not
+    override it.
+
+    Two things to know about Zaber that this class exists to handle:
+
+    * Unlike a Thorlabs controller, Zaber does NO automatic backlash correction
+      — the firmware drives straight to the target from whichever side it is on.
+      backlash_mm therefore defaults to 50 um here, so every move arrives from
+      the same direction and the marked zero-delay position stays in the same
+      frame as a scan sweep. See StageBase for why that matters.
+
+    * get_position() reads the `pos` setting, which on a stepper is the
+      TRAJECTORY COUNTER, not a measurement — after a completed move it returns
+      the commanded value whether or not the carriage got there. So a readback
+      alone can never reveal a stall, a hand-nudge or a lost reference. That is
+      what position_fault() is for: it reads the device's warning flags (and the
+      encoder, on devices that have one) and reports anything that means the
+      position is a lie.
     """
+    # Zaber warning/fault flags that invalidate the position readback, mapped to
+    # what to tell the user. See zaber_motion.ascii.WarningFlags.
+    _FAULT_FLAGS = {
+        "FS": "motor stalled and stopped",
+        "WS": "motor stalled and recovered",
+        "WM": "stage displaced while stationary",
+        "WL": "unexpected limit switch trigger",
+        "WH": "axis is not homed",
+        "WR": "no reference position (axis needs homing)",
+        "NC": "stage was moved by manual control (knob/joystick)",
+        "FQ": "encoder error",
+        "FI": "index error",
+        "FE": "limit error",
+        "FR": "overdrive limit exceeded",
+    }
+    # pos vs encoder.pos divergence beyond this means lost steps, not rounding.
+    _ENCODER_TOL_MM = 0.010
+
     def __init__(self, port: str | None = None, device_index: int = 0,
                  axis_number: int = 1, travel_mm: float | None = None,
-                 probe_timeout_ms: int = 500):
+                 probe_timeout_ms: int = 500, backlash_mm: float = 0.05):
         from zaber_motion import Units
         from zaber_motion.ascii import Connection
 
         self._Units = Units
         self._conn  = None
+        self.backlash_mm = float(backlash_mm)
 
         conn, device, used_port = self._open(
             port, device_index, probe_timeout_ms, Connection)
@@ -430,12 +541,24 @@ class ZaberStage(StageBase):
             self._axis   = device.get_axis(axis_number)
 
             if travel_mm is None:
-                try:
-                    travel_mm = float(self._axis.settings.get(
-                        "limit.max", Units.LENGTH_MILLIMETRES))
-                except Exception:
-                    travel_mm = None
+                travel_mm = self._setting("limit.max")
             self.travel_mm = travel_mm
+            # limit.min is NOT always 0 — a user-set soft limit protecting the
+            # optics is common. Clamping to [0, travel] instead would command
+            # moves the firmware rejects.
+            self.travel_min_mm = self._setting("limit.min") or 0.0
+
+            # An unhomed Zaber reports a `pos` with no physical meaning, and
+            # homing later shifts the whole coordinate frame under any zero
+            # marked in the meantime.
+            try:
+                self.needs_homing = not bool(self._axis.is_homed())
+            except Exception:
+                self.needs_homing = False
+
+            # Devices with an encoder can be cross-checked against `pos`; those
+            # without leave position_fault() relying on the warning flags alone.
+            self._has_encoder = self._setting("encoder.pos") is not None
 
             label = getattr(device, "name", None) or "Zaber"
             axis_tag = f" ax{axis_number}" if device.axis_count > 1 else ""
@@ -448,9 +571,27 @@ class ZaberStage(StageBase):
     def _candidate_ports() -> list[str]:
         try:
             from serial.tools import list_ports
-            return [p.device for p in list_ports.comports()]
+            # Bluetooth-link COM ports block for seconds on open (long enough
+            # to look like a hang when auto-scanning) and are never a Zaber.
+            return [p.device for p in list_ports.comports()
+                    if not p.description.startswith(
+                        "Standard Serial over Bluetooth link")]
         except Exception:
             return []
+
+    def _setting(self, name: str, unit=None) -> float | None:
+        """Read one axis setting in mm (or `unit`), or None if unsupported.
+
+        Not every setting exists on every Zaber device — encoder.pos only on
+        devices with an encoder, limit.min only on some firmware — and asking
+        for a missing one raises. A missing setting is information, not an
+        error, so it comes back as None.
+        """
+        try:
+            return float(self._axis.settings.get(
+                name, self._Units.LENGTH_MILLIMETRES if unit is None else unit))
+        except Exception:
+            return None
 
     def _open(self, port, device_index, probe_timeout_ms, Connection):
         """Open the serial connection and return (connection, device, port).
@@ -494,19 +635,59 @@ class ZaberStage(StageBase):
             f"No Zaber device found on any serial port ({', '.join(ports)}). "
             f"Last error: {last_err}")
 
-    def move_to(self, position_mm: float) -> None:
+    def _move_to_raw(self, position_mm: float) -> None:
+        # wait_until_idle is the library default, but StageBase makes blocking a
+        # hard contract — say so rather than inherit it.
         self._axis.move_absolute(float(position_mm),
-                                 self._Units.LENGTH_MILLIMETRES)
-
-    def move_by(self, delta_mm: float) -> None:
-        self._axis.move_relative(float(delta_mm),
-                                 self._Units.LENGTH_MILLIMETRES)
+                                 self._Units.LENGTH_MILLIMETRES,
+                                 wait_until_idle=True)
 
     def get_position(self) -> float:
+        """Position in mm from the `pos` setting.
+
+        This is the app's coordinate frame; position_fault() is what tells you
+        whether to believe it. Deliberately NOT encoder.pos — that has its own
+        origin, and switching would silently re-reference every saved zero.
+        """
         return float(self._axis.get_position(self._Units.LENGTH_MILLIMETRES))
 
+    def encoder_position(self) -> float | None:
+        """Measured position in mm from the encoder, or None if there is none.
+
+        Unlike get_position() this is a measurement, so the two disagreeing
+        means the axis lost steps.
+        """
+        return self._setting("encoder.pos") if self._has_encoder else None
+
+    def position_fault(self) -> str | None:
+        try:
+            flags = set(self._axis.warnings.get_flags())
+        except Exception:
+            return None
+        reasons = [text for flag, text in self._FAULT_FLAGS.items()
+                   if flag in flags]
+
+        enc = self.encoder_position()
+        if enc is not None:
+            try:
+                gap = abs(enc - self.get_position())
+            except Exception:
+                gap = 0.0
+            if gap > self._ENCODER_TOL_MM:
+                reasons.append(
+                    f"encoder disagrees with the step counter by "
+                    f"{gap * 1000.0:.1f} um (lost steps)")
+        return "; ".join(reasons) or None
+
+    def clear_position_faults(self) -> None:
+        try:
+            self._axis.warnings.clear_flags()
+        except Exception:
+            pass
+
     def home(self) -> None:
-        self._axis.home()
+        self._axis.home(wait_until_idle=True)
+        self.needs_homing = False
 
     def stop(self) -> None:
         self._axis.stop()
@@ -541,8 +722,12 @@ class PiezoJenaStage(StageBase):
     no other device on a bench is likely to say.
 
     "wr" only sets the target — the controller settles on its own — so
-    move_to() polls "rd" until the readback is within tolerance, with a hard
-    deadline so a wedged controller raises instead of hanging the GUI.
+    _move_to_raw() polls "rd" until the readback is within tolerance, with a
+    hard deadline so a wedged controller raises instead of hanging the GUI.
+
+    backlash_mm stays 0: a closed-loop flexure piezo has no screw and therefore
+    no backlash, and "rd" is a real measurement rather than a step counter, so
+    every move verifies itself against the stage's own 0.1 um resolution.
     """
     _TOL_UM = 0.1   # settle tolerance = the stage's own resolution
 
@@ -614,7 +799,7 @@ class PiezoJenaStage(StageBase):
     def _command(self, cmd: bytes) -> None:
         self._ser.write(cmd + b"\r\n")
 
-    def move_to(self, position_mm: float) -> None:
+    def _move_to_raw(self, position_mm: float) -> None:
         # Clamp instead of raising: the scan worker pre-checks its targets
         # against travel_mm, so anything out of range here is a manual move.
         target_um = min(max(float(position_mm) * 1000.0, 0.0),
@@ -627,9 +812,6 @@ class PiezoJenaStage(StageBase):
                     f"Stage did not settle at {target_um:.2f} um within 5 s "
                     f"(readback {self.get_position() * 1000.0:.2f} um).")
             time.sleep(0.05)
-
-    def move_by(self, delta_mm: float) -> None:
-        self.move_to(self.get_position() + float(delta_mm))
 
     def get_position(self) -> float:
         # Reply looks like b"rd,123.4\r\n" — the value follows the last comma.
@@ -954,23 +1136,41 @@ class StitchedSpectrometer(SpectrometerBase):
 # Simulated hardware (drop-in test doubles, no SDK required)
 # ===========================================================================
 class SimulatedStage(StageBase):
-    """In-memory delay stage in mm, with optional settle time."""
-    def __init__(self, settle_s: float = 0.0, travel_mm: float = 300.0):
-        self._pos      = 0.0
+    """In-memory delay stage in mm, with optional settle time.
+
+    physical_backlash_mm models real lead-screw slack: the carriage only
+    follows the nut after the slack has been taken up, so a target reached
+    travelling downward lands physical_backlash_mm short of the same target
+    reached travelling upward. Zero (the default) is an ideal stage.
+
+    This is what makes the zero-shift bug reproducible without hardware: mark
+    zero after arriving from one side, sweep a scan from the other, and the
+    trace comes back offset. Setting backlash_mm (the *correction*) to anything
+    larger than physical_backlash_mm makes the offset go away.
+    """
+    def __init__(self, settle_s: float = 0.0, travel_mm: float = 300.0,
+                 physical_backlash_mm: float = 0.0, backlash_mm: float = 0.0):
+        self._pos      = 0.0     # where the nut is  (= commanded)
+        self._true_pos = 0.0     # where the carriage actually is
         self.settle_s  = settle_s
         self.travel_mm = travel_mm
+        self.backlash_mm = float(backlash_mm)
+        self.physical_backlash_mm = float(physical_backlash_mm)
         self.name      = "simulated stage"
 
-    def move_to(self, position_mm: float) -> None:
-        self._pos = float(position_mm)
+    def _move_to_raw(self, position_mm: float) -> None:
+        target = float(position_mm)
+        if target != self._pos:      # a no-op command moves nothing, slack included
+            # Arriving upward, the carriage is pushed flush with the nut;
+            # arriving downward it trails by the slack.
+            self._true_pos = (target if target > self._pos
+                              else target - self.physical_backlash_mm)
+            self._pos = target
         if self.settle_s:
             time.sleep(self.settle_s)
 
-    def move_by(self, delta_mm: float) -> None:
-        self.move_to(self._pos + float(delta_mm))
-
     def get_position(self) -> float:
-        return self._pos
+        return self._true_pos
 
     def home(self) -> None:
         self.move_to(0.0)

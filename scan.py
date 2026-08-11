@@ -137,6 +137,16 @@ class FrogScanConfig:
     saturation_counts: float | None = None  # explicit full-scale; None -> use
                                              # spectrometer.max_counts
     abort_on_saturation: bool = False        # alert only by default
+    # Stage health. Unlike saturation, this defaults to ABORTING: a clipped
+    # spectrum is still labelled with the right delay, but a stalled or
+    # hand-nudged stage means every column after it carries a delay that never
+    # happened, and nothing downstream can tell.
+    abort_on_stage_fault: bool = True
+    # Readback-vs-commanded tolerance (um); None disables the check. Off by
+    # default because it is a no-op on Zaber (its readback is the trajectory
+    # counter, so it always agrees) and would false-trip on adapters whose
+    # readback resolution is coarser than the tolerance.
+    position_tolerance_um: float | None = None
     # Optional soft travel limits (um); None -> fall back to stage.travel_mm
     pos_min_um: float | None = None
     pos_max_um: float | None = None
@@ -169,6 +179,11 @@ class FrogResult:
     n_saturated:           np.ndarray | None = None # clipped px per column
     n_saturated_bg_before: int = 0
     n_saturated_bg_after:  int = 0
+    # Per-column stage-health report, "" where the column was clean. Non-empty
+    # entries mean the delay label on that column is not trustworthy.
+    stage_faults:          np.ndarray | None = None
+    stage_name:            str = ""
+    stage_backlash_um:     float = 0.0
     timestamp: str = field(
         default_factory=lambda: datetime.datetime.now().isoformat(timespec="seconds"))
 
@@ -185,6 +200,15 @@ class FrogResult:
     def is_saturated(self) -> bool:
         return bool(self.saturated_columns().size
                     or self.n_saturated_bg_before or self.n_saturated_bg_after)
+
+    def faulted_columns(self) -> np.ndarray:
+        """Indices of the columns the stage reported a position fault at."""
+        if self.stage_faults is None:
+            return np.zeros(0, dtype=int)
+        return np.flatnonzero(np.asarray(self.stage_faults, dtype=object) != "")
+
+    def has_stage_fault(self) -> bool:
+        return bool(self.faulted_columns().size)
 
     def autocorrelation(self, baseline_subtract=True):
         return autocorrelation(self.trace, baseline_subtract)
@@ -216,6 +240,13 @@ class FrogResult:
                                     else int(np.max(self.n_saturated, initial=0))),
             n_saturated_bg_before=int(self.n_saturated_bg_before),
             n_saturated_bg_after=int(self.n_saturated_bg_after),
+            # Stage provenance. backlash_um is what makes a trace's delay axis
+            # comparable to another one's: a scan taken without the approach
+            # correction carries an unknown zero offset of that order.
+            stage_name=self.stage_name,
+            stage_backlash_um=float(self.stage_backlash_um),
+            stage_faulted=self.has_stage_fault(),
+            n_faulted_columns=int(self.faulted_columns().size),
         )
         return d
 
@@ -313,9 +344,16 @@ def write_dwc(path, result):
 
 def write_npz(path, result):
     """Write the full FrogResult as a NumPy archive — raw counts plus the
-    background frames, the per-column saturation record and metadata the text
-    formats cannot carry. (.dwc and .csv have fixed layouts and take none of
-    this; the archive is the only format that can carry it.)"""
+    background frames, the per-column saturation and stage-fault records, and
+    metadata the text formats cannot carry. (.dwc and .csv have fixed layouts
+    and take none of this; the archive is the only format that can carry it.)
+
+    Everything here is in ACQUISITION order, so a high->low scan is stored
+    descending. That is self-consistent — trace, delays_fs and both position
+    vectors share the ordering — but it is NOT the order .dwc and .csv use,
+    since those flip to ascending (see _ascending). Line up an archive against
+    a .dwc by delay value, not by column index.
+    """
     data = dict(
         trace=result.trace, delays_fs=result.delays_fs,
         wavelengths_nm=result.wavelengths_nm,
@@ -327,6 +365,10 @@ def write_npz(path, result):
         # Per column, aligned with delays_fs — enough to mask out the ruined
         # columns downstream rather than just knowing that some exist.
         data["n_saturated"] = np.asarray(result.n_saturated, dtype=int)
+    if result.stage_faults is not None:
+        # Also per column: "" is clean, anything else names what the stage
+        # reported and means that column's delay label cannot be trusted.
+        data["stage_faults"] = np.asarray(result.stage_faults, dtype=str)
     if result.background_before is not None:
         data["background_before"] = result.background_before
     if result.background_after is not None:
@@ -358,15 +400,23 @@ class FrogScanWorker(QThread):
 
     Per delay point: absolute move (blocks until settled) -> optional extra
     wait -> discard `idle_shots` frames -> average `n_average` frames -> read
-    back the actual position -> emit the column. The trace is assembled here
-    and returned whole as a FrogResult, but columns are also emitted live so
-    the GUI can build the trace up as it goes.
+    back the actual position -> check the stage still knows where it is -> emit
+    the column. The trace is assembled here and returned whole as a FrogResult,
+    but columns are also emitted live so the GUI can build the trace up as it
+    goes.
+
+    The scan sweeps monotonically, so every point is approached from the same
+    side. Keeping that true of the marked zero-delay position as well is the
+    stage adapter's job (StageBase.backlash_mm) — without it the two sit in
+    frames that differ by the mechanical backlash and the whole delay axis is
+    offset.
 
     Signals:
       progress(done, total)
       column_ready(i, delay_fs, readback_um, column)        # for the live plot
       background_ready("before"|"after", spectrum)
       saturation_warning(i, delay_fs, n_pixels, peak)       # i = -1 for a bg frame
+      stage_fault(i, delay_fs, reason)                      # i = -1 outside the sweep
       finished_scan(FrogResult)
       error(message)
     """
@@ -374,6 +424,7 @@ class FrogScanWorker(QThread):
     column_ready       = Signal(int, float, float, object)
     background_ready   = Signal(str, object)
     saturation_warning = Signal(int, float, int, float)
+    stage_fault        = Signal(int, float, str)
     finished_scan      = Signal(object)
     error              = Signal(str)
 
@@ -454,9 +505,17 @@ class FrogScanWorker(QThread):
                 self._member_thr = thr if any(t is not None for t in thr) else None
 
             # Travel-limit guard — catches a bad zero or range BEFORE moving.
+            # The low end is limit.min (not necessarily 0) plus the backlash
+            # margin, since the stage undershoots by that much to approach a
+            # target from below and must still have room to do it.
             lo, hi = cfg.pos_min_um, cfg.pos_max_um
+            backlash_um = _stage_to_um(
+                float(getattr(self.stage, "backlash_mm", 0.0) or 0.0))
             if lo is None and getattr(self.stage, "travel_mm", None):
-                lo, hi = 0.0, _stage_to_um(float(self.stage.travel_mm))
+                lo = _stage_to_um(float(getattr(self.stage, "travel_min_mm", 0.0)))
+                hi = _stage_to_um(float(self.stage.travel_mm))
+            if lo is not None:
+                lo += backlash_um
             if lo is not None and hi is not None:
                 bad = (targets < lo) | (targets > hi)
                 if bad.any():
@@ -472,6 +531,11 @@ class FrogScanWorker(QThread):
             # archive carries a per-column map of what is trustworthy.
             n_sat_col = np.zeros(total, dtype=int)
             bg_sat    = {"before": 0, "after": 0}
+            faults    = np.array([""] * total, dtype=object)
+
+            # Warning flags latch on the controller, so anything left over from
+            # a previous session would be blamed on this scan. Start clean.
+            self.stage.clear_position_faults()
 
             def check_sat(idx, delay_fs, peak, n_sat, bg=None):
                 if bg is not None:
@@ -495,8 +559,44 @@ class FrogScanWorker(QThread):
                         return True
                 return False
 
+            def check_fault(idx, delay_fs, target_um=None, pos_um=None):
+                """Ask the stage whether its position is still trustworthy.
+
+                Returns True when the scan must stop. Unlike saturation this
+                aborts by DEFAULT: a clipped column is still labelled with the
+                delay it was taken at, but a stalled or hand-nudged stage
+                labels every later column with a delay that never happened.
+                """
+                reason = self.stage.position_fault()
+                # A readback that disagrees with the command is the same class
+                # of problem. Off unless a tolerance is configured — see
+                # FrogScanConfig.position_tolerance_um for why.
+                tol = cfg.position_tolerance_um
+                if tol is not None and target_um is not None and pos_um is not None:
+                    gap = abs(pos_um - target_um)
+                    if gap > tol:
+                        drift = (f"stage stopped {gap:.2f} um from the commanded "
+                                 f"position (tolerance {tol:.2f} um)")
+                        reason = f"{reason}; {drift}" if reason else drift
+                if not reason:
+                    return False
+                if 0 <= idx < total:
+                    faults[idx] = reason
+                self.stage_fault.emit(idx, float(delay_fs), reason)
+                if cfg.abort_on_stage_fault:
+                    where = ("the background frame" if idx < 0
+                             else f"delay {delay_fs:+.1f} fs")
+                    self.error.emit(
+                        f"Stage fault at {where}: {reason}. Scan stopped — the "
+                        f"delay axis from here on cannot be trusted. Re-home "
+                        f"the stage and set zero again before rescanning.")
+                    return True
+                return False
+
             # Background BEFORE — captured at the start position.
             self.stage.move_to(_um_to_stage(targets[0]))
+            if check_fault(-1, delays[0]):
+                return
             if cfg.capture_background:
                 bg_before, peak, n_sat = self._measure()
                 self.background_ready.emit("before", bg_before)
@@ -515,6 +615,8 @@ class FrogScanWorker(QThread):
                 self.column_ready.emit(i, float(delays[i]), pos_um, col)
                 self.progress.emit(i + 1, total)
                 if check_sat(i, delays[i], peak, n_sat):
+                    return
+                if check_fault(i, delays[i], targets[i], pos_um):
                     return
 
             # Background AFTER — captured at the end position.
@@ -536,6 +638,9 @@ class FrogScanWorker(QThread):
                 n_saturated=n_sat_col,
                 n_saturated_bg_before=bg_sat["before"],
                 n_saturated_bg_after=bg_sat["after"],
+                stage_faults=faults,
+                stage_name=str(getattr(self.stage, "name", "")),
+                stage_backlash_um=backlash_um,
             ))
         except Exception as e:
             self.error.emit(str(e))
@@ -556,3 +661,51 @@ if __name__ == "__main__":
     print(f"  delay round-trip max error: {np.max(np.abs(back - d)):.2e} fs")
     ac = np.exp(-(d ** 2) / (2 * 80.0 ** 2))   # gaussian, sigma=80 -> FWHM~188
     print(f"  FWHM of test gaussian: {fwhm(d, ac):.1f} fs  (expect ~188)")
+
+    # ---------------------------------------------------------------------
+    # Backlash / zero-shift check — the bug this machinery exists to stop.
+    #
+    # Marking zero after arriving from ABOVE, then sweeping upward, puts the
+    # marked zero and the scan in frames that differ by the screw slack. On a
+    # Zaber that is the whole story: nothing in the controller compensates, and
+    # `pos` reads back the commanded value either way, so the offset is silent.
+    # ---------------------------------------------------------------------
+    from hardware import SimulatedStage
+
+    SLACK_MM = 0.008          # 8 um — Zaber X-LSM class spec
+
+    def zero_shift_fs(correction_mm):
+        stage = SimulatedStage(travel_mm=300.0, physical_backlash_mm=SLACK_MM,
+                               backlash_mm=correction_mm)
+        stage.move_to(160.0)                    # park above
+        stage.move_to(150.0)                    # jog DOWN onto zero delay
+        zero_um = _stage_to_um(stage.get_position())    # "Set current position as 0 fs"
+        targets = delay_to_position_um(d, zero_um, cfg.pass_factor)
+        landed = []
+        for t in targets:                       # the scan: monotonic, upward
+            stage.move_to(_um_to_stage(t))
+            landed.append(_stage_to_um(stage.get_position()))
+        # True zero delay is at 150 mm. Compare the delay each column REALLY
+        # sampled against the delay it is labelled with. Skip column 0: it is
+        # the one point the sweep arrives at from above, so it carries an extra
+        # slack error of its own on top of the systematic shift.
+        real = position_to_delay_fs(np.array(landed), 150000.0, cfg.pass_factor)
+        return float(np.mean(real[1:] - d[1:]))
+
+    print("  backlash zero shift:"
+          f"  uncompensated {zero_shift_fs(0.0):+.1f} fs,"
+          f"  compensated {zero_shift_fs(0.05):+.1f} fs  (expect ~-53, ~0)")
+
+    # The correction must not slow a scan down. An ascending sweep only ever
+    # reverses once — on the way into the scan range — so it should cost
+    # exactly one extra move, not one per point.
+    stage = SimulatedStage(travel_mm=300.0, backlash_mm=0.05)
+    raw = [0]
+    stage._move_to_raw = (lambda f: lambda mm: (raw.__setitem__(0, raw[0] + 1), f(mm))[1]
+                          )(stage._move_to_raw)
+    stage.move_to(150.0)
+    raw[0] = 0
+    for t in delay_to_position_um(d, 150000.0, cfg.pass_factor):
+        stage.move_to(_um_to_stage(t))
+    print(f"  moves issued for a {d.size}-point ascending sweep: {raw[0]} "
+          f"(expect {d.size + 1} — one pre-move entering the range)")
