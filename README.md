@@ -18,8 +18,8 @@
 - **Live FROG build-up** — the trace and its autocorrelation are drawn column by
   column as the scan runs, each costing one small blit rather than a full redraw.
 - **Hardware abstraction** — the GUI never imports a vendor SDK. Thorlabs
-  Kinesis, Zaber and Ocean Optics adapters all sit behind two abstract base
-  classes, and vendor libraries are imported lazily.
+  Kinesis, Zaber, Ocean Optics and Avantes adapters all sit behind two abstract
+  base classes, and vendor libraries are imported lazily.
 - **Simulator with nine pulse shapes** — transform-limited sech²/Gaussian, GDD
   chirp, third-order dispersion, self-phase modulation, split-step fibre
   output, double pulse, two-colour pair, and a deliberately over-exposed pulse
@@ -40,6 +40,7 @@
 | --- | --- |
 | [frog_gui_fast.py](frog_gui_fast.py) | PySide6 GUI — application entry point |
 | [hardware.py](hardware.py) | Device abstraction: stage + spectrometer adapters, pulse simulator |
+| [avantes.py](avantes.py) | Standalone ctypes wrapper around the Avantes `AvaSpecX64.dll` |
 | [scan.py](scan.py) | Delay-scan engine: optics conversions, scan worker, file writers |
 | [Lillypad.spec](Lillypad.spec) | PyInstaller recipe for a standalone Windows build |
 | [requirements.txt](requirements.txt) | Pinned lockfile (Python 3.13) — install with `--no-deps` |
@@ -72,7 +73,7 @@ Without anaconda installed
 python -m venv .venv
 .venv\Scripts\activate          # Windows;  source .venv/bin/activate on POSIX
 pip install --no-deps -r requirements.txt
-seabreeze_os_setup              # Required for seabreeze to talk to the spectrometers
+seabreeze_os_setup              # Ocean Optics only; Avantes has its own driver
 
 python frog_gui_fast.py
 
@@ -85,7 +86,7 @@ conda deactivate                # in case conda is running in your terminal
 py -3.14  -m venv .venv         # e.g. for python 3.14, if you don't have non-conda python installed you need to install it
 .venv\Scripts\activate          # Windows;  source .venv/bin/activate on POSIX
 pip install --no-deps -r requirements.txt
-seabreeze_os_setup              # Required for seabreeze to talk to the spectrometers
+seabreeze_os_setup              # Ocean Optics only; Avantes has its own driver
 
 python frog_gui_fast.py
 
@@ -104,11 +105,12 @@ Pick a pulse shape under **Hardware** to change what the simulator produces.
 
 ### Self-tests
 
-Both non-GUI modules are runnable and check themselves — no hardware, no Qt:
+All three non-GUI modules are runnable and check themselves — no hardware, no Qt:
 
 ```bash
 python hardware.py    # simulator self-test
 python scan.py        # pure-core self-test (delay grid, conversions, autocorrelation)
+python avantes.py     # ctypes struct layout + error table; DLL and device optional
 ```
 
 ## Real hardware
@@ -123,14 +125,25 @@ rather than the whole app.
 | Zaber stage (serial / daisy-chain) | `ZaberStage` | `zaber-motion` |
 | piezosystems Jena piezo stage (serial, 320 um closed loop) | `PiezoJenaStage` | `pyserial` |
 | Ocean Optics / Ocean Insight spectrometer | `SeabreezeSpectrometer` | `seabreeze` |
+| Avantes AvaSpec spectrometer (USB) | `AvantesSpectrometer` | ctypes → `AvaSpecX64.dll` |
 
-Kinesis and Seabreeze both enumerate first and pop a picker when more than one
-device is attached. Zaber and Piezo Jena auto-scan serial ports when no port is
-given.
+Kinesis, Seabreeze and Avantes all enumerate first and pop a picker when more
+than one device is attached. Zaber and Piezo Jena auto-scan serial ports when
+no port is given.
 
-**Spectrometer backends.** python-seabreeze has two backends and the
-**Backend** box in the Hardware dialog switches between them (applied on the
-next connect). The default is **pyseabreeze**, the pure-Python backend — it is
+**Spectrometers are named `vendor:serial`.** Two vendors can be on the bench at
+once, so a bare serial no longer identifies a device — `hardware.list_spectrometers()`
+returns tagged ids and `hardware.open_spectrometer()` is the single place a tag
+is mapped to an adapter class. Both multi-spectrometer slots accept either
+vendor, so an Avantes and an Ocean device can be stitched into one span. A
+vendor whose SDK is missing simply contributes nothing to the enumeration
+rather than taking the other vendor's devices down with it.
+
+**Spectrometer backends.** python-seabreeze has two backends and the box beside
+*Real (seabreeze)* in the Hardware dialog switches between them (applied on the
+next connect). It sits on the seabreeze row for the same reason the port fields
+sit on the Zaber and Piezo Jena rows — it applies to that adapter only, and
+nothing else. The default is **pyseabreeze**, the pure-Python backend — it is
 the only one that supports the newer Ocean Insight models (SR/ST/HDX series).
 **cseabreeze**, the vendor C library, remains selectable for older devices
 that misbehave through pyseabreeze. pyseabreeze talks USB through `pyusb`,
@@ -139,7 +152,61 @@ which needs a libusb driver: the `libusb-package` wheel in
 automatically), and the device itself must be bound to a WinUSB/libusb
 driver — `seabreeze_os_setup` (above) installs Ocean's drivers; if the device
 still does not enumerate, bind its USB interface to **WinUSB** with
-[Zadig](https://zadig.akeo.ie/).
+[Zadig](https://zadig.akeo.ie/). None of this applies to Avantes, which has its
+own driver and its own DLL.
+
+**Avantes spectrometers.** Two separate Avantes downloads matter, and installing
+the wrong one is the usual first stumble:
+
+| You need | What it gives you | Enough on its own? |
+| --- | --- | --- |
+| **AvaSpec-DLL package** (`AvaspecX64Dll_*.Setup_64bit.exe`) | `AvaSpecX64.dll` (64-bit), `avaspec.h`, the library manual, examples | **Required** |
+| AvaSoft | the GUI app, the USB driver, and a **32-bit only** `avaspec.dll` | No |
+
+Lillypad runs on 64-bit Python, and a 32-bit DLL cannot be loaded into it —
+AvaSoft alone leaves you with a DLL Python refuses with `WinError 193`.
+[avantes.py](avantes.py) detects exactly that case and names it, rather than
+passing the bare OSError on. The USB driver ships with either package, so
+installing AvaSoft first is harmless.
+
+The DLL installer drops everything into a **versioned folder at the root of the
+system drive** — `C:\AvaSpecX64-DLL_9.14.0.0\` — not into Program Files.
+[avantes.py](avantes.py) searches, in order: `LILLYPAD_AVASPEC_DLL` (a full
+path), next to the program (or the `.exe`), `C:\AvaSpec*DLL*\`,
+`C:\Program Files\Avantes\…`, then `PATH`. With several versions installed the
+newest wins.
+
+Press **Real (Avantes)** in the Hardware dialog to connect. Everything
+Avantes-specific then lives behind an **Avantes** button that appears in the
+toolbar only while such a device is connected, so the Hardware panel stays the
+same size it always was. That dialog covers on-board averaging, the ADC
+resolution, dark and prescan correction, smoothing, triggering and sync, the
+board temperature, and a device-info block. Three couplings are worth knowing:
+
+- **ADC resolution moves full scale.** 14-bit is 16383 counts, 16-bit is 65535,
+  and the counts scale by 4 between them. Switching re-arms the saturation
+  alarm against the new ceiling.
+- **On-board averaging multiplies the frame time.** The Integration Time box
+  shows what one frame *costs* (exposure × averages), because that is what the
+  live feed paces itself to. The scan already averages in software
+  (*Acquisition Settings → averages*), so leave the on-board count at 1 unless
+  you want both.
+- **An armed hardware trigger stops the live feed.** Under an external trigger
+  a frame only arrives when the experiment fires, so a free-running feed would
+  simply block; Lillypad stops it for you and says so. `acquire()` still
+  enforces a timeout rather than waiting forever.
+
+Two things worth not being surprised by. The device reports its **own** pixel
+count and wavelength axis, and they need not match the datasheet: a
+ULS4096CL-EVO here reports **4094** pixels spanning 183.6–1338.6 nm, against a
+nominal 4096 and a 200–1100 nm *usable* range. Nothing is hardcoded, so this is
+fine — but the axis extends past where the grating is specified. And the DLL
+hands out **the same handle** if you open one spectrometer twice, so closing
+either copy disconnects both; `avantes.py` refuses the second open instead.
+
+`python avantes.py` is a self-test. Without the DLL it still checks the ctypes
+struct layout and the error table and prints what to install; with the DLL and a
+spectrometer attached it enumerates, connects, acquires and reports the device.
 
 **Kinesis stages.** `KinesisStage` identifies the stage from the model number
 its controller reports before driving it, and calibrates it either from a
@@ -227,7 +294,9 @@ calibration…* in the menu). The factors are interpolated onto the device's
 pixel grid and multiply every displayed and recorded spectrum. Saturation is
 always judged on **raw** ADC counts, before calibration.
 
-**Multi-spectrometer mode.** *Enable multi-spectrometer mode* in the
+**Multi-spectrometer mode.** Either slot takes a device from either vendor, so
+an Avantes and an Ocean spectrometer stitch together like two of a kind.
+*Enable multi-spectrometer mode* in the
 toolbar's **Multi-Spec** menu opens two slots, each with its own spectrometer
 and calibration submenu; once both slots are filled the pair connects
 automatically as one stitched device (`StitchedSpectrometer`): spectra are

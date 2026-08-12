@@ -60,8 +60,11 @@ from matplotlib.transforms import ScaledTranslation
 
 from hardware import (SimulatedStage, SimulatedSpectrometer,
                       KinesisStage, ZaberStage, PiezoJenaStage,
-                      SeabreezeSpectrometer, StitchedSpectrometer,
-                      list_kinesis_stages, list_seabreeze_spectrometers,
+                      SeabreezeSpectrometer, AvantesSpectrometer,
+                      StitchedSpectrometer,
+                      list_kinesis_stages, list_spectrometers,
+                      list_avantes_spectrometers, open_spectrometer,
+                      avantes_trigger_options,
                       load_calibration_file, SEABREEZE_BACKENDS,
                       PULSE_SHAPES, DEFAULT_PULSE)
 from scan import (FrogScanConfig, FrogScanWorker, autocorrelation, fwhm,
@@ -105,9 +108,11 @@ MEMBER_COLORS = ("#56B4E9", "#E69F00")      # SLOT order: (S1, S2)
 
 # Simulated members offered alongside real devices in the multi-spectrometer
 # slots, so the mode can be exercised without two spectrometers on the bench.
-# The "serials" are sentinels, not device serials — _open_slot_device branches
-# on them. Each covers one overlapping half of the simulated signal band; see
-# _make_sim_member for why halves and not two full-band copies.
+# These are sentinels, not device ids — _open_slot_device matches them BEFORE
+# it hands anything to hardware.open_spectrometer, so they deliberately do not
+# carry a "vendor:serial" tag. Each covers one overlapping half of the
+# simulated signal band; see _make_sim_member for why halves and not two
+# full-band copies.
 SIM_SLOT_DEVICES = (("__sim_blue__", "Simulated — blue half"),
                     ("__sim_red__",  "Simulated — red half"))
 
@@ -678,29 +683,35 @@ class HardwareDialog(QDialog):
         self.lbl_spec = QLabel(); self.lbl_spec.setObjectName("value")
         self.lbl_spec.setWordWrap(True)
         lay.addWidget(self.lbl_spec)
-        prow = QHBoxLayout()
+        # Same two-column shape as the stage grid above: column 1 is the
+        # connect button, column 0 that row's parameter. Putting the seabreeze
+        # backend combo on the seabreeze row is what stops it reading as a
+        # global setting — the same trick that keeps edit_zaber_port from
+        # looking like a Kinesis field.
+        pgrid = QGridLayout(); pgrid.setSpacing(6)
+        pgrid.setColumnStretch(0, 1); pgrid.setColumnStretch(1, 1)
         b_ps = QPushButton("Simulated")
         b_ps.clicked.connect(lambda: self._do(self.main._use_sim_spectrometer))
-        b_pr = QPushButton("Real (seabreeze)"); b_pr.setObjectName("accent")
-        b_pr.clicked.connect(lambda: self._do(self.main._connect_real_spectrometer))
-        prow.addWidget(b_ps); prow.addWidget(b_pr)
-        lay.addLayout(prow)
+        b_pa = QPushButton("Real (Avantes)"); b_pa.setObjectName("accent")
+        b_pa.clicked.connect(
+            lambda: self._do(self.main._connect_avantes_spectrometer))
+        pgrid.addWidget(b_ps, 0, 0); pgrid.addWidget(b_pa, 0, 1)
 
         # seabreeze backend switch. pyseabreeze is the default because it is
         # the only backend that knows the newer Ocean Insight models; cseabreeze
         # stays available for devices that only enumerate through the vendor
-        # C library. Applied on the next connect.
-        berow = QGridLayout(); berow.setSpacing(6)
-        berow.setColumnStretch(0, 0); berow.setColumnStretch(1, 1)
-        berow.addWidget(QLabel("Backend"), 0, 0)
+        # C library. Applied on the next connect. No label: its own items say
+        # what it is, exactly as the port fields use a placeholder instead.
         self.cmb_backend = ComboBox()
         for name in SEABREEZE_BACKENDS:
             self.cmb_backend.addItem(name, name)
         self.cmb_backend.setCurrentIndex(
             max(0, self.cmb_backend.findData(self.main.seabreeze_backend)))
         self.cmb_backend.currentIndexChanged.connect(self._on_backend)
-        berow.addWidget(self.cmb_backend, 0, 1)
-        lay.addLayout(berow)
+        b_pr = QPushButton("Real (seabreeze)"); b_pr.setObjectName("accent")
+        b_pr.clicked.connect(lambda: self._do(self.main._connect_real_spectrometer))
+        pgrid.addWidget(self.cmb_backend, 1, 0); pgrid.addWidget(b_pr, 1, 1)
+        lay.addLayout(pgrid)
 
         # Full-scale override. Without this, a spectrometer that does not
         # report `max_intensity` leaves saturation unchecked with no way out
@@ -851,7 +862,449 @@ class HardwareDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Spectrometer picker (modal — shown only when seabreeze finds 2+ devices)
+# Avantes settings dialog
+# ─────────────────────────────────────────────────────────────────────────────
+class AvantesSettingsDialog(QDialog):
+    """Every Avantes-only control, in its own window.
+
+    The Avantes DLL exposes far more than the Ocean adapter does — on-board
+    averaging, ADC resolution, dark and non-linearity correction, smoothing,
+    external triggering, sync, prescan, board temperature. None of it belongs
+    in the Hardware dialog, which has to stay legible on a bench with no
+    Avantes attached, so it lives here behind a toolbar button that is HIDDEN
+    unless an Avantes is connected (see FrogWindow._refresh_avantes_button).
+
+    Nothing persists between launches — there is no settings file — so
+    `_refresh` reads the device's current state INTO the widgets. Pushing
+    widget defaults the other way would mean that merely opening this dialog
+    silently reconfigured the spectrometer.
+    """
+
+    # Scrubbable controls are debounced through one shared timer: a
+    # valueChanged per spinbox tick would park and restart the live feed on
+    # every keystroke, the same reason the main integration spinbox debounces.
+    WRITE_DEBOUNCE_MS = 250
+    POLL_MS = 2000
+
+    def __init__(self, main, parent=None):
+        super().__init__(parent, Qt.Tool)
+        self.main = main
+        self.setWindowTitle("Avantes Settings")
+
+        outer = QVBoxLayout(self); outer.setSpacing(8)
+        outer.setContentsMargins(0, 0, 0, 0)
+        body = QWidget()
+        lay = QVBoxLayout(body); lay.setSpacing(10)
+        lay.setContentsMargins(14, 14, 14, 14)
+
+        # Which device these controls act on. Hidden with only one Avantes
+        # connected, which is the normal case; a two-Avantes stitched pair is
+        # the reason it exists at all.
+        self.cmb_target = ComboBox()
+        self.cmb_target.currentIndexChanged.connect(lambda _=0: self._refresh())
+        lay.addWidget(self.cmb_target)
+
+        # ── Acquisition ─────────────────────────────────────────────────────
+        lay.addWidget(self._header("Acquisition"))
+        arow = QGridLayout(); arow.setSpacing(6)
+        arow.setColumnStretch(0, 0); arow.setColumnStretch(1, 1)
+        arow.addWidget(QLabel("On-board averages"), 0, 0)
+        self.spin_onboard_avg = SpinBox()
+        self.spin_onboard_avg.setRange(1, 10000)
+        self.spin_onboard_avg.valueChanged.connect(self._queue_write)
+        arow.addWidget(self.spin_onboard_avg, 0, 1)
+        arow.addWidget(QLabel("Smoothing (± pixels)"), 1, 0)
+        self.spin_smooth = SpinBox()
+        self.spin_smooth.setRange(0, 128)
+        self.spin_smooth.valueChanged.connect(self._queue_write)
+        arow.addWidget(self.spin_smooth, 1, 1)
+        lay.addLayout(arow)
+        self.lbl_avg_hint = QLabel(); self.lbl_avg_hint.setObjectName("dim")
+        self.lbl_avg_hint.setWordWrap(True)
+        lay.addWidget(self.lbl_avg_hint)
+
+        self.chk_hires = QCheckBox("16-bit ADC (high resolution)")
+        self.chk_hires.toggled.connect(self._on_hires)
+        lay.addWidget(self.chk_hires)
+        self.lbl_hires = QLabel(); self.lbl_hires.setObjectName("dim")
+        self.lbl_hires.setWordWrap(True)
+        lay.addWidget(self.lbl_hires)
+
+        lay.addWidget(_hline())
+
+        # ── Corrections ─────────────────────────────────────────────────────
+        lay.addWidget(self._header("Corrections"))
+        self.chk_dark = QCheckBox("Dynamic dark correction")
+        self.chk_dark.toggled.connect(
+            lambda on: self._write("Dark correction",
+                                   lambda d: d.set_dark_correction(on)))
+        lay.addWidget(self.chk_dark)
+        self.chk_prescan = QCheckBox("Prescan (discard the first scan)")
+        self.chk_prescan.toggled.connect(
+            lambda on: self._write("Prescan", lambda d: d.set_prescan(on)))
+        lay.addWidget(self.chk_prescan)
+        hint = QLabel("These change what a frame contains, so a recorded dark "
+                      "and any fitted stitch factor go stale — re-record and "
+                      "re-fit after changing them.")
+        hint.setObjectName("dim"); hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        lay.addWidget(_hline())
+
+        # ── Trigger & sync ──────────────────────────────────────────────────
+        lay.addWidget(self._header("Trigger & sync"))
+        trow = QGridLayout(); trow.setSpacing(6)
+        trow.setColumnStretch(0, 0); trow.setColumnStretch(1, 1)
+        self.cmb_trig_mode = ComboBox()
+        self.cmb_trig_src = ComboBox()
+        self.cmb_trig_type = ComboBox()
+        for r, (label, cmb) in enumerate((("Mode", self.cmb_trig_mode),
+                                          ("Source", self.cmb_trig_src),
+                                          ("Edge/level", self.cmb_trig_type))):
+            trow.addWidget(QLabel(label), r, 0)
+            trow.addWidget(cmb, r, 1)
+            cmb.currentIndexChanged.connect(self._on_trigger)
+        lay.addLayout(trow)
+        self.chk_sync = QCheckBox("Sync mode")
+        self.chk_sync.toggled.connect(
+            lambda on: self._write("Sync mode",
+                                   lambda d: d.set_sync_mode(on)))
+        lay.addWidget(self.chk_sync)
+        self.lbl_trig = QLabel(); self.lbl_trig.setObjectName("dim")
+        self.lbl_trig.setWordWrap(True)
+        lay.addWidget(self.lbl_trig)
+
+        lay.addWidget(_hline())
+
+        # ── Detector ────────────────────────────────────────────────────────
+        lay.addWidget(self._header("Detector"))
+        self.lbl_temp = QLabel("—"); self.lbl_temp.setObjectName("value")
+        lay.addWidget(self.lbl_temp)
+        trow2 = QHBoxLayout()
+        btn_refresh = QPushButton("Refresh")
+        btn_refresh.clicked.connect(self._refresh_readback)
+        self.chk_poll = QCheckBox(f"Auto-refresh ({self.POLL_MS // 1000} s)")
+        self.chk_poll.toggled.connect(self._on_poll_toggle)
+        trow2.addWidget(btn_refresh); trow2.addWidget(self.chk_poll)
+        lay.addLayout(trow2)
+        hint = QLabel("Each refresh borrows the spectrometer from the live "
+                      "feed for one frame — leave auto-refresh off at long "
+                      "integration times.")
+        hint.setObjectName("dim"); hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        lay.addWidget(_hline())
+
+        # ── Device info ─────────────────────────────────────────────────────
+        lay.addWidget(self._header("Device"))
+        self.lbl_info = QLabel(); self.lbl_info.setObjectName("dim")
+        self.lbl_info.setWordWrap(True)
+        lay.addWidget(self.lbl_info)
+
+        self.lbl_msg = QLabel(""); self.lbl_msg.setObjectName("dim")
+        self.lbl_msg.setWordWrap(True)
+        lay.addWidget(self.lbl_msg)
+        lay.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidget(body); scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        outer.addWidget(scroll, 1)
+        close_row = QHBoxLayout(); close_row.setContentsMargins(14, 0, 14, 14)
+        btn_close = QPushButton("Close"); btn_close.clicked.connect(self.hide)
+        close_row.addWidget(btn_close)
+        outer.addLayout(close_row)
+        self.setFixedWidth(360)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.POLL_MS)
+        self._timer.timeout.connect(self._poll)
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(self.WRITE_DEBOUNCE_MS)
+        self._debounce.timeout.connect(self._flush_writes)
+        self._loading = False        # True while _refresh seeds the widgets
+        self._target_ids = None      # device list the target combo was built from
+
+    # ── plumbing ────────────────────────────────────────────────────────────
+    def _header(self, text):
+        l = QLabel(text); l.setObjectName("hdr")
+        return l
+
+    def _target(self):
+        """The device the controls act on, re-resolved every time.
+
+        Never cached: _apply_spectrometer can disconnect it out from under an
+        open dialog, and a stale handle would be a call into a closed device.
+        The combo carries the tagged id rather than the device object for the
+        same reason — widget data must not keep a closed device alive.
+        """
+        devices = self.main._avantes_devices()
+        if not devices:
+            return None
+        want = self.cmb_target.currentData()
+        for d in devices:
+            if getattr(d, "spec_id", None) == want:
+                return d
+        return devices[0]
+
+    def _sync_target_combo(self, devices):
+        """Rebuild the target list only when the devices actually changed.
+
+        An unconditional clear()/addItem() would reset the selection to the
+        first device on every _refresh — and _refresh runs after every write,
+        so a setting applied while member 2 was selected would land on member 2
+        and then silently snap the UI back to member 1, with the next write
+        going to the wrong device.
+        """
+        ids = [getattr(d, "spec_id", None) or d.name for d in devices]
+        if ids == self._target_ids:
+            return
+        keep = self.cmb_target.currentData()
+        self.cmb_target.blockSignals(True)
+        self.cmb_target.clear()
+        for d, ident in zip(devices, ids):
+            self.cmb_target.addItem(d.name, ident)
+        if keep is not None:
+            self.cmb_target.setCurrentIndex(max(0, self.cmb_target.findData(keep)))
+        self.cmb_target.blockSignals(False)
+        # Only meaningful with a two-Avantes pair; hidden in the normal case.
+        self.cmb_target.setVisible(len(devices) > 1)
+        self._target_ids = ids
+
+    def _do(self, ok, msg):
+        # objectName + repolish rather than setStyleSheet, so a theme switch
+        # restyles this label with everything else.
+        self.lbl_msg.setObjectName("ok" if ok else "err")
+        self.lbl_msg.style().unpolish(self.lbl_msg)
+        self.lbl_msg.style().polish(self.lbl_msg)
+        self.lbl_msg.setText(msg)
+
+    def _write(self, label, fn, refresh=True):
+        """One device write: refused during a scan, taken under the feed
+        handover, reported inline.
+
+        The _scan_running() check is not belt-and-braces — _device_lock only
+        parks the LIVE FEED, while the scan worker holds the devices
+        independently, which is why _apply_spectrometer and _apply_calibration
+        both check separately too.
+        """
+        if self._loading:
+            return                      # _refresh is seeding widgets, not a user edit
+        dev = self._target()
+        if dev is None:
+            self._do(False, "No Avantes spectrometer is connected.")
+            return
+        if self.main._scan_running():
+            self._do(False, "A scan is running — stop it before changing "
+                            "spectrometer settings.")
+            return
+        with self.main._device_lock() as ok:
+            if not ok:
+                self._do(False, FEED_BUSY_MSG)
+                return
+            try:
+                fn(dev)
+            except Exception as e:
+                self._do(False, f"{label} failed: {e}")
+                return
+        self._do(True, f"{label}: applied.")
+        if refresh:
+            self._refresh()
+
+    def _queue_write(self, _value=None):
+        """Debounce a scrubbable control."""
+        if not self._loading:
+            self._debounce.start()
+
+    def _flush_writes(self):
+        """Apply the debounced spinboxes in one device handover."""
+        avg, smooth = self.spin_onboard_avg.value(), self.spin_smooth.value()
+
+        def apply(dev):
+            dev.set_averages(avg)
+            dev.set_smoothing(smooth)
+
+        self._write("Acquisition settings", apply)
+        # On-board averaging multiplies the frame time, and the main
+        # integration spinbox shows what one acquire costs — reseed it, or it
+        # disagrees with what the feed is actually pacing to.
+        self.main._sync_integration_ui()
+
+    # ── control handlers ────────────────────────────────────────────────────
+    def _on_hires(self, on):
+        """ADC resolution moves full scale (16383 <-> 65535), so the saturation
+        alarm has to be re-armed against the new ceiling — the same pairing
+        HardwareDialog._on_full_scale does. Without it the lamp and the scan's
+        clip test keep judging against the old one."""
+        if self._loading:
+            return
+        result = {}
+
+        def apply(dev):
+            result["on"] = dev.set_high_res_adc(on)
+
+        self._write("ADC resolution", apply, refresh=False)
+        self.main._reset_saturation()
+        if self.main.dlg_hardware.isVisible():
+            self.main.dlg_hardware._refresh()   # its full-scale placeholder moved
+        if result.get("on") is False and on:
+            self._do(False, "This device has no 16-bit ADC — staying at 14-bit.")
+        self._refresh()
+
+    def _on_trigger(self, _idx=None):
+        if self._loading:
+            return
+        mode = self.cmb_trig_mode.currentData()
+        src = self.cmb_trig_src.currentData()
+        typ = self.cmb_trig_type.currentData()
+        # An armed hardware trigger makes acquire() block until a pulse
+        # arrives. The live feed would then never return a frame, pause() would
+        # time out, and every later action would fail with FEED_BUSY_MSG and no
+        # visible cause. Stop the feed for the operator and say so.
+        stopped = False
+        opts = avantes_trigger_options()
+        hw = dict(opts["mode"]).get("Hardware trigger")
+        if mode == hw and self.main.btn_feed.isChecked():
+            self.main.btn_feed.setChecked(False)     # runs _toggle_feed
+            stopped = True
+        self._write("Trigger",
+                    lambda d: d.set_trigger(mode, src, typ))
+        if stopped:
+            self._do(True, "Trigger: applied. The live feed was stopped — "
+                           "under a hardware trigger a frame only arrives when "
+                           "the experiment fires.")
+
+    def _on_poll_toggle(self, on):
+        if on:
+            self._timer.start()
+        else:
+            self._timer.stop()
+
+    def _poll(self):
+        """Timed readback. Silent on failure: a busy feed must not turn the
+        dialog into a blinking error, and the scan worker owns the device
+        outright while a scan runs."""
+        if not self.isVisible() or self.main._scan_running():
+            return
+        self._refresh_readback(quiet=True)
+
+    def _refresh_readback(self, quiet=False):
+        """Read the board temperature. A device call, so it takes the feed
+        handover like any other."""
+        dev = self._target()
+        if dev is None or self.main._scan_running():
+            return
+        with self.main._device_lock() as ok:
+            if not ok:
+                if not quiet:
+                    self._do(False, FEED_BUSY_MSG)
+                return
+            try:
+                temp = dev.temperature_c()
+            except Exception as e:
+                if not quiet:
+                    self._do(False, f"Temperature read failed: {e}")
+                return
+        self.lbl_temp.setText("Board temperature: " +
+                              ("not reported by this device" if temp is None
+                               else f"{temp:.1f} °C"))
+
+    # ── state ───────────────────────────────────────────────────────────────
+    def _refresh(self):
+        """Seed every widget from the device. `_loading` suppresses the write
+        handlers throughout, so reading the state cannot write it back."""
+        devices = self.main._avantes_devices()
+        self._loading = True
+        try:
+            self._sync_target_combo(devices)
+            dev = self._target()
+            for w in (self.spin_onboard_avg, self.spin_smooth, self.chk_hires,
+                      self.chk_dark, self.chk_prescan, self.chk_sync,
+                      self.cmb_trig_mode, self.cmb_trig_src,
+                      self.cmb_trig_type):
+                w.setEnabled(dev is not None)
+            if dev is None:
+                self.lbl_info.setText("No Avantes spectrometer is connected.")
+                return
+
+            self.spin_onboard_avg.setValue(dev.n_averages)
+            self.spin_smooth.setValue(dev.smoothing_pixels)
+            self.chk_hires.setChecked(dev.high_res_adc)
+            self.chk_dark.setChecked(dev.dark_correction)
+
+            opts = avantes_trigger_options()
+            mode, src, typ = dev.trigger
+            for cmb, key, value in ((self.cmb_trig_mode, "mode", mode),
+                                    (self.cmb_trig_src, "source", src),
+                                    (self.cmb_trig_type, "source_type", typ)):
+                if cmb.count() == 0:
+                    for label, val in opts[key]:
+                        cmb.addItem(label, val)
+                cmb.setCurrentIndex(max(0, cmb.findData(value)))
+
+            n_avg = dev.n_averages
+            self.lbl_avg_hint.setText(
+                f"One frame costs {dev.integration_ms:g} ms "
+                f"({dev.exposure_ms:g} ms exposure × {n_avg} "
+                f"{'average' if n_avg == 1 else 'averages'}). The scan also "
+                f"averages in software — leave this at 1 unless you want both.")
+            self.lbl_hires.setText(
+                f"Full scale {dev.max_counts:.0f} counts. Switching resolution "
+                f"rescales the counts and re-arms the saturation alarm.")
+            self.lbl_trig.setText(
+                "Hardware trigger: a frame arrives only when the trigger "
+                "input fires, so the live feed is stopped while it is armed."
+                if dev.hardware_triggered else
+                "Free running — the device clocks its own scans.")
+
+            info = dev.device_info()
+            wl_lo, wl_hi = info["wavelength_range_nm"]
+            lines = [f"{info['model']}  [{info['serial']}]",
+                     f"{info['board']} board · {info['n_pixels']} pixels · "
+                     f"{wl_lo:.1f}–{wl_hi:.1f} nm",
+                     f"firmware {info.get('firmware') or '?'} · "
+                     f"FPGA {info.get('fpga') or '?'} · "
+                     f"DLL {info.get('dll') or '?'}"]
+            if info.get("detector"):
+                lines.append(f"detector {info['detector']}")
+            if not info.get("config_verified"):
+                # Honest rather than silent: the EEPROM block did not match the
+                # layout this build expects, so anything read from it is
+                # suspect. Nothing above depends on it, which is why this is a
+                # note and not a failure.
+                lines.append("note: the device configuration block did not "
+                             "match the expected layout, so EEPROM-derived "
+                             "details are omitted.")
+            self.lbl_info.setText("\n".join(lines))
+        finally:
+            self._loading = False
+
+    # ── lifecycle ───────────────────────────────────────────────────────────
+    def toggle(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self._refresh(); self.lbl_msg.setText(""); self.show(); self.raise_()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh()
+        self._refresh_readback(quiet=True)
+        if self.chk_poll.isChecked():
+            self._timer.start()
+
+    def hideEvent(self, event):
+        self._timer.stop()          # never poll a hidden dialog
+        super().hideEvent(event)
+
+    def closeEvent(self, event):
+        self._timer.stop()
+        super().closeEvent(event)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spectrometer picker (modal — shown only when enumeration finds 2+ devices)
 # ─────────────────────────────────────────────────────────────────────────────
 class DevicePickerDialog(QDialog):
     """Pick one device from an enumeration. `devices` is [(label, id), ...] —
@@ -2016,8 +2469,11 @@ class FrogWindow(QMainWindow):
         self._worker       = None
         self._export_worker = None
         # Multi-spectrometer mode: two slots, each holding a device choice and
-        # a calibration choice; _multi_members are the live SeabreezeSpectro-
-        # meter objects in SLOT order once the stitched pair is connected.
+        # a calibration choice; _multi_members are the live spectrometer
+        # objects in SLOT order once the stitched pair is connected.
+        # "serials" holds tagged ids ("vendor:serial", see hardware.spec_ident)
+        # or one of the SIM_SLOT_DEVICES sentinels — the two slots may hold
+        # devices from different vendors.
         self._multi = {"on": False, "serials": [None, None],
                        "labels": [None, None], "cals": [None, None]}
         self._multi_members = [None, None]
@@ -2044,6 +2500,9 @@ class FrogWindow(QMainWindow):
 
         self.dlg_settings = AcquisitionSettingsDialog(self)
         self.dlg_hardware = HardwareDialog(self, self)
+        # Vendor-specific controls, opened from a toolbar button that stays
+        # hidden until an Avantes is actually connected.
+        self.dlg_avantes  = AvantesSettingsDialog(self, self)
         self.spin_avg  = self.dlg_settings.spin_avg
         self.spin_idle = self.dlg_settings.spin_idle
         self.spin_wait = self.dlg_settings.spin_wait
@@ -2157,14 +2616,15 @@ class FrogWindow(QMainWindow):
                     f"[{start:.0f}–{end:.0f} nm]")
         return sim
 
-    def _open_slot_device(self, serial):
+    def _open_slot_device(self, ident):
         """Open whatever a multi-spectrometer slot points at — a simulated
-        half, or a real device by serial."""
-        for half, (sim_serial, _label) in enumerate(SIM_SLOT_DEVICES):
-            if serial == sim_serial:
+        half, or a real device by its tagged id. The sentinels are matched
+        first: they carry no vendor tag, so open_spectrometer would reject
+        them."""
+        for half, (sim_ident, _label) in enumerate(SIM_SLOT_DEVICES):
+            if ident == sim_ident:
                 return self._make_sim_member(half)
-        return SeabreezeSpectrometer(serial=serial,
-                                     backend=self.seabreeze_backend)
+        return open_spectrometer(ident, self.seabreeze_backend)
 
     def _build_hardware_sim(self):
         self.stage = SimulatedStage(travel_mm=300.0)
@@ -2348,50 +2808,62 @@ class FrogWindow(QMainWindow):
         return True, f"Simulated: {self.spec.pulse_label}."
 
     def _live_seabreeze_backend(self):
-        """Backend name of the currently connected real spectrometer(s), or
-        None when the current device is simulated."""
-        spec = self.spec
-        if isinstance(spec, StitchedSpectrometer):
-            spec = spec.spec1
-        if isinstance(spec, SeabreezeSpectrometer):
-            return getattr(spec, "backend", None)
+        """Backend name of the currently connected seabreeze device, or None
+        when no live device is a seabreeze one.
+
+        Every member is checked, not just spec1: StitchedSpectrometer assigns
+        spec1 by wavelength, so in a mixed-vendor pair the seabreeze device can
+        land in either slot. Missing it would skip the release step below and
+        let select_seabreeze_backend shut the API down under a LIVE device.
+        calibration_targets() is the existing "physical devices behind the
+        facade" accessor — [self] for a single device, both members for a pair.
+        """
+        for spec in self.spec.calibration_targets():
+            if isinstance(spec, SeabreezeSpectrometer):
+                return getattr(spec, "backend", None)
         return None
 
     def _list_spectrometers(self):
-        """Enumerate via the selected backend. Selecting a backend tears the
-        previous backend's API down, which would sever a device still open
-        through it — so any such device is released (swapped for the
-        simulator) first. Raises RuntimeError when that release is refused
-        (scan running / feed busy)."""
+        """Enumerate every vendor's attached spectrometers as tagged ids.
+        Selecting a seabreeze backend tears the previous backend's API down,
+        which would sever a device still open through it — so any such device
+        is released (swapped for the simulator) first. Raises RuntimeError when
+        that release is refused (scan running / feed busy)."""
         live = self._live_seabreeze_backend()
         if live is not None and live != self.seabreeze_backend:
             ok, err = self._apply_spectrometer(self._make_sim_spectrometer())
             if not ok:
                 raise RuntimeError(err)
-        return list_seabreeze_spectrometers(self.seabreeze_backend)
+        return list_spectrometers(self.seabreeze_backend)
 
     def _connect_real_spectrometer(self):
-        backend = self.seabreeze_backend
+        """Connect an Ocean Optics / Ocean Insight device. (ok, msg).
+
+        Filtered to seabreeze even though the enumeration covers every vendor:
+        this is what the *Real (seabreeze)* button does, and a picker that
+        offered an Avantes under that label — or silently connected one when it
+        was the only device attached — would be lying about which adapter and
+        which backend setting apply. Avantes has its own button.
+        """
         try:
-            devices = self._list_spectrometers()  # quick USB descriptor query
+            devices = [(m, i) for m, i in self._list_spectrometers()
+                       if i.startswith("seabreeze:")]
         except Exception as e:
             return False, f"Spectrometer connect failed: {e}"
         if not devices:
-            return False, (f"Spectrometer connect failed: No spectrometers "
-                           f"found (backend: {backend}).")
+            return False, (f"Spectrometer connect failed: No Ocean Optics "
+                           f"spectrometers found (backend: "
+                           f"{self.seabreeze_backend}).")
         if len(devices) > 1:
-            serial = DevicePickerDialog.pick(
+            ident = DevicePickerDialog.pick(
                 self.dlg_hardware, devices, "Select Spectrometer",
                 f"{len(devices)} spectrometers found — choose one:")
-            if serial is None:
+            if ident is None:
                 return False, "Cancelled — spectrometer unchanged."
         else:
-            serial = devices[0][1]
+            ident = devices[0][1]
         try:
-            # "?" = serial unreadable; fall back to first-device auto-connect.
-            spec = (SeabreezeSpectrometer(serial=serial, backend=backend)
-                    if serial and serial != "?"
-                    else SeabreezeSpectrometer(backend=backend))
+            spec = open_spectrometer(ident, self.seabreeze_backend)
         except Exception as e:
             return False, f"Spectrometer connect failed: {e}"
         ok, err = self._apply_spectrometer(spec)
@@ -2400,6 +2872,49 @@ class FrogWindow(QMainWindow):
             return False, err
         self.status.showMessage(f"Spectrometer: {spec.name}", 5000)
         return True, f"Spectrometer connected: {spec.name}"
+
+    def _connect_avantes_spectrometer(self):
+        """Connect an Avantes device. (ok, msg).
+
+        Enumerates through list_avantes_spectrometers rather than the merged
+        list_spectrometers: the operator pressed the *Avantes* button, so a
+        missing DLL or driver must be reported with the message that names what
+        to install, not silently swallowed into "no spectrometers found".
+        """
+        try:
+            devices = list_avantes_spectrometers()
+        except Exception as e:
+            return False, f"Avantes connect failed: {e}"
+        if not devices:
+            return False, ("Avantes connect failed: No Avantes spectrometers "
+                           "found. Check the USB cable and that the AvaSpec "
+                           "USB driver is installed.")
+        if len(devices) > 1:
+            serial = DevicePickerDialog.pick(
+                self.dlg_hardware, devices, "Select Avantes Spectrometer",
+                f"{len(devices)} Avantes spectrometers found — choose one:")
+            if serial is None:
+                return False, "Cancelled — spectrometer unchanged."
+        else:
+            serial = devices[0][1]
+        try:
+            spec = AvantesSpectrometer(serial=serial or None)
+        except Exception as e:
+            return False, f"Avantes connect failed: {e}"
+        ok, err = self._apply_spectrometer(spec)
+        if not ok:
+            self._drop(spec)
+            return False, err
+        self.status.showMessage(f"Spectrometer: {spec.name}", 5000)
+        return True, f"Avantes connected: {spec.name}"
+
+    def _avantes_devices(self):
+        """Every live Avantes device — [], [one], or both members of a mixed
+        stitched pair. calibration_targets() is the existing accessor for
+        "the physical devices behind whatever facade is connected", so this
+        keeps working for any future composite."""
+        return [s for s in self.spec.calibration_targets()
+                if isinstance(s, AvantesSpectrometer)]
 
     @staticmethod
     def _drop(device):
@@ -2425,6 +2940,17 @@ class FrogWindow(QMainWindow):
         tb.addWidget(self._build_export_button())
         tb.addWidget(self._build_calibration_button())
         tb.addWidget(self._build_multispec_button())
+        # Vendor-specific, so it is HIDDEN rather than disabled when there is
+        # no Avantes attached — the toolbar already carries six buttons, and a
+        # permanently greyed one is noise on a bench that has none. Visibility
+        # is owned by _refresh_avantes_button.
+        self.btn_avantes = QPushButton("Avantes")
+        self.btn_avantes.setToolTip(
+            "Avantes-specific settings: averaging, ADC resolution, "
+            "corrections, triggering, detector temperature")
+        self.btn_avantes.clicked.connect(self.dlg_avantes.toggle)
+        self.btn_avantes.setVisible(False)
+        tb.addWidget(self.btn_avantes)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
@@ -2745,10 +3271,13 @@ class FrogWindow(QMainWindow):
             sub.addAction(act)
             return
         added = 0
-        for model, serial in devices:
-            if serial == other:
+        for model, ident in devices:
+            if ident == other:
                 continue
-            add(serial, f"{model} [{serial}]")
+            # Bare serial in the label: the model name already says which
+            # vendor it is, so repeating the tag here would only make the menu
+            # wider. The full tagged id is what gets stored in the slot.
+            add(ident, f"{model} [{ident.split(':', 1)[-1]}]")
             added += 1
         if not added:
             act = QAction("(no free spectrometers found)", sub)
@@ -2802,14 +3331,18 @@ class FrogWindow(QMainWindow):
 
     def _enable_multi_mode(self):
         self._multi["on"] = True
-        # Pre-fill slot 1 with an already-connected single Seabreeze device so
-        # entering the mode does not throw away the current connection.
-        if isinstance(self.spec, SeabreezeSpectrometer):
-            serial = getattr(getattr(self.spec, "_spec", None),
-                             "serial_number", None)
-            if serial:
-                self._multi["serials"][0] = str(serial)
-                self._multi["labels"][0]  = self.spec.name
+        # Pre-fill slot 1 with an already-connected real device so entering the
+        # mode does not throw away the current connection. spec_id is what the
+        # slot needs (it is reopened by id), and every real adapter sets it —
+        # so this works for any vendor without reaching into vendor objects.
+        ident = getattr(self.spec, "spec_id", None)
+        # An id ending in ":?" means the serial could not be read, so it names
+        # "whichever device enumerates first" rather than this one — not good
+        # enough for a slot, which must be able to reopen exactly this device
+        # alongside another. Leave the slot empty instead.
+        if ident and not str(ident).endswith(":?"):
+            self._multi["serials"][0] = ident
+            self._multi["labels"][0]  = self.spec.name
         elif isinstance(self.spec, SimulatedSpectrometer):
             # Entering the mode from the simulator: pre-pick the blue half, so
             # picking the red half in slot 2 is all it takes to get a working
@@ -2831,9 +3364,12 @@ class FrogWindow(QMainWindow):
         if s1 == s2:
             return False, ("Both slots point at the same spectrometer — pick "
                            "two different devices.")
-        # Release any handle we already hold on one of these devices first:
-        # seabreeze cannot open the same spectrometer twice.
-        if isinstance(self.spec, (SeabreezeSpectrometer, StitchedSpectrometer)):
+        # Release any handle we already hold on one of these devices first: a
+        # vendor SDK cannot open the same spectrometer twice. spec_id is set by
+        # every real adapter and left None on the simulators, so this covers
+        # any vendor without naming one.
+        if (getattr(self.spec, "spec_id", None)
+                or isinstance(self.spec, StitchedSpectrometer)):
             ok, err = self._apply_spectrometer(self._make_sim_spectrometer())
             if not ok:
                 return False, err
@@ -3265,6 +3801,37 @@ class FrogWindow(QMainWindow):
             self._overlay_on = False
             self.canvas.clear_members()
         self._refresh_overlay_button()
+        self._refresh_avantes_button()
+
+    def _refresh_avantes_button(self):
+        """Show the Avantes toolbar button only while an Avantes is live.
+
+        Called from _sync_multi_ui because that is the one function guaranteed
+        to run after every device swap (_apply_spectrometer, _connect_multi_pair,
+        _enable_multi_mode, _disable_multi_mode all end in it).
+        """
+        devices = self._avantes_devices()
+        self.btn_avantes.setVisible(bool(devices))
+        if not devices and self.dlg_avantes.isVisible():
+            self.dlg_avantes.hide()      # its target just went away
+        elif devices and self.dlg_avantes.isVisible():
+            self.dlg_avantes._refresh()  # a swap may have changed which device
+
+    def _sync_integration_ui(self):
+        """Reseed the integration spinbox(es) from the live device.
+
+        Needed when something OTHER than the spinbox changes what one frame
+        costs — on-board averaging on an Avantes is the case that exists. The
+        signal blocker matters: seeding must not restart the debounce, or 250 ms
+        later we take another feed handover to write back a value the device
+        already holds.
+        """
+        if isinstance(self.spec, StitchedSpectrometer):
+            self._sync_multi_ui()
+            return
+        ms = int(round(float(getattr(self.spec, "integration_ms", 10.0))))
+        with QSignalBlocker(self.spin_integration):
+            self.spin_integration.setValue(max(1, min(10000, ms)))
 
     def _refresh_overlay_button(self):
         """Icon, tooltip and availability of the per-spectrometer view toggle.
@@ -4061,7 +4628,8 @@ class FrogWindow(QMainWindow):
                 dev.disconnect()
             except Exception:
                 pass
-        self.dlg_settings.close(); self.dlg_hardware.close(); self.dlg_graphics.close()
+        self.dlg_settings.close(); self.dlg_hardware.close()
+        self.dlg_graphics.close(); self.dlg_avantes.close()
         super().closeEvent(event)
 
 

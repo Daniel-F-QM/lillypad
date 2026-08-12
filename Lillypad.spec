@@ -44,6 +44,27 @@ if not _libusb_dlls:
     raise SystemExit('No libusb DLL found inside libusb_package; '
                      'reinstall libusb-package.')
 
+# The Avantes AvaSpecX64.dll is deliberately NOT bundled, unlike the two
+# libraries above. Its licence does permit redistribution with an application
+# that controls Avantes equipment, so this is a practical choice, not a legal
+# one:
+#   * zaber_motion and libusb_package live inside pip packages, so
+#     importlib.util.find_spec gives this spec a deterministic source path.
+#     The Avantes DLL has none — its installer drops it in a VERSIONED folder
+#     at the root of the system drive (C:\AvaSpecX64-DLL_9.14.0.0\), so there
+#     is nothing stable to point at from here.
+#   * The AvaSpec USB driver has to be installed on the target machine anyway,
+#     and it comes with the same package, so bundling removes no install step.
+#   * Pinning one DLL version into the bundle would override whatever the
+#     operator installed for their own spectrometer.
+# avantes.py resolves the DLL at runtime (LILLYPAD_AVASPEC_DLL, then next to
+# the .exe, then the versioned install folder, then PATH), so dropping a
+# specific DLL beside Lillypad.exe remains available if a self-contained
+# folder is wanted.
+#
+# No hiddenimports entry is needed for avantes.py: PyInstaller's analysis scans
+# function bodies, so the lazy `import avantes` inside AvantesSpectrometer is
+# found the same way the lazy zaber_motion import is.
 a = Analysis(
     ['frog_gui_fast.py'],
     pathex=[],

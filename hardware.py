@@ -224,6 +224,12 @@ class SpectrometerBase(abc.ABC):
     # set this; the scan worker and the live feed both use it to flag
     # saturation, and neither can warn about anything while it is None.
     max_counts: float | None = None
+    # The tagged id ("vendor:serial") this device was opened by — see
+    # list_spectrometers / open_spectrometer. None on simulated devices, which
+    # are not reachable by id. Real adapters MUST set it: it is how the GUI
+    # names a live device without reaching into a vendor object's privates,
+    # and how a multi-spectrometer slot remembers what it points at.
+    spec_id: str | None = None
 
     @property
     @abc.abstractmethod
@@ -997,6 +1003,85 @@ def list_seabreeze_spectrometers(backend: str = "pyseabreeze") -> list[tuple[str
     return out
 
 
+# ===========================================================================
+# Vendor-agnostic spectrometer enumeration
+# ===========================================================================
+# More than one vendor can be on the bench at once, so a bare serial number no
+# longer identifies a device: two vendors may legitimately use the same string,
+# and nothing in it says which adapter class to open it with. Devices are
+# therefore named by a TAGGED id, "vendor:serial".
+#
+# The tag is deliberately a plain string rather than a dataclass. The id is
+# carried through QComboBox userData, stored in the multi-spectrometer slots,
+# compared with ==, and printed in the device picker and in status messages —
+# a string keeps all of that working and renders as something a human can read.
+# The simulated multi-spec halves already use the same idiom (the
+# "__sim_blue__" / "__sim_red__" sentinels in the GUI), and those are matched
+# before any tag parsing, so they are left exactly as they are.
+SPEC_VENDORS = ("seabreeze", "avantes")
+
+
+def spec_ident(vendor: str, serial) -> str:
+    """Build the tagged id for a device. '?' when the serial is unreadable —
+    the GUI treats that as "cannot reopen by id, auto-connect instead" rather
+    than dropping the device from the list."""
+    return f"{vendor}:{serial if serial else '?'}"
+
+
+def split_spec_ident(ident: str) -> tuple[str, str]:
+    """Inverse of spec_ident. Raises on anything that is not a tagged id."""
+    vendor, _, serial = str(ident).partition(":")
+    if vendor not in SPEC_VENDORS:
+        raise RuntimeError(
+            f"Unknown spectrometer id {ident!r}: expected "
+            f"'<vendor>:<serial>' with vendor one of "
+            f"{', '.join(SPEC_VENDORS)}.")
+    return vendor, serial
+
+
+def list_spectrometers(seabreeze_backend: str = "pyseabreeze") -> list[tuple[str, str]]:
+    """Every attached spectrometer, from every vendor, as
+    [(label, "vendor:serial"), ...] — the same shape list_kinesis_stages uses,
+    so the GUI's device picker drives all of them.
+
+    A vendor whose SDK is missing or whose enumeration fails contributes
+    NOTHING and raises nothing. This is background enumeration — it fills the
+    picker and the multi-spectrometer submenus — and one absent driver must not
+    hide the other vendor's devices or turn every submenu into an error. Code
+    that wants the failure reported (because the operator explicitly pressed
+    that vendor's connect button) calls that vendor's list_* helper directly.
+    """
+    out: list[tuple[str, str]] = []
+    try:
+        for model, serial in list_seabreeze_spectrometers(seabreeze_backend):
+            out.append((model, spec_ident("seabreeze", serial)))
+    except Exception:
+        pass
+    try:
+        for model, serial in list_avantes_spectrometers():
+            out.append((model, spec_ident("avantes", serial)))
+    except Exception:
+        pass
+    return out
+
+
+def open_spectrometer(ident: str,
+                      seabreeze_backend: str = "pyseabreeze") -> SpectrometerBase:
+    """Open the device a tagged id names. The ONLY place a vendor tag is mapped
+    to an adapter class, so a new vendor is one entry here rather than one per
+    call site in the GUI."""
+    vendor, serial = split_spec_ident(ident)
+    if vendor == "seabreeze":
+        # "?" = the serial could not be read at enumeration time; fall back to
+        # first-device auto-connect rather than refusing outright.
+        return (SeabreezeSpectrometer(serial=serial, backend=seabreeze_backend)
+                if serial and serial != "?"
+                else SeabreezeSpectrometer(backend=seabreeze_backend))
+    if vendor == "avantes":
+        return AvantesSpectrometer(serial=serial if serial != "?" else None)
+    raise RuntimeError(f"No adapter for spectrometer vendor {vendor!r}.")
+
+
 class SeabreezeSpectrometer(SpectrometerBase):
     """Ocean Optics / Ocean Insight spectrometer via python-seabreeze."""
     def __init__(self, device=None, serial: str | None = None,
@@ -1018,6 +1103,11 @@ class SeabreezeSpectrometer(SpectrometerBase):
 
         self.name = (f"{getattr(self._spec, 'model', 'spectrometer')} "
                      f"[{getattr(self._spec, 'serial_number', '?')}]")
+        # Taken from the OPENED device, not from the `serial` argument: the
+        # device= and auto-connect paths never see one, and this is the id a
+        # multi-spectrometer slot has to be able to reopen later.
+        self.spec_id = spec_ident(
+            "seabreeze", getattr(self._spec, "serial_number", None))
         self._wl = np.asarray(self._spec.wavelengths(), dtype=float)
 
         # Detector full scale, as the device itself reports it (seabreeze's
@@ -1045,6 +1135,184 @@ class SeabreezeSpectrometer(SpectrometerBase):
             self._spec.close()
         except Exception:
             pass
+
+
+def list_avantes_spectrometers() -> list[tuple[str, str]]:
+    """Enumerate attached Avantes spectrometers without adopting any.
+    Returns [(model, serial), ...].
+
+    Raises when the AvaSpec DLL is missing or the enumeration fails — callers
+    that want a quiet "nothing found" (background enumeration) go through
+    list_spectrometers, which swallows it. The message is worth surfacing when
+    the operator explicitly asked for an Avantes: it names the package to
+    install.
+    """
+    import avantes
+    return [(name, serial) for name, serial, _status in avantes.list_devices()]
+
+
+def avantes_trigger_options() -> dict[str, list[tuple[str, int]]]:
+    """Labelled choices for the Avantes trigger controls, as
+    {"mode"/"source"/"source_type": [(label, value), ...]}.
+
+    Read from the vendor module rather than restated here so the numbers have
+    exactly one definition. The GUI calls this only while an Avantes is
+    connected, so the lazy import costs nothing on a machine without the DLL —
+    and it is what keeps frog_gui_fast from importing avantes directly.
+    """
+    import avantes
+    return {
+        "mode": [("Free running", avantes.SW_TRIGGER_MODE),
+                 ("Hardware trigger", avantes.HW_TRIGGER_MODE),
+                 ("Single scan", avantes.SS_TRIGGER_MODE)],
+        "source": [("External", avantes.EXTERNAL_TRIGGER),
+                   ("Sync", avantes.SYNC_TRIGGER)],
+        "source_type": [("Edge", avantes.EDGE_TRIGGER_SOURCE),
+                        ("Level", avantes.LEVEL_TRIGGER_SOURCE)],
+    }
+
+
+class AvantesSpectrometer(SpectrometerBase):
+    """Avantes AvaSpec spectrometer via the vendor DLL (see avantes.py).
+
+    The vendor module is imported lazily, inside __init__, so `import hardware`
+    and the simulator self-test still work on a machine with no AvaSpec DLL —
+    the same arrangement ZaberStage and PiezoJenaStage use for their SDKs.
+
+    Two device settings are entangled with things the rest of the app assumes,
+    and this adapter owns both couplings so no consumer has to know about them:
+
+      * `integration_ms` reports the cost of ONE acquire(), which is the
+        exposure times the on-board average count — not the exposure. The live
+        feed paces itself off this value and derives its handover timeout from
+        it, so reporting the bare exposure while a frame silently costs N times
+        that makes the feed spin hot and the device-handover time out.
+      * `max_counts` follows the ADC resolution. Switching to the 16-bit ADC
+        moves full scale from 16383 to 65535, and anything that cached the old
+        ceiling would then either cry wolf or stay silent through clipping.
+        `set_high_res_adc` returns whether the mode actually changed so the UI
+        can re-arm its saturation state only when it did.
+    """
+
+    def __init__(self, serial: str | None = None, high_res_adc: bool = True):
+        import avantes
+        self._spec = avantes.AvaSpec(serial=serial, high_res_adc=high_res_adc)
+        try:
+            self.serial = self._spec.serial
+            self.spec_id = spec_ident("avantes", self.serial)
+            self.name = f"{self._spec.model} [{self.serial}]"
+            self._wl = np.asarray(self._spec.wavelengths, dtype=float)
+            self._sync_derived()
+        except Exception:
+            self.disconnect()
+            raise
+
+    def _sync_derived(self) -> None:
+        """Re-read everything the base class contract exposes as plain
+        attributes. Called after any change that can move them, so the two
+        couplings in the class docstring stay true by construction."""
+        self.integration_ms = float(self._spec.frame_time_ms)
+        self.max_counts = float(self._spec.max_counts)
+
+    # ── SpectrometerBase ────────────────────────────────────────────────────
+    @property
+    def wavelengths(self) -> np.ndarray:
+        return self._wl
+
+    def set_integration_time(self, ms: float) -> None:
+        self._spec.set_integration_time(float(ms))
+        self._sync_derived()
+
+    def acquire(self) -> np.ndarray:
+        return self._spec.acquire()
+
+    def disconnect(self) -> None:
+        spec = getattr(self, "_spec", None)
+        if spec is not None:
+            try:
+                spec.disconnect()
+            except Exception:
+                pass
+            self._spec = None
+
+    # ── Avantes-specific settings ───────────────────────────────────────────
+    # Everything below is reached only from the Avantes settings dialog. It is
+    # exposed here rather than by handing the GUI the raw avantes.AvaSpec so
+    # the one-way frog_gui_fast -> scan -> hardware dependency holds, and so
+    # _sync_derived() cannot be forgotten at a call site.
+    @property
+    def exposure_ms(self) -> float:
+        """The exposure alone, without the averaging factor that
+        `integration_ms` folds in."""
+        return float(self._spec.integration_ms)
+
+    @property
+    def n_averages(self) -> int:
+        return int(self._spec.n_averages)
+
+    def set_averages(self, n: int) -> None:
+        self._spec.set_averages(int(n))
+        self._sync_derived()          # frame time just changed
+
+    @property
+    def high_res_adc(self) -> bool:
+        return bool(self._spec.high_res_adc)
+
+    def set_high_res_adc(self, enable: bool) -> bool:
+        """Returns the mode actually in force — False when the hardware has no
+        16-bit ADC, which is a fact about the model rather than an error."""
+        on = self._spec.set_high_res_adc(bool(enable))
+        self._sync_derived()          # full scale just changed
+        return on
+
+    def set_dark_correction(self, enable: bool) -> None:
+        self._spec.set_dark_correction(bool(enable))
+
+    def set_smoothing(self, pixels: int) -> None:
+        self._spec.set_smoothing(int(pixels))
+
+    @property
+    def smoothing_pixels(self) -> int:
+        return int(self._spec.config.m_Smoothing.m_SmoothPix)
+
+    @property
+    def dark_correction(self) -> bool:
+        return bool(self._spec.config.m_CorDynDark.m_Enable)
+
+    def set_prescan(self, enable: bool) -> None:
+        self._spec.set_prescan_mode(bool(enable))
+
+    def set_sync_mode(self, enable: bool) -> None:
+        self._spec.set_sync_mode(bool(enable))
+
+    def set_trigger(self, mode: int, source: int, source_type: int) -> None:
+        self._spec.set_trigger(mode, source, source_type)
+
+    @property
+    def trigger(self) -> tuple[int, int, int]:
+        t = self._spec.config.m_Trigger
+        return int(t.m_Mode), int(t.m_Source), int(t.m_SourceType)
+
+    @property
+    def hardware_triggered(self) -> bool:
+        """True when acquire() waits on an external pulse and may therefore
+        block indefinitely. The GUI checks this before leaving a live feed
+        running, since a feed that never returns a frame wedges the device
+        handover with no visible cause."""
+        return bool(self._spec.hardware_triggered)
+
+    def temperature_c(self) -> float | None:
+        """Board temperature, or None on a device with no such sensor."""
+        return self._spec.temperature_c()
+
+    def saturated_pixels(self) -> np.ndarray:
+        """The device's own clipped-pixel mask for the last frame. Independent
+        of the count-vs-max_counts test the scan does, and useful as a
+        cross-check rather than a replacement."""
+        return self._spec.saturated_pixels()
+
+    def device_info(self) -> dict:
+        return self._spec.device_info()
 
 
 class StitchedSpectrometer(SpectrometerBase):
@@ -1645,3 +1913,35 @@ if __name__ == "__main__":
     stage.move_to(45.0)
     assert raw[0] == 1, f"expected 1 move for 2 mm, got {raw[0]}"
     print(f"  long-move split: 47 mm -> {10} steps of <=5 mm, 2 mm -> 1 step")
+
+    # Tagged spectrometer ids. All of this runs with no vendor SDK installed
+    # and no hardware attached — which is the point: enumeration must degrade
+    # to "found nothing" rather than raising, or a missing driver takes the
+    # device picker and every multi-spectrometer submenu down with it.
+    assert spec_ident("seabreeze", "USB2+H12345") == "seabreeze:USB2+H12345"
+    assert spec_ident("seabreeze", None) == "seabreeze:?"   # unreadable serial
+    assert split_spec_ident("seabreeze:USB2+H12345") == ("seabreeze", "USB2+H12345")
+    assert split_spec_ident("avantes:2001234") == ("avantes", "2001234")
+    for bad in ("USB2+H12345", "ocean:123", "", "__sim_blue__"):
+        try:
+            split_spec_ident(bad)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} should not parse as a tagged id")
+    devices = list_spectrometers()          # must not raise without an SDK
+    assert isinstance(devices, list)
+    assert all(len(d) == 2 and split_spec_ident(d[1]) for d in devices)
+    print(f"  tagged spectrometer ids: ok ({len(devices)} device(s) enumerated)")
+
+    # A vendor whose SDK is absent must fail with the message that names what
+    # to install, not with an ImportError or a bare OSError — that string is
+    # what the operator reads in the Hardware dialog.
+    try:
+        open_spectrometer("avantes:2001234")
+    except Exception as e:
+        # Printed whole, not truncated: the point of the check is that this
+        # sentence tells an operator what to install.
+        print(f"  avantes without its DLL -> {type(e).__name__}: {e}")
+    else:
+        print("  avantes connected (DLL present)")

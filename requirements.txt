@@ -16,6 +16,11 @@
 # pylablib.devices (all we import) does not.
 #
 # PyInstaller is additionally told to exclude PyQt5 in Lillypad.spec.
+#
+# NOT listed here: the Avantes AvaSpec DLL. avantes.py drives it through ctypes
+# (stdlib), and the DLL itself comes from the vendor's AvaSpec-DLL package —
+# an external installer, not a pip package. See the Avantes section of the
+# README for what to install and where it lands.
 
 altgraph==0.17.5
 colorama==0.4.6
