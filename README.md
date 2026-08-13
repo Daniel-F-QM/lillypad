@@ -158,10 +158,10 @@ own driver and its own DLL.
 **Avantes spectrometers.** Two separate Avantes downloads matter, and installing
 the wrong one is the usual first stumble:
 
-| You need | What it gives you | Enough on its own? |
-| --- | --- | --- |
-| **AvaSpec-DLL package** (`AvaspecX64Dll_*.Setup_64bit.exe`) | `AvaSpecX64.dll` (64-bit), `avaspec.h`, the library manual, examples | **Required** |
-| AvaSoft | the GUI app, the USB driver, and a **32-bit only** `avaspec.dll` | No |
+| You need | What it gives you |
+| --- | --- |
+| **AvaSpec-DLL package** (`AvaspecX64Dll_*.Setup_64bit.exe`) | `AvaSpecX64.dll` (64-bit), `avaspec.h`, the library manual, examples |
+| AvaSoft | the GUI app, the USB driver, and a **32-bit only** `avaspec.dll` |
 
 Lillypad runs on 64-bit Python, and a 32-bit DLL cannot be loaded into it —
 AvaSoft alone leaves you with a DLL Python refuses with `WinError 193`.
