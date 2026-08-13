@@ -36,15 +36,21 @@
 
 ## Layout
 
-| File | Role |
+| File (Core)| Role |
 | --- | --- |
 | [frog_gui_fast.py](frog_gui_fast.py) | PySide6 GUI — application entry point |
 | [hardware.py](hardware.py) | Device abstraction: stage + spectrometer adapters, pulse simulator |
-| [avantes.py](avantes.py) | Standalone ctypes wrapper around the Avantes `AvaSpecX64.dll` |
 | [scan.py](scan.py) | Delay-scan engine: optics conversions, scan worker, file writers |
+| [icons/](icons/) | Application and toolbar icons |
+
+| **File (Helpers)**| **Role** |
+| --- | --- |
 | [Lillypad.spec](Lillypad.spec) | PyInstaller recipe for a standalone Windows build |
 | [requirements.txt](requirements.txt) | Pinned lockfile (Python 3.13) — install with `--no-deps` |
-| [icons/](icons/) | Application and toolbar icons |
+| [avantes.py](avantes.py) | Standalone ctypes wrapper around the Avantes `AvaSpecX64.dll` |
+| [zaber_diagnostics.py](zaber_diagnostics.py)| Support program to help diagnose issues with backlash compensation in zaber stages| 
+
+
 
 The dependency direction is strictly one-way — `frog_gui_fast` → `scan` →
 `hardware` — and `hardware.py` has no Qt dependency at all. `scan.py` is split
@@ -57,6 +63,8 @@ and reusable without a GUI.
 Requires Python 3.13.  
 
 Requires Visual C++ - e.g. x64 "Visual C++ Redistributable" (vc_redist.x64.exe)  
+
+Requires Avantes DLL and drivers to use their spectrometers - distributed by them separately
 
 (likely) Requires Kinesis to be installed for Thorlabs stages to get the drivers  
 
