@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QInputDialog
 )
 from PySide6.QtCore import (Qt, QTimer, QThread, Signal, QPointF, QSize, QRect,
-                            QPoint, QSignalBlocker)
+                            QRectF, QPoint, QSignalBlocker)
 from PySide6.QtGui import (QPalette, QColor, QFont, QIcon, QPixmap, QPainter,
                            QPen, QPolygonF, QAction, QActionGroup)
 import matplotlib
@@ -1510,7 +1510,8 @@ class GraphicsSettingsDialog(QDialog):
 
         # ── Plot proportions ─────────────────────────────────────────────────
         lay.addWidget(self._hdr("Plot Proportions"))
-        prop_hint = QLabel("Spectrum column width  (% of total plot area)")
+        prop_hint = QLabel("Spectrum column width  (% of total plot area) — or "
+                           "drag the handle between the plots")
         prop_hint.setObjectName("dim"); prop_hint.setWordWrap(True)
         lay.addWidget(prop_hint)
         self.sld_prop = Slider(Qt.Horizontal)
@@ -1630,6 +1631,13 @@ class GraphicsSettingsDialog(QDialog):
         self.lbl_prop.setText(f"{val}%")
         self.canvas.set_proportions(val / 100.0)
 
+    def sync_proportions(self, pct):
+        """Canvas-side change (the split handle was dragged) — keep the slider
+        truthful without re-driving the canvas from it."""
+        with QSignalBlocker(self.sld_prop):
+            self.sld_prop.setValue(int(pct))
+        self.lbl_prop.setText(f"{int(pct)}%")
+
     def toggle(self):
         if self.isVisible():
             self.hide()
@@ -1652,7 +1660,16 @@ class GraphicsSettingsDialog(QDialog):
 # Margins are sized for the 9-pt plot fonts: LEFT holds the spectrum's y label
 # plus its tick labels, COLGAP the right column's y label, and BOT the bottom
 # row's tick labels and x label.
-_GEO_L, _GEO_R, _GEO_TOP = 0.10, 0.99, 0.95
+_GEO_R, _GEO_TOP = 0.99, 0.95
+# The left margin and the column gap hold text at a FIXED point size, so they
+# are sized in logical pixels and only converted to a fraction at layout time:
+# one fraction that fits a small window wastes half of a large one (the old
+# 0.10 left margin was 90 px at 900 px wide but 192 px at 1920, for content
+# that never needs more than the measured worst case below).
+_GEO_L_PX   = 68     # y label + 5-digit tick labels at 8.5 pt measure ~58 px
+_GEO_L_MAX  = 0.14   # …but never eat this much of a narrow window
+_GEO_GAP_PX = 70     # column-gap floor: the right column's y label and tick
+                     # labels, plus clearance for the split handle beside them
 _GEO_ROW_RATIO = 1.8        # tall row : short row, both modes
 _GEO_V_BOT     = 0.095
 _GEO_V_COLGAP  = 0.055
@@ -1673,9 +1690,96 @@ _TITLE_ABOVE_IN  = 5 / 72   # matches the original pad=5
 _TITLE_INSET_IN  = (0.08, 0.06)   # (right, down) from the axes' top-left corner
 
 
+class PlotSplitHandle(QWidget):
+    """The divider between the spectrum and the panel(s) beside it: a separator
+    line down the shared height, with a draggable grip at its middle — the
+    Graphics dialog's proportion slider, in reach.
+
+    A Qt child of the canvas rather than a matplotlib artist: hover feedback and
+    drag tracking cost one small widget repaint instead of a figure redraw, and
+    the divider composites above the canvas without ever landing in the cached
+    blit background (the same reason the rubber band is a Qt widget).
+    """
+    W = 13          # logical px: wide enough to grab, narrow enough for the gap
+    GRIP_H = 46     # grip length; the separator line runs the full height
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self._canvas = canvas
+        self._hover = False
+        self._press_x = None      # global x at press
+        self._press_frac = None   # spectrum fraction at press
+        self.setCursor(Qt.SplitHCursor)
+        self.setToolTip("Drag to resize the spectrum panel  ·  "
+                        "double-click for 50 / 50")
+
+    # ── Painting ──────────────────────────────────────────────────────────
+    def paintEvent(self, _event):
+        # PALETTE is read at paint time, so a theme switch only needs update().
+        active = self._hover or self._press_x is not None
+        h, cx = float(self.height()), self.width() / 2.0
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        # Separator: a hairline the full height of the two panels, so they read
+        # as separate panels whether or not anyone ever drags it.
+        p.setBrush(QColor(PALETTE["border"]))
+        p.drawRect(QRectF(cx - 0.5, 0.0, 1.0, h))
+        # Grip: the same line thickened over a short run at the middle. Accent
+        # on hover so it is discoverable without shouting at rest.
+        gw, gh = 5.0, min(self.GRIP_H, h)
+        p.setBrush(QColor(PALETTE["accent"] if active
+                          else PALETTE["border_hover"]))
+        p.drawRoundedRect(QRectF(cx - gw / 2.0, (h - gh) / 2.0, gw, gh),
+                          gw / 2.0, gw / 2.0)
+        # Grip dots punched in the panel colour: they read as a handle at any
+        # size, where a plain bar could pass for a plot decoration.
+        p.setBrush(QColor(PALETTE["plot_bg"]))
+        for dy in (-5.0, 0.0, 5.0):
+            p.drawEllipse(QPointF(cx, h / 2.0 + dy), 0.9, 0.9)
+
+    def enterEvent(self, event):
+        self._hover = True; self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False; self.update()
+        super().leaveEvent(event)
+
+    # ── Dragging ──────────────────────────────────────────────────────────
+    # Anchored to the press position rather than to the cursor's offset within
+    # the grip, so the split never jumps on the first move.
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        self._press_x = event.globalPosition().x()
+        self._press_frac = self._canvas.spec_fraction()
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._press_x is None:
+            return
+        travel = self._canvas.split_travel_px()
+        if travel <= 0:
+            return
+        self._canvas.set_proportions(
+            self._press_frac + (event.globalPosition().x() - self._press_x) / travel)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            return
+        self._press_x = self._press_frac = None
+        self.update()
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._canvas.set_proportions(0.50)
+
+
 class FrogCanvas(FigureCanvasQTAgg):
     limits_changed = Signal()        # zoom/reset happened → window syncs dialog
     log_toggle_requested = Signal()  # click on spectrum y-axis strip
+    proportions_changed = Signal(int)  # split handle dragged → dialog follows
 
     def __init__(self):
         self.fig = Figure(facecolor=PALETTE["plot_bg"])
@@ -1791,6 +1895,11 @@ class FrogCanvas(FigureCanvasQTAgg):
         # Re-captures the background after every real draw (init, resize, or any
         # of our draw_idle() calls) and re-renders the animated artists on top.
         self.mpl_connect('draw_event', self._on_draw)
+        # Divider between the spectrum and the column beside it. Created before
+        # the first _layout_axes(), which is what positions it.
+        self._split_band = None      # (x, y_bottom, y_top) in figure fractions
+        self._renderer = None        # last draw's renderer, for label metrics
+        self._split = PlotSplitHandle(self)
         # Place the axes for the startup layout mode (must come after the blit
         # state above: it invalidates both caches and requests a draw).
         self._layout_axes()
@@ -1859,9 +1968,9 @@ class FrogCanvas(FigureCanvasQTAgg):
         explicitly instead of being left where the gridspec put them, so the
         proportion slider works in either mode (and before the first draw).
         """
-        L, R, TOP = _GEO_L, _GEO_R, _GEO_TOP
+        L, R, TOP = self._left_margin(), _GEO_R, _GEO_TOP
         horiz   = self._layout_mode == "horizontal"
-        cgap    = _GEO_H_COLGAP if horiz else _GEO_V_COLGAP
+        cgap    = self._col_gap()
         # Clamped, not rejected: the slider must never be a silent no-op.
         frac    = min(max(self._spec_frac, 0.05), 0.95)
         spec_w  = frac * (R - L - cgap)
@@ -1874,6 +1983,8 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.ax_spec.set_position([L, BOT, spec_w, TOP - BOT])
             self.ax_trace.set_position([right_x, BOT + h_ac + rgap, right_w, h_tr])
             self.ax_ac.set_position([right_x, BOT, right_w, h_ac])
+            # The whole column gap is shared by both sides here.
+            split_bot = BOT
         else:
             BOT = _GEO_V_BOT
             # Reproduce the original gridspec spacing exactly: hspace is a
@@ -1886,10 +1997,91 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.ax_spec.set_position([L, BOT + h_ac + rgap, spec_w, h_top])
             self.ax_trace.set_position([right_x, BOT + h_ac + rgap, right_w, h_top])
             self.ax_ac.set_position([L, BOT, R - L, h_ac])
+            # Only the top row is split — the autocorrelation spans both columns.
+            split_bot = BOT + h_ac + rgap
+        # The gap's centre line, over the rows the two sides actually share.
+        self._split_band = (right_x - cgap / 2.0, split_bot, TOP)
+        self._position_split_handle()
         # Everything moved, so both cached backgrounds describe the old geometry.
         self._bg = None
         self._bg_static = None
         self.draw_idle()
+
+    def _left_margin(self):
+        """Left margin as a figure fraction — a fixed pixel width (see
+        _GEO_L_PX), so a wide window spends it on plot instead of blank paper."""
+        return min(_GEO_L_PX / max(self.width(), 1), _GEO_L_MAX)
+
+    def _col_gap(self):
+        """Column gap as a figure fraction, floored at the pixels the right
+        column's labels and the split handle need side by side."""
+        base = (_GEO_H_COLGAP if self._layout_mode == "horizontal"
+                else _GEO_V_COLGAP)
+        return max(base, _GEO_GAP_PX / max(self.width(), 1))
+
+    def _position_split_handle(self, renderer=None):
+        """Put the separator over the band the split governs, in the clear strip
+        between the two panels. Figure fractions have their origin at the bottom
+        left, Qt widget coords at the top left — hence the flip."""
+        # getattr, not the attribute: the base class can resize the widget while
+        # its own __init__ runs, before the handle exists.
+        if getattr(self, "_split_band", None) is None:
+            return
+        x, bot, top = self._split_band
+        w, h = float(self.width()), float(self.height())
+        x_px = self._split_x_px(renderer, x * w)
+        self._split.setGeometry(
+            QRect(round(x_px - PlotSplitHandle.W / 2.0), round((1.0 - top) * h),
+                  PlotSplitHandle.W, max(1, round((top - bot) * h))))
+
+    def _split_x_px(self, renderer, fallback):
+        """Centre of the clear strip between the spectrum's right spine and the
+        right column's y labels, in logical px.
+
+        Measured rather than derived from the gap: the gap also holds the right
+        column's y label and tick labels, whose width depends on the font and on
+        the data, so the midpoint of what they leave over is the one position
+        guaranteed to sit inside neither panel. Falls back to the gap's centre
+        until the first draw provides a renderer.
+
+        Between draws the last renderer is reused: it serves only as a source of
+        font metrics here, while the positions come from the live axes — so a
+        drag re-measures against the geometry it just set instead of snapping
+        back to the gap centre until the next redraw lands.
+        """
+        renderer = renderer or self._renderer
+        if renderer is None:
+            return fallback
+        right_axes = ((self.ax_trace, self.ax_ac)
+                      if self._layout_mode == "horizontal" else (self.ax_trace,))
+        dpr = self.devicePixelRatioF()
+        left = self.ax_spec.get_window_extent().x1 / dpr
+        inks = [bb.x0 / dpr for bb in
+                (ax.yaxis.get_tightbbox(renderer) for ax in right_axes)
+                if bb is not None]
+        if not inks:
+            return fallback
+        # Clamped to the panels themselves, so a label that overhangs its own
+        # column (or a tightbbox we could not trust) can never push the handle
+        # onto a plot.
+        half = PlotSplitHandle.W / 2.0
+        spine = self.ax_trace.get_window_extent().x0 / dpr
+        return min(max((left + min(inks)) / 2.0, left + half), spine - half)
+
+    def split_travel_px(self):
+        """Widget pixels the split can travel over the full 0…1 fraction range —
+        the drag handle's px → fraction conversion."""
+        return (_GEO_R - self._left_margin() - self._col_gap()) * self.width()
+
+    def spec_fraction(self):
+        return self._spec_frac
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Not just a repositioning: the left margin and the column gap are fixed
+        # pixel widths, so their figure fractions change with the window.
+        if getattr(self, "_split", None) is not None:
+            self._layout_axes()
 
     def set_layout_mode(self, mode):
         """"horizontal": spectrum at full height on the left, FROG trace over
@@ -1939,6 +2131,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         # colourblind separation that is the whole point.
         self._style()   # re-applies axes/tick/label/grid colors from PALETTE
         self._apply_cmap()   # masked pixels must follow the new background
+        self._split.update()  # a Qt child: draw_idle would not repaint it
         self.draw_idle()
 
     # ── Blitting core ─────────────────────────────────────────────────────
@@ -1951,6 +2144,11 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._bg_static = None       # figure changed; recomposite lazily
         for ax, art in self._animated:
             ax.draw_artist(art)
+        # Only a completed draw knows how much of the gap the tick labels took,
+        # and only then can the separator be placed clear of both panels. Moving
+        # a Qt child cannot recurse back into the figure draw.
+        self._renderer = getattr(event, "renderer", None) or self._renderer
+        self._position_split_handle()
 
     def _blit(self):
         """Fast path: repaint the animated artists over the cached background.
@@ -2282,10 +2480,19 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_m2.set_data([], [])
 
     def set_proportions(self, spec_frac):
-        """Width of the spectrum column as a fraction of the plot area
-        (slider range 0.20–0.80). Applies in both layout modes."""
-        self._spec_frac = float(spec_frac)
+        """Width of the spectrum column as a fraction of the plot area. Applies
+        in both layout modes.
+
+        Clamped to the dialog slider's 0.20–0.80 range rather than to the wider
+        one _layout_axes tolerates: the drag handle and the slider drive the same
+        value, so a drag must never reach a split the slider cannot represent.
+        """
+        frac = min(max(float(spec_frac), 0.20), 0.80)
+        if frac == self._spec_frac:
+            return                      # dragging past the clamp: nothing moved
+        self._spec_frac = frac
         self._layout_axes()
+        self.proportions_changed.emit(round(frac * 100))
 
     def update_spectrum(self, wl, spectrum):
         # Last writer owns the panel: whoever has a combined frame to show
@@ -3024,6 +3231,7 @@ class FrogWindow(QMainWindow):
         # checkbox stays the single source of truth for the log scale.
         self.canvas.limits_changed.connect(self.dlg_graphics.sync_limits)
         self.canvas.log_toggle_requested.connect(self.dlg_graphics.chk_log.toggle)
+        self.canvas.proportions_changed.connect(self.dlg_graphics.sync_proportions)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
