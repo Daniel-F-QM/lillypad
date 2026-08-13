@@ -139,6 +139,40 @@ vendor, so an Avantes and an Ocean device can be stitched into one span. A
 vendor whose SDK is missing simply contributes nothing to the enumeration
 rather than taking the other vendor's devices down with it.
 
+**The Integration Time box takes its range from the device.** Each adapter
+reports the exposure range it accepts and the box is built from it, so
+sub-millisecond exposures appear only where the hardware really has them: an
+Ocean unit with a 1 ms floor keeps its whole-millisecond box, while an Avantes
+gets microsecond resolution and adaptive arrow steps.
+
+The floor is the **sensor's**, not the library's, and `avantes.py` finds it by
+asking the device at connect (a dozen `AVS_PrepareMeasure` calls, bisected).
+The two differ by orders of magnitude and nothing in the device config reports
+which applies — the ULS4096CL-EVO here answers **9 µs**, against the library's
+2 µs and the header's 1.1 ms constant for the ILX CCD family. That probe is not
+cosmetic: an exposure the sensor refuses is accepted by the library and then
+fails at the *next acquisition*, which on a running feed means the plot quietly
+freezes on its last good frame. Writing an exposure now pushes it to the device
+immediately, so a refusal names itself at the point of the change and the
+device keeps the last exposure that worked.
+
+Two more consequences of the range being the device's: connecting a coarser
+device while the box holds a sub-millisecond value clamps it up to that
+device's floor rather than failing the connect, and in multi-spectrometer mode
+each of the two boxes carries its own member's range. The top is capped at
+**10 s** whatever the device claims — `acquire()` blocks for the whole
+exposure, so a longer one would leave the app looking hung.
+
+Going below a millisecond does not make frames arrive proportionally faster.
+Each frame also pays sensor readout, the USB transfer of every pixel and the
+DLL round trip, none of which shrink with the exposure. Measured here on the
+ULS4096CL-EVO (4094 px, USB): 10 ms exposure → 12.4 ms/frame, 1 ms → 2.9 ms,
+0.05 ms → 1.8 ms, 9 µs → 2.5 ms. So the useful gain is down to about a
+millisecond; below that you are buying dynamic-range headroom against a bright
+source, not speed. The live feed is capped at ~33 fps regardless
+(`LiveFeedWorker`'s `min_interval_ms`), since the plot cannot usefully redraw
+faster; a scan is not capped and takes frames as fast as the device yields them.
+
 **Spectrometer backends.** python-seabreeze has two backends and the box beside
 *Real (seabreeze)* in the Hardware dialog switches between them (applied on the
 next connect). It sits on the seabreeze row for the same reason the port fields
@@ -187,10 +221,10 @@ board temperature, and a device-info block. Three couplings are worth knowing:
   and the counts scale by 4 between them. Switching re-arms the saturation
   alarm against the new ceiling.
 - **On-board averaging multiplies the frame time.** The Integration Time box
-  shows what one frame *costs* (exposure × averages), because that is what the
-  live feed paces itself to. The scan already averages in software
-  (*Acquisition Settings → averages*), so leave the on-board count at 1 unless
-  you want both.
+  shows and writes the *exposure*; the Avantes dialog reports what one frame
+  actually costs (exposure × averages), which is what the live feed paces
+  itself to. The scan already averages in software (*Acquisition Settings →
+  averages*), so leave the on-board count at 1 unless you want both.
 - **An armed hardware trigger stops the live feed.** Under an external trigger
   a frame only arrives when the experiment fires, so a free-running feed would
   simply block; Lillypad stops it for you and says so. `acquire()` still

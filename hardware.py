@@ -219,6 +219,14 @@ class SpectrometerBase(abc.ABC):
     # live feed paces itself off it (and derives its handover timeout from it),
     # so EVERY adapter must keep this current in set_integration_time().
     integration_ms: float = 100.0
+    # Exposure range this device accepts, in ms — what the GUI's integration
+    # box may offer. The defaults are the conservative whole-millisecond range
+    # the app used before any sub-ms device existed; an adapter that knows
+    # better MUST narrow or widen them, because the input is built from these.
+    # The device stays the authority: these shape the input and catch the
+    # obviously-wrong, they do not replace the SDK's own range check.
+    min_integration_ms: float = 1.0
+    max_integration_ms: float = 10000.0
     # Full-scale reading of the detector, in counts — the level at which the
     # ADC clips and the measurement stops being a measurement. Adapters SHOULD
     # set this; the scan worker and the live feed both use it to flag
@@ -243,6 +251,16 @@ class SpectrometerBase(abc.ABC):
     @abc.abstractmethod
     def set_integration_time(self, ms: float) -> None:
         ...
+
+    @property
+    def exposure_ms(self) -> float:
+        """The exposure alone, without any on-board averaging that
+        `integration_ms` folds in — i.e. exactly what set_integration_time()
+        writes. They differ only on a device that averages internally
+        (Avantes); everywhere else this IS the integration time. A UI that
+        both shows and sets the exposure must read THIS, or a round trip
+        through it would multiply the frame cost by the average count."""
+        return float(self.integration_ms)
 
     @abc.abstractmethod
     def acquire(self) -> np.ndarray:
@@ -1119,12 +1137,27 @@ class SeabreezeSpectrometer(SpectrometerBase):
         except Exception:
             self.max_counts = None
 
+        # Exposure range, again as the device reports it. Ocean models differ
+        # widely (1 ms on a USB2000+, 3.8 ms on an HR4000, 10 us on some), so
+        # asking beats assuming. Guarded: not every backend exposes the limits,
+        # and missing ones must fall back to the safe default range rather than
+        # to a wrong one.
+        try:
+            lo_us, hi_us = self._spec.integration_time_micros_limits
+            self.min_integration_ms = float(lo_us) / 1000.0
+            self.max_integration_ms = float(hi_us) / 1000.0
+        except Exception:
+            pass
+
     @property
     def wavelengths(self) -> np.ndarray:
         return self._wl
 
     def set_integration_time(self, ms: float) -> None:
-        self._spec.integration_time_micros(int(ms * 1000))
+        # Rounded, not truncated: the API takes whole microseconds, and
+        # truncating a fractional-millisecond exposure biases every one of
+        # them low (3.999 ms -> 3998 us).
+        self._spec.integration_time_micros(int(round(float(ms) * 1000.0)))
         self.integration_ms = float(ms)   # keeps the live feed's pacing honest
 
     def acquire(self) -> np.ndarray:
@@ -1202,6 +1235,14 @@ class AvantesSpectrometer(SpectrometerBase):
             self.spec_id = spec_ident("avantes", self.serial)
             self.name = f"{self._spec.model} [{self.serial}]"
             self._wl = np.asarray(self._spec.wavelengths, dtype=float)
+            # THIS sensor's range, probed from the device at connect — not the
+            # library's much wider one. The gap is two orders of magnitude (a
+            # CMOS unit takes 9 us where the library claims 2 us and an ILX
+            # CCD needs 1.1 ms), and offering an exposure the device will
+            # refuse is worse than not offering it: the refusal surfaces one
+            # acquire() later, on the live feed's thread.
+            self.min_integration_ms = float(self._spec.min_integration_ms)
+            self.max_integration_ms = float(self._spec.max_integration_ms)
             self._sync_derived()
         except Exception:
             self.disconnect()
@@ -1364,6 +1405,12 @@ class StitchedSpectrometer(SpectrometerBase):
         self.stitch_factor = 1.0
         self.name = f"stitched: {self.spec1.name} + {self.spec2.name}"
         self.max_counts = None
+        # The intersection of the members' ranges: set_integration_time() on
+        # the facade writes BOTH devices, so it can only offer what both
+        # accept. The per-member boxes in the GUI are seeded from the members
+        # themselves and keep their own (possibly wider) ranges.
+        self.min_integration_ms = max(m.min_integration_ms for m in self.members)
+        self.max_integration_ms = min(m.max_integration_ms for m in self.members)
         self._sync_integration()
         # RAW (pre-calibration) frames of the most recent acquire, one per
         # member. This is what per-device saturation alarms judge: each frame
@@ -1945,3 +1992,27 @@ if __name__ == "__main__":
         print(f"  avantes without its DLL -> {type(e).__name__}: {e}")
     else:
         print("  avantes connected (DLL present)")
+
+    # Exposure range and exposure-vs-frame-time. The GUI builds its integration
+    # box from these, so a device that reports nothing must still land on the
+    # safe whole-millisecond range rather than on an empty or inverted one.
+    sim = SimulatedSpectrometer(SimulatedStage(), gate="shg")
+    assert sim.min_integration_ms == 1.0 and sim.max_integration_ms == 10000.0
+    sim.set_integration_time(25.0)
+    # Without on-board averaging the two are the same number by definition.
+    assert sim.exposure_ms == sim.integration_ms == 25.0, sim.exposure_ms
+
+    class _Fast(SimulatedSpectrometer):     # stands in for an Avantes
+        min_integration_ms = 0.002
+        max_integration_ms = 600_000.0
+
+    fast = _Fast(SimulatedStage(), gate="shg")
+    pair = StitchedSpectrometer(fast, sim) if fast.wavelengths[0] <= sim.wavelengths[0] \
+           else StitchedSpectrometer(sim, fast)
+    # The facade writes BOTH devices, so it can only offer what both accept.
+    assert pair.min_integration_ms == 1.0, pair.min_integration_ms
+    assert pair.max_integration_ms == 10000.0, pair.max_integration_ms
+    print(f"  exposure ranges: sim {sim.min_integration_ms:g}–"
+          f"{sim.max_integration_ms:g} ms, sub-ms member "
+          f"{fast.min_integration_ms:g}–{fast.max_integration_ms:g} ms, "
+          f"stitched {pair.min_integration_ms:g}–{pair.max_integration_ms:g} ms")

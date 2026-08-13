@@ -40,6 +40,7 @@ from __future__ import annotations
 import atexit
 import ctypes
 import glob
+import math
 import os
 import struct
 import sys
@@ -897,8 +898,16 @@ class AvaSpec:
     Configuration is held in `self.config` (a MeasConfigType) and pushed to the
     device by AVS_PrepareMeasure. Changing anything sets `_prepared = False`,
     and the next acquire() re-prepares — so a caller can set several fields
-    without paying for a device round-trip per field.
+    without paying for a device round-trip per field. The two settings the
+    device can REFUSE (exposure and averaging) are the exception: they push
+    immediately, so the refusal reaches the caller instead of the next
+    acquire() on some other thread.
     """
+
+    # Replaced in __init__ with what this sensor actually accepts. Present as
+    # class attributes only so a half-built instance still has an answer.
+    min_integration_ms: float = MIN_INTEGRATION_MS
+    max_integration_ms: float = MAX_INTEGRATION_MS
 
     def __init__(self, serial: str | None = None, port: int = INIT_USB,
                  high_res_adc: bool = True):
@@ -969,6 +978,10 @@ class AvaSpec:
             self.config = self._default_config()
             self.set_high_res_adc(high_res_adc)
             self._read_config()
+            # Asked once, here, so every later range check and every UI built
+            # from this range talks about THIS sensor rather than the library.
+            self.min_integration_ms = self._probe_min_integration()
+            self.max_integration_ms = MAX_INTEGRATION_MS
         except Exception:
             self.disconnect()
             raise
@@ -1051,6 +1064,79 @@ class AvaSpec:
         self._call("AVS_PrepareMeasure", byref(self.config))
         self._prepared = True
 
+    def _push_config(self, undo) -> None:
+        """Send the current config to the device NOW, undoing it if refused.
+
+        AVS_PrepareMeasure is the only thing that validates a measurement
+        config, and acquire() would otherwise be the first call to make it —
+        on whatever thread happens to be running the live feed, where the
+        error is far away from the setting that caused it. Pushing here means
+        an unacceptable value fails at the call site, and the device is left
+        holding the last one that worked rather than a config it rejects.
+        """
+        self._invalidate()
+        try:
+            with self._measure_lock:
+                self._prepare()
+        except AvantesError:
+            undo()
+            self._invalidate()
+            raise
+
+    def _probe_min_integration(self) -> float:
+        """The shortest exposure THIS sensor accepts, found by asking it.
+
+        MIN_INTEGRATION_MS is the LIBRARY's bound and is nowhere near the
+        sensor's: the CMOS unit here takes 9 us, while the header's ILX CCD
+        constant is 1.1 ms — two orders of magnitude apart, and nothing in the
+        device config reports which applies. AVS_PrepareMeasure is the only
+        oracle, so bisect against it.
+
+        Costs a dozen PrepareMeasure calls once per connect, and buys an
+        exposure range that cannot ask for something the device will refuse —
+        which matters because that refusal otherwise surfaces one acquire()
+        later, on the caller's acquisition thread.
+        """
+        keep = float(self.config.m_IntegrationTime)
+
+        def accepts(ms: float) -> bool:
+            self.config.m_IntegrationTime = float(ms)
+            self._prepared = False
+            try:
+                self._call("AVS_PrepareMeasure", byref(self.config))
+            except AvantesError as e:
+                if e.name == "ERR_INVALID_INT_TIME":
+                    return False
+                raise                       # not a range question — give up
+            return True
+
+        try:
+            lo, hi = MIN_INTEGRATION_MS, 2.0   # 2 ms: above every documented min
+            if accepts(lo):
+                return lo
+            if not accepts(hi):
+                return MIN_INTEGRATION_MS      # unexpected; the write-time
+            while hi - lo > 1e-4:              # check still guards the device
+                mid = (lo + hi) / 2
+                if accepts(mid):
+                    hi = mid
+                else:
+                    lo = mid
+            # Snap to whole microseconds. Bisection converges from above, so
+            # the raw answer is a hair over the real limit (9.012 us for a 9 us
+            # sensor) — an ugly number to show, and one that needlessly refuses
+            # the round value the datasheet quotes. Tested, not assumed: if the
+            # rounded-down value is refused, keep the one known to work.
+            snapped = math.floor(hi * 1000.0) / 1000.0
+            return snapped if snapped >= MIN_INTEGRATION_MS and accepts(snapped) \
+                   else hi
+        except (AvantesError, RuntimeError):
+            # A probe is a nicety; never let it fail a connect.
+            return MIN_INTEGRATION_MS
+        finally:
+            self.config.m_IntegrationTime = keep
+            self._prepared = False
+
     # ── identity ────────────────────────────────────────────────────────────
     @property
     def wavelengths(self) -> np.ndarray:
@@ -1116,22 +1202,38 @@ class AvaSpec:
     def set_integration_time(self, ms: float) -> None:
         """Exposure per scan, in milliseconds.
 
-        Range-checked against the LIBRARY's documented bounds only. A given
-        sensor is usually narrower — the ULS4096CL-EVO datasheet says
-        9 µs – 40 s against the library's 2 µs – 600 s — and the DLL answers
-        ERR_INVALID_INT_TIME (-11) for whatever it cannot do. The device stays
-        the authority; this check exists so an obvious slip (0, a negative, a
-        seconds-for-milliseconds mix-up) is named here instead of coming back
-        as a bare -11 from the next PrepareMeasure.
+        Checked twice, because a wrong exposure is otherwise invisible until
+        it breaks something far away. First against `min_integration_ms` —
+        probed from this sensor at connect, not the library's much wider bound
+        — so an obvious slip (0, a negative, a seconds-for-milliseconds
+        mix-up) is named here. Then by pushing it to the device: the sensor
+        may refuse a value the probe suggested was fine (heavy averaging
+        narrows the range), and it must refuse it NOW rather than at the next
+        acquire() on somebody else's thread. A refused value leaves the
+        device on the exposure it already had.
         """
         ms = float(ms)
-        if not MIN_INTEGRATION_MS <= ms <= MAX_INTEGRATION_MS:
+        if not self.min_integration_ms <= ms <= self.max_integration_ms:
             raise ValueError(
-                f"integration time must be between {MIN_INTEGRATION_MS} and "
-                f"{MAX_INTEGRATION_MS:g} ms, got {ms:g}. (The sensor's own "
-                f"range may be narrower still.)")
+                f"integration time must be between {self.min_integration_ms:g} "
+                f"and {self.max_integration_ms:g} ms for this sensor, got "
+                f"{ms:g}.")
+        prev = float(self.config.m_IntegrationTime)
         self.config.m_IntegrationTime = ms
-        self._invalidate()
+        try:
+            self._push_config(
+                lambda: setattr(self.config, "m_IntegrationTime", prev))
+        except AvantesError as e:
+            if e.name == "ERR_INVALID_INT_TIME":
+                # A value problem, not a device fault, so say so as one — the
+                # bare -11 is what this whole path exists to avoid.
+                raise ValueError(
+                    f"The sensor refused an exposure of {ms:g} ms. It accepts "
+                    f"{self.min_integration_ms:g} to "
+                    f"{self.max_integration_ms:g} ms, and can be narrower at "
+                    f"{self.n_averages} on-board averages. The exposure is "
+                    f"unchanged at {prev:g} ms.") from None
+            raise
 
     @property
     def n_averages(self) -> int:
@@ -1147,8 +1249,22 @@ class AvaSpec:
         n = int(n)
         if n < 1:
             raise ValueError(f"averages must be >= 1, got {n}")
+        prev = int(self.config.m_NrAverages)
         self.config.m_NrAverages = n
-        self._invalidate()
+        try:
+            self._push_config(
+                lambda: setattr(self.config, "m_NrAverages", prev))
+        except AvantesError as e:
+            # The device refuses some exposure/averaging combinations outright
+            # (the manual's example is 600 s at more than 5000 averages), and
+            # it is the pairing that is wrong, not either number alone.
+            if e.name in ("ERR_INVALID_COMBINATION", "ERR_INVALID_INT_TIME",
+                          "ERR_INVALID_MEASPARAM_AVG_SAT2"):
+                raise ValueError(
+                    f"The sensor refused {n} on-board averages at an exposure "
+                    f"of {self.integration_ms:g} ms. Averaging is unchanged at "
+                    f"{prev}.") from None
+            raise
 
     @property
     def frame_time_ms(self) -> float:

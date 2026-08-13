@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QLabel, QDoubleSpinBox, QSpinBox, QCheckBox, QPushButton,
     QProgressBar, QFrame, QScrollArea, QSizePolicy, QStatusBar, QFileDialog,
     QDialog, QToolBar, QSlider, QLineEdit, QMenu, QComboBox, QRubberBand,
-    QMessageBox, QInputDialog
+    QMessageBox, QInputDialog, QAbstractSpinBox
 )
 from PySide6.QtCore import (Qt, QTimer, QThread, Signal, QPointF, QSize, QRect,
                             QRectF, QPoint, QSignalBlocker)
@@ -386,11 +386,19 @@ class LiveFeedWorker(QThread):
     safely take over the shared stage/spectrometer.
     """
     spectrum_ready = Signal(object, object)   # (wavelengths, raw counts)
+    # A device that has started refusing to acquire. Emitted on the first
+    # failure and then at most every FAIL_REPORT_S while it persists, because
+    # the alternative — the loop quietly retrying forever — is indistinguishable
+    # from "the setting I just changed did nothing": the plot simply stops
+    # updating and holds the last good frame.
+    acquire_failed = Signal(str)
+    FAIL_REPORT_S = 3.0
 
     def __init__(self, get_spec, min_interval_ms=30, parent=None):
         super().__init__(parent)
         self._get_spec = get_spec
         self._min = float(min_interval_ms)
+        self._last_fail_report = 0.0
         self._run = True
         self._paused = True
         self._idle = threading.Event()   # set whenever not mid-acquire
@@ -417,9 +425,15 @@ class LiveFeedWorker(QThread):
                 raw = np.asarray(spec.acquire(), float)
                 wl  = np.asarray(spec.wavelengths, float)
                 elapsed_ms = (time.monotonic() - t0) * 1000.0
-            except Exception:
+            except Exception as e:
+                now = time.monotonic()
+                if now - self._last_fail_report >= self.FAIL_REPORT_S:
+                    self._last_fail_report = now
+                    if self._run and not self._paused:
+                        self.acquire_failed.emit(str(e))
                 self.msleep(50)
                 continue
+            self._last_fail_report = 0.0     # recovered — report the next one
             if self._run and not self._paused:
                 self.spectrum_ready.emit(wl, raw)
             # Pace to the integration time; acquire already consumed `elapsed_ms`
@@ -458,6 +472,35 @@ class LiveFeedWorker(QThread):
 # not release the hardware in time.
 FEED_BUSY_MSG = ("Live feed is still mid-acquisition — try again in a moment "
                  "(or stop the feed first).")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Exposure-box plumbing
+# ─────────────────────────────────────────────────────────────────────────────
+# Longest exposure the integration box will offer, whatever the device claims.
+# A GUI policy, not a hardware limit: acquire() blocks for the whole exposure,
+# so a device that will happily take its documented 600 s would leave the app
+# looking hung, with the feed unable to park and every dialog answering
+# FEED_BUSY_MSG. Type-in of a longer value is not something the app needs.
+MAX_UI_EXPOSURE_MS = 10_000.0
+
+
+def _exposure_ms(spec) -> float:
+    """What the integration box should SHOW for `spec`.
+
+    The exposure, never the frame time: the box writes set_integration_time(),
+    so seeding it from a frame cost that folds in on-board averaging would
+    make every later edit multiply the exposure by the average count.
+    """
+    return float(getattr(spec, "exposure_ms",
+                         getattr(spec, "integration_ms", 10.0)))
+
+
+def _exposure_bounds(spec) -> tuple[float, float]:
+    """(min, max) exposure in ms the integration box may offer for `spec`."""
+    lo = float(getattr(spec, "min_integration_ms", 1.0))
+    hi = float(getattr(spec, "max_integration_ms", MAX_UI_EXPOSURE_MS))
+    return lo, min(hi, MAX_UI_EXPOSURE_MS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2736,6 +2779,7 @@ class FrogWindow(QMainWindow):
         # FIX 2/3 — acquisition runs on a worker thread, paced to integration.
         self._feed = LiveFeedWorker(lambda: self.spec)
         self._feed.spectrum_ready.connect(self._on_spectrum)
+        self._feed.acquire_failed.connect(self._on_feed_error)
         self._feed.start()
         if self.btn_feed.isChecked():
             self._feed.resume()
@@ -2905,7 +2949,13 @@ class FrogWindow(QMainWindow):
                 # Any single device replaces a stitched pair wholesale — the
                 # slot->member mapping is only meaningful while the pair lives.
                 self._multi_members = [None, None]
-            self.spec.set_integration_time(self.spin_integration.value())
+            # Clamped to the INCOMING device's range: the box still carries the
+            # outgoing device's value, and 0.05 ms from an Avantes is a hard
+            # error on an Ocean unit with a 1 ms floor. _sync_multi_ui below
+            # reseeds the box from whatever the new device ended up with.
+            lo, hi = _exposure_bounds(new_spec)
+            self.spec.set_integration_time(
+                min(hi, max(lo, float(self.spin_integration.value()))))
             # The old device's frames and dark are meaningless for the new one
             # — and a different pixel count (certain with a stitched grid)
             # would crash the dark subtraction outright.
@@ -3711,8 +3761,15 @@ class FrogWindow(QMainWindow):
         lay.addWidget(self.btn_feed)
         self.lbl_integration = QLabel("Integration Time")
         lay.addWidget(self.lbl_integration)
-        self.spin_integration = SpinBox()
-        self.spin_integration.setRange(1, 10000); self.spin_integration.setValue(10)
+        # Floating point, because the range is the DEVICE's: an Avantes goes
+        # down to 2 us, so a whole-millisecond box would put most of its usable
+        # exposure range out of reach. Range, decimals and step are all seeded
+        # from the live device by _seed_integration_spin — an Ocean box that
+        # cannot do sub-ms keeps its whole-millisecond look.
+        self.spin_integration = DoubleSpinBox()
+        self.spin_integration.setDecimals(0)
+        self.spin_integration.setRange(1.0, MAX_UI_EXPOSURE_MS)
+        self.spin_integration.setValue(10.0)
         self.spin_integration.setSuffix("  ms")
         # Debounced: set_integration_time is a device call, so it has to take
         # the hardware off the feed thread first. Doing that on every spinbox
@@ -3731,8 +3788,10 @@ class FrogWindow(QMainWindow):
         # — the same numbering as the saturation lamps and the Multi-Spec menu.
         self.lbl_integration2 = QLabel("Integration Time — S2")
         lay.addWidget(self.lbl_integration2)
-        self.spin_integration2 = SpinBox()
-        self.spin_integration2.setRange(1, 10000); self.spin_integration2.setValue(10)
+        self.spin_integration2 = DoubleSpinBox()
+        self.spin_integration2.setDecimals(0)
+        self.spin_integration2.setRange(1.0, MAX_UI_EXPOSURE_MS)
+        self.spin_integration2.setValue(10.0)
         self.spin_integration2.setSuffix("  ms")
         # Same debounce timer as S1 on purpose: editing both boxes then costs
         # ONE feed handover instead of two, and a handover blocks until the
@@ -3992,22 +4051,14 @@ class FrogWindow(QMainWindow):
                                      else "Integration Time")
         self.lbl_integration2.setVisible(stitched)
         self.spin_integration2.setVisible(stitched)
-        if len(slots) == 2:
-            for mem, spin in zip(slots, (self.spin_integration,
-                                         self.spin_integration2)):
-                ms = int(round(float(getattr(mem, "integration_ms", 10.0))))
-                # Blocked: seeding must not restart the debounce, or 250 ms
-                # later we would take another feed handover to write back a
-                # value the device already holds.
-                with QSignalBlocker(spin):
-                    spin.setValue(max(1, min(10000, ms)))
-        else:
+        if len(slots) != 2:
             # No live pair: the per-spectrometer view has nothing to show.
             if self.btn_overlay.isChecked():
                 with QSignalBlocker(self.btn_overlay):
                     self.btn_overlay.setChecked(False)
             self._overlay_on = False
             self.canvas.clear_members()
+        self._sync_integration_ui()
         self._refresh_overlay_button()
         self._refresh_avantes_button()
 
@@ -4025,21 +4076,46 @@ class FrogWindow(QMainWindow):
         elif devices and self.dlg_avantes.isVisible():
             self.dlg_avantes._refresh()  # a swap may have changed which device
 
-    def _sync_integration_ui(self):
-        """Reseed the integration spinbox(es) from the live device.
+    @staticmethod
+    def _seed_integration_spin(spin, dev):
+        """Point one exposure box at `dev`: range, resolution, step and value.
 
-        Needed when something OTHER than the spinbox changes what one frame
-        costs — on-board averaging on an Avantes is the case that exists. The
-        signal blocker matters: seeding must not restart the debounce, or 250 ms
-        later we take another feed handover to write back a value the device
-        already holds.
+        The range is the device's, so sub-millisecond exposures appear only on
+        hardware that actually has them and the box cannot be used to ask for
+        something the SDK will refuse. Resolution follows: microsecond steps
+        would be noise on a device with a 1 ms floor, and adaptive stepping
+        keeps the arrows useful across a range that now spans four decades.
+
+        Blocked throughout: seeding must not restart the debounce, or 250 ms
+        later we take a feed handover to write back a value the device already
+        holds.
         """
-        if isinstance(self.spec, StitchedSpectrometer):
-            self._sync_multi_ui()
-            return
-        ms = int(round(float(getattr(self.spec, "integration_ms", 10.0))))
-        with QSignalBlocker(self.spin_integration):
-            self.spin_integration.setValue(max(1, min(10000, ms)))
+        lo, hi = _exposure_bounds(dev)
+        sub_ms = lo < 1.0
+        with QSignalBlocker(spin):
+            spin.setDecimals(3 if sub_ms else 0)   # before setRange: it rounds
+            spin.setRange(lo, hi)
+            spin.setStepType(QAbstractSpinBox.AdaptiveDecimalStepType if sub_ms
+                             else QAbstractSpinBox.DefaultStepType)
+            spin.setSingleStep(1.0)
+            spin.setValue(min(hi, max(lo, _exposure_ms(dev))))
+
+    def _sync_integration_ui(self):
+        """Reseed the integration spinbox(es) from the live device(s).
+
+        Needed whenever the device behind a box changes, and whenever
+        something OTHER than the box changes the exposure it should be
+        showing. A live pair takes one box per member, from that member's own
+        limits — the two halves of a mixed-vendor pair do not share a range.
+        """
+        slots = (self._slot_members()
+                 if isinstance(self.spec, StitchedSpectrometer) else [])
+        if len(slots) == 2:
+            for mem, spin in zip(slots, (self.spin_integration,
+                                         self.spin_integration2)):
+                self._seed_integration_spin(spin, mem)
+        else:
+            self._seed_integration_spin(self.spin_integration, self.spec)
 
     def _refresh_overlay_button(self):
         """Icon, tooltip and availability of the per-spectrometer view toggle.
@@ -4181,6 +4257,17 @@ class FrogWindow(QMainWindow):
         self._judge_lamp(0, raw, full)
 
     # ── Live feed ─────────────────────────────────────────────────────────────
+    def _on_feed_error(self, msg):
+        """Slot for LiveFeedWorker.acquire_failed — runs on the GUI thread.
+
+        The live feed cannot stop on a failed frame (a device is allowed the
+        occasional hiccup, and the loop must keep trying), but it must not
+        swallow one either: a plot frozen on its last good frame reads as "the
+        setting I just changed did nothing" rather than as an error. The worker
+        throttles the repeats, so this only ever shows a live problem.
+        """
+        self.status.showMessage(f"Live feed: {msg}", 6000)
+
     def _on_spectrum(self, wl, raw):
         """Slot for LiveFeedWorker.spectrum_ready — runs on the GUI thread.
 
@@ -4196,9 +4283,6 @@ class FrogWindow(QMainWindow):
         if p > self._sat_peak:
             self._sat_peak = p
             self._sat_frame = raw
-        if self._pending_fit:
-            self._pending_fit = False
-            QTimer.singleShot(150, self._autofit_spectrum)
         # NB: no stage read here. Polling get_position() at feed rate raced the
         # feed thread's own acquire() (which, for the simulator, itself reads
         # the stage). The readout is instead refreshed after every move we make
@@ -4219,6 +4303,7 @@ class FrogWindow(QMainWindow):
         self._sat_frame = None
         self._sat_peak = -1.0
         if self._overlay_on and self._render_overlay():
+            self._flush_pending_fit()
             return
         spectrum = raw
         if self.chk_dark.isChecked() and self.background is not None:
@@ -4227,6 +4312,21 @@ class FrogWindow(QMainWindow):
         # raw-ADC property, the calibration is display/data physics.
         spectrum = self.spec.calibrate(spectrum)
         self.canvas.update_spectrum(wl, spectrum)
+        self._flush_pending_fit()
+
+    def _flush_pending_fit(self):
+        """Run the one-shot fit a device swap queued, once its first frame is
+        actually on the axes.
+
+        Driven from the render, not from frame arrival: fit_xy() fits to what
+        the curves currently hold, and arrival leads the render by up to one
+        display tick. Fitting on arrival therefore had to guess a delay long
+        enough to outlast the tick, and on a starved event loop it guessed
+        wrong and fitted the OUTGOING device's wavelength range.
+        """
+        if self._pending_fit:
+            self._pending_fit = False
+            self._autofit_spectrum()
 
     def _render_overlay(self):
         """Draw one curve per stitched member. False = nothing to draw yet, so
@@ -4316,12 +4416,18 @@ class FrogWindow(QMainWindow):
                     for i, (mem, spin) in enumerate(
                             zip(slots, (self.spin_integration,
                                         self.spin_integration2))):
-                        ms = spin.value()
-                        if float(getattr(mem, "integration_ms", -1.0)) == float(ms):
+                        ms = float(spin.value())
+                        # Compared at the box's own resolution, not exactly:
+                        # the Avantes stores the exposure as a C float, so
+                        # 0.02 ms reads back as 0.019999999552965164 and an
+                        # equality test would rewrite both devices — and take
+                        # a feed handover — every time the debounce fired.
+                        dp = spin.decimals()
+                        if round(_exposure_ms(mem), dp) == round(ms, dp):
                             continue   # already there — don't disturb the device
                         self.spec.set_member_integration_time(
                             self.spec.member_index(mem), ms)
-                        changed.append(f"S{i + 1} {ms} ms")
+                        changed.append(f"S{i + 1} {ms:g} ms")
                 else:
                     self.spec.set_integration_time(self.spin_integration.value())
             except Exception as e:
