@@ -288,12 +288,33 @@ Thorlabs stage.
 **Long moves are split up.** A move blocks until the stage has settled and
 nothing in the app can interrupt one, so a mistyped target or a fs/um mix-up
 would otherwise become a single full-speed traverse across the travel. Any move
-longer than `StageBase.max_step_mm` (**5 mm**, the same for every adapter; set it
-to 0 to switch this off) is instead carried out as a run of sub-moves of at most
-that far, each settling before the next is issued, and the status bar reports the
-split. The stage still lands on exactly the position you asked for — the last
-sub-move is the target itself — and the backlash approach above is unaffected.
-Scan points are microns apart, so a scan never trips it.
+longer than `StageBase.max_step_mm` (**5 mm** by default; set it to 0 to switch
+this off, as `PiezoJenaStage` does — its whole travel is 0.32 mm, so the split
+could never fire and the readback it costs before every move is pure serial
+traffic) is instead carried out as a run of sub-moves of at most that far, each
+settling before the next is issued, and the status bar reports the split. The
+stage still lands on exactly the position you asked for — the last sub-move is
+the target itself — and the backlash approach above is unaffected. Scan points
+are microns apart, so a scan never trips it.
+
+**Piezo Jena stages.** This controller emits unsolicited output — a power-up
+banner such as `NV1CL V1.236>` — that arrives mid-conversation and means the box
+has just rebooted *out of* remote and closed-loop mode, where `wr` does nothing.
+Every reply is therefore checked against the prefix it must start with (`rd,`
+for a position), not merely parsed for a number: `err,2` happens to contain a
+comma and used to be accepted as a position of 0.002 mm, which is far worse than
+an error. Both the readback and the move get `PiezoJenaStage.NTRIES` (**3**)
+attempts, and each retry re-asserts `i1`/`cl` and re-issues the move — that is
+what recovers a rebooted controller rather than giving up on it. The acceptance
+window is the stage's own `resolution_mm` (0.1 um).
+
+If a move still has not landed after all of that, the adapter **latches the
+reason in `position_fault()` instead of raising**. That routes it into the scan's
+normal stage-health path: the column is flagged with the reason, tagged with the
+position the stage really reached, and the scan stops only if
+`abort_on_stage_fault` is set. Previously any single bad reply raised straight
+past the scan worker, so the whole scan — every column already measured —
+was discarded.
 
 **Zaber stages.** Two Zaber-specific things are worth knowing.
 
@@ -334,7 +355,11 @@ intensity calibration to each connected spectrometer: a two-column text file
 frozen build — the folder is user-editable, drop new files in or use *Add new
 calibration…* in the menu). The factors are interpolated onto the device's
 pixel grid and multiply every displayed and recorded spectrum. Saturation is
-always judged on **raw** ADC counts, before calibration.
+always judged on **raw** ADC counts, before calibration. A file with the odd
+malformed line still loads — the bad lines are skipped and counted in the
+status message — but a file that cannot be read at all pops a dialog and the
+device keeps whatever it had, so a menu label can never claim a calibration
+the spectrometer is not actually carrying.
 
 **Multi-spectrometer mode.** Either slot takes a device from either vendor, so
 an Avantes and an Ocean spectrometer stitch together like two of a kind.
@@ -343,14 +368,32 @@ toolbar's **Multi-Spec** menu opens two slots, each with its own spectrometer
 and calibration submenu; once both slots are filled the pair connects
 automatically as one stitched device (`StitchedSpectrometer`): spectra are
 interpolated onto a common grid, each device's own calibration file is
-applied first, and the two are averaged across the overlap (the ranges must
-overlap). *Auto-stitch* least-squares-matches the bluer spectrometer to the
-redder one over the overlap (do this with light spanning the overlap);
+applied first, and the two are crossfaded across the overlap band (the ranges
+must overlap). *Auto-stitch* least-squares-matches the bluer spectrometer to
+the redder one over that band (do this with light spanning the overlap);
 *Manual stitch…* enters the factor by hand. Entering the mode adds a second
 saturation lamp to the status bar: each device's RAW frames are judged
 against that device's own full scale, both live and during scans, so either
 detector clipping trips its own alarm. *Disable multi-spectrometer mode*
 keeps the slot-1 spectrometer connected as a normal single device.
+
+**The overlap band.** The range the two devices geometrically share always
+includes both detectors' dead edges — where the bluer one's sensitivity has
+fallen away and the redder one's has not yet risen. Those samples are at the
+noise floor and each calibration factor is at its steepest there, so they feed
+the fit maximum noise and no information. *Overlap band…* in the Multi-Spec
+menu sets the sub-range actually used: the stitch factor is fitted over it, and
+the two spectra are crossfaded across it with a raised cosine — the bluer
+device alone below, the redder alone above — so there is no seam and the dead
+edges never reach the merged curve. It defaults to the central 90% of the
+shared range and is shaded **green** in the per-spectrometer view, so you can
+see what the fit is using. *Auto-stitch* reports a **residual mismatch**
+alongside the factor (also shown in the menu): that number is the answer to
+"is one scalar enough for this pair?" — a few percent means the two calibrated
+curves genuinely agree across the band; a large one means a calibration is
+wrong or the band is too wide. *Auto-stitch* subtracts the recorded dark from
+both members before fitting, so a long-exposure member's pedestal cannot be
+matched instead of the light.
 
 Each slot also offers a **simulated** member — *Simulated — blue half* and
 *Simulated — red half*, listed above the real devices and available even with

@@ -32,18 +32,47 @@ from pathlib import Path
 
 C_NM_PER_FS = 299.792458   # speed of light, nm/fs (used only by the simulator)
 
+# Fraction of the geometric overlap a stitched pair fits and crossfades over by
+# default, centred — so the outer 5% at each end, where both detectors are at
+# their noise floor, is excluded until the operator says otherwise. See
+# StitchedSpectrometer.
+OVERLAP_BAND_FRAC = 0.90
 
-def load_calibration_file(path) -> tuple[np.ndarray, np.ndarray]:
+
+def load_calibration_file(path) -> tuple[np.ndarray, np.ndarray, int]:
     """Parse an intensity-calibration text file: two whitespace-separated
     columns, wavelength (nm) and multiplicative factor, '#' comments allowed.
-    Returns (wavelengths, factors) sorted by wavelength."""
-    data = np.atleast_2d(np.loadtxt(path, comments="#"))
+    Returns (wavelengths, factors, n_skipped) sorted by wavelength.
+
+    Rows that do not carry two parseable numbers are SKIPPED rather than
+    fatal, and counted in n_skipped so the caller can say so. A single ragged
+    line — an editor's stray trailing field, a truncated export — used to take
+    np.loadtxt down with "the number of columns changed", which the GUI then
+    turned into a transient message while the device silently stayed on raw
+    counts. A file is only rejected when fewer than two usable rows survive.
+    """
+    try:
+        data = np.atleast_2d(np.loadtxt(path, comments="#", usecols=(0, 1)))
+        skipped = 0
+    except ValueError:
+        rows, skipped = [], 0
+        with open(path, "r") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                fields = line.split()
+                try:
+                    rows.append((float(fields[0]), float(fields[1])))
+                except (IndexError, ValueError):
+                    skipped += 1
+        data = np.atleast_2d(np.asarray(rows, float).reshape(-1, 2))
     if data.shape[0] < 2 or data.shape[1] < 2:
         raise RuntimeError(
             f"{Path(path).name}: expected two columns (wavelength_nm factor) "
             f"with at least two rows, got data of shape {data.shape}.")
     order = np.argsort(data[:, 0])
-    return data[order, 0], data[order, 1]
+    return data[order, 0], data[order, 1], skipped
 
 
 # ===========================================================================
@@ -100,6 +129,11 @@ class StageBase(abc.ABC):
     # until homed. Adapters that can tell set this; the GUI refuses to adopt a
     # zero-delay position from a stage that reports it.
     needs_homing:  bool = False
+    # Smallest move the axis can resolve, in mm, or None when the adapter does
+    # not know. This is what defines "arrived": a settle window narrower than
+    # the resolution can never close, and one wider than it throws away
+    # accuracy the stage actually has.
+    resolution_mm: float | None = None
 
     def move_to(self, position_mm: float) -> None:
         """Absolute move to position_mm; blocks until settled.
@@ -272,20 +306,32 @@ class SpectrometerBase(abc.ABC):
     # of raw ADC counts, so consumers must check saturation on acquire()'s
     # output and only then run it through calibrate().
     calibration_name: str | None = None
+    # How many malformed lines the loaded file had. Non-zero means the file
+    # parsed but was not clean, which the GUI reports — a calibration is data
+    # the operator has to trust, so a partial read must never pass silently.
+    calibration_skipped: int = 0
     _cal_pixels: np.ndarray | None = None
 
-    def set_calibration(self, path) -> None:
+    def set_calibration(self, path) -> int:
         """Load a calibration file (see load_calibration_file) and hold it
         interpolated onto this device's pixel grid. Pixels outside the file's
-        wavelength range hold the edge factor rather than extrapolating."""
-        wl, fac = load_calibration_file(path)
+        wavelength range hold the edge factor rather than extrapolating.
+
+        Returns the number of malformed lines skipped. Nothing on the device is
+        touched until the file has parsed, so a failed load leaves the previous
+        calibration (or raw counts) in place rather than a half-applied one.
+        """
+        wl, fac, skipped = load_calibration_file(path)
         self._cal_pixels = np.interp(np.asarray(self.wavelengths, float),
                                      wl, fac)
         self.calibration_name = Path(path).stem
+        self.calibration_skipped = skipped
+        return skipped
 
     def clear_calibration(self) -> None:
         self._cal_pixels = None
         self.calibration_name = None
+        self.calibration_skipped = 0
 
     def calibrate(self, counts: np.ndarray) -> np.ndarray:
         """Apply the loaded intensity calibration (identity when none)."""
@@ -828,21 +874,54 @@ class PiezoJenaStage(StageBase):
     backlash_mm stays 0: a closed-loop flexure piezo has no screw and therefore
     no backlash, and "rd" is a real measurement rather than a step counter, so
     every move verifies itself against the stage's own 0.1 um resolution.
+
+    Recovering from a confused controller
+    -------------------------------------
+    This controller emits unsolicited output — a power-up/reset banner such as
+    b"NV1CL V1.236>" — that lands in the middle of a conversation, has no
+    trailing newline, and means the box has just rebooted OUT of remote and
+    closed-loop mode. Two consequences drive the design here:
+
+      * Every reply is validated against the prefix it must start with. Testing
+        only "does float() parse the tail after the last comma" accepted
+        b"err,2" as a position of 0.002 mm — a wrong position that reads as a
+        perfectly good one is far worse than an exception.
+      * Both the READ and the MOVE get NTRIES attempts, and each retry
+        re-asserts "i1"/"cl" first, because a rebooted controller has silently
+        dropped the modes that make "wr" do anything at all.
+
+    When a move still has not landed after all of that, _move_to_raw latches
+    the reason in position_fault() and returns instead of raising. That routes
+    the failure into the scan's own stage-health path, which records it against
+    the column, reports the position the stage really is at, and stops the scan
+    only when abort_on_stage_fault is set — instead of an exception unwinding
+    past the whole scan and discarding every column already measured.
     """
-    _TOL_UM = 0.1   # settle tolerance = the stage's own resolution
+    NTRIES = 3          # attempts per readback, and per move
+    SETTLE_TIMEOUT_S = 5.0     # how long one move attempt gets to land
+    QUERY_TIMEOUT_S = 0.5      # per reply — see _read_reply
+    _EOL = b"\r\n"      # command terminator, probe included
+    resolution_mm = 0.0001                   # 0.1 um, the controller's own step
+    _TOL_UM = resolution_mm * 1000.0         # settle window = that step
+    # Travel is 0.32 mm against StageBase's 5 mm default, so the long-move
+    # split can never fire — but a non-zero value makes move_to() take an extra
+    # get_position() before EVERY move. Zero takes the no-readback fast path:
+    # half the serial traffic per move, and one less chance to catch a banner.
+    max_step_mm = 0.0
 
     def __init__(self, port: str | None = None, travel_um: float = 320.0,
                  probe_timeout_s: float = 0.5):
         import serial
 
         self._ser = None
+        # Latched reason the readback cannot be trusted, published through
+        # position_fault(). Set before _open so a failure in there still leaves
+        # a well-formed object for disconnect() to clean up.
+        self._fault: str | None = None
         self._ser, used_port = self._open(port, probe_timeout_s, serial)
         try:
-            self._ser.timeout = 2.0        # working timeout, per readline
-            self._command(b"i1")           # remote-control mode
-            time.sleep(0.05)
-            self._command(b"cl")           # closed-loop mode
-            time.sleep(0.05)
+            self._ser.timeout = self.QUERY_TIMEOUT_S   # working, per read
+            self._assert_modes()
             self.travel_mm = travel_um / 1000.0
             self.name = f"Piezo Jena [{used_port}]"
         except Exception:
@@ -879,7 +958,7 @@ class PiezoJenaStage(StageBase):
                 ser = serial.Serial(p, baudrate=9600,
                                     timeout=probe_timeout_s)
                 ser.reset_input_buffer()
-                ser.write(b"hello\r")
+                ser.write(b"hello" + self._EOL)   # same terminator as _command
                 if ser.readline().startswith(b"err,2"):
                     return ser, p
                 ser.close()
@@ -897,33 +976,142 @@ class PiezoJenaStage(StageBase):
             f"({', '.join(ports)}). Last error: {last_err}")
 
     def _command(self, cmd: bytes) -> None:
-        self._ser.write(cmd + b"\r\n")
+        self._ser.write(cmd + self._EOL)
 
-    def _move_to_raw(self, position_mm: float) -> None:
-        # Clamp instead of raising: the scan worker pre-checks its targets
-        # against travel_mm, so anything out of range here is a manual move.
-        target_um = min(max(float(position_mm) * 1000.0, 0.0),
-                        self.travel_mm * 1000.0)
-        self._command(b"wr,%.2f" % target_um)
-        deadline = time.monotonic() + 5.0
-        while abs(self.get_position() * 1000.0 - target_um) > self._TOL_UM:
-            if time.monotonic() > deadline:
-                raise RuntimeError(
-                    f"Stage did not settle at {target_um:.2f} um within 5 s "
-                    f"(readback {self.get_position() * 1000.0:.2f} um).")
-            time.sleep(0.05)
+    def _assert_modes(self) -> None:
+        """Put the controller into remote + closed-loop mode.
+
+        Neither command answers, so there is nothing to verify — but it is
+        cheap and idempotent, which is what makes it usable as the first step
+        of a retry: a controller that emitted a reset banner has dropped both
+        modes, and until they are back "wr" is quietly ignored.
+        """
+        self._command(b"i1")           # remote-control mode
+        time.sleep(0.05)
+        self._command(b"cl")           # closed-loop mode
+        time.sleep(0.05)
+
+    def _read_reply(self) -> bytes:
+        """One reply, terminator or timeout.
+
+        Unterminated output (the banner has no newline) costs the full read
+        timeout — there is no way to know a line has ended early. That is why
+        the port runs at QUERY_TIMEOUT_S rather than seconds: a "rd" answer is
+        ~10 bytes, about 10 ms at 9600 baud, so the timeout only ever elapses
+        when something is already wrong, and NTRIES of them stay well inside
+        one settle deadline. Anything that arrived late is swept up too, so it
+        cannot masquerade as the next command's answer.
+        """
+        reply = self._ser.read_until(b"\n")
+        if not reply.endswith(b"\n"):
+            extra = getattr(self._ser, "in_waiting", 0) or 0
+            if extra:
+                reply += self._ser.read(extra)
+        return reply
+
+    def _query(self, cmd: bytes, prefix: bytes) -> bytes:
+        """Send `cmd` and return the first reply that starts with `prefix`.
+
+        Up to NTRIES attempts. A reply that does not match is discarded, the
+        input drained, and the controller's modes re-asserted before asking
+        again — that sequence is what recovers from a reset banner instead of
+        giving up on it.
+
+        Matching on the prefix rather than on "parses as a number" is the point
+        of the helper: b"err,2" would otherwise be read as a position.
+        """
+        seen = []
+        for attempt in range(self.NTRIES):
+            if attempt:
+                # Something is out of step: clear both directions and put the
+                # controller back into the mode it answers in.
+                try:
+                    self._ser.reset_input_buffer()
+                    self._ser.reset_output_buffer()
+                except Exception:
+                    pass
+                self._assert_modes()
+            self._ser.reset_input_buffer()
+            self._command(cmd)
+            reply = self._read_reply()
+            if reply.startswith(prefix):
+                return reply
+            seen.append(reply)
+        raise RuntimeError(
+            f"Piezo Jena stage gave no usable {cmd.decode()} reply in "
+            f"{self.NTRIES} attempts (expected {prefix.decode()!r}, got "
+            f"{', '.join(repr(r) for r in seen)}).")
 
     def get_position(self) -> float:
-        # Reply looks like b"rd,123.4\r\n" — the value follows the last comma.
-        self._ser.reset_input_buffer()
-        self._command(b"rd")
-        reply = self._ser.readline()
+        # Reply looks like b"rd,123.4\r\n" — the value follows the comma.
+        reply = self._query(b"rd", b"rd,")
         try:
-            return float(reply[reply.rfind(b",") + 1:]) / 1000.0
+            return float(reply[reply.find(b",") + 1:]) / 1000.0
         except ValueError:
             raise RuntimeError(
                 f"Piezo Jena stage gave no usable position readback "
                 f"(reply: {reply!r}).") from None
+
+    def _move_to_raw(self, position_mm: float) -> None:
+        """Command an absolute move and wait for it to land.
+
+        Each attempt re-asserts the modes and re-issues "wr" — a controller
+        that reset simply never acted on the previous one. After NTRIES the
+        fault is LATCHED rather than raised: the stage is wherever it is, that
+        position is readable and honest, and the scan is entitled to record it
+        and carry on if abort_on_stage_fault is off.
+        """
+        # Clamp instead of raising: the scan worker pre-checks its targets
+        # against travel_mm, so anything out of range here is a manual move.
+        target_um = min(max(float(position_mm) * 1000.0, 0.0),
+                        self.travel_mm * 1000.0)
+        # Cleared per move, so position_fault() stays a plain read and each
+        # scan column only ever sees the fault from its own move.
+        self._fault = None
+        last_um = None
+        read_err = None
+        for attempt in range(self.NTRIES):
+            if attempt:
+                self._assert_modes()
+            self._command(b"wr,%.2f" % target_um)
+            deadline = time.monotonic() + self.SETTLE_TIMEOUT_S
+            while True:
+                try:
+                    last_um = self.get_position() * 1000.0
+                except RuntimeError as e:
+                    # The whole point of retrying: a controller that started
+                    # talking nonsense mid-settle gets its modes re-asserted
+                    # and the move re-issued, rather than taking the scan down.
+                    read_err = e
+                    break
+                if abs(last_um - target_um) <= self._TOL_UM:
+                    return
+                if time.monotonic() > deadline:
+                    break
+                time.sleep(0.05)
+        if last_um is None:
+            # Never got a single reading — there is no position to accept, so
+            # this one really is fatal.
+            raise RuntimeError(
+                f"Piezo Jena stage is not answering position queries, so the "
+                f"move to {target_um:.2f} um cannot be verified: {read_err}")
+        self._fault = (
+            f"stage did not reach {target_um:.2f} um in {self.NTRIES} attempts "
+            f"(readback {last_um:.2f} um, window ±{self._TOL_UM:g} um)")
+        if read_err is not None:
+            self._fault += f"; last readback error: {read_err}"
+
+    def position_fault(self) -> str | None:
+        """The last move's failure to land, or None.
+
+        Set by _move_to_raw and cleared at the start of the next move, so this
+        reports the CURRENT move rather than latching forever — the scan calls
+        it after every column.
+        """
+        return self._fault
+
+    def clear_position_faults(self) -> None:
+        self._fault = None
 
     def home(self) -> None:
         # No homing routine exists for this closed-loop piezo; raising keeps
@@ -1366,7 +1554,23 @@ class StitchedSpectrometer(SpectrometerBase):
     halves comparable — so calibrate() on the stitched device itself stays the
     identity and consumers cannot double-apply anything. spec1 is additionally
     scaled by `stitch_factor` (fit or set by hand) to absorb any residual
-    sensitivity mismatch; in the overlap the two contributions are averaged.
+    sensitivity mismatch.
+
+    The overlap band
+    ----------------
+    The GEOMETRIC overlap runs from spec2's first pixel to spec1's last, and it
+    always includes both detectors' dead edges — the region where spec1's
+    sensitivity has fallen off the red end and spec2's has not yet risen at the
+    blue end. There the counts sit at the noise floor and each member's
+    calibration factor is at its steepest, so those samples carry no
+    information while contributing maximum noise to a least-squares fit.
+
+    `band_lo_nm`/`band_hi_nm` name the sub-range that is actually used: the fit
+    is restricted to it, and the blend crossfades across it (spec1 alone below,
+    spec2 alone above, raised-cosine in between). Default is the central
+    OVERLAP_BAND_FRAC of the geometric overlap; set_band() moves it. A taper
+    rather than the old flat 50/50 average, which stepped at both seams and
+    dragged the dead edges into the merged curve.
 
     The two members hold INDEPENDENT integration times (see
     set_member_integration_time). Frames stay in raw counts, so the exposure
@@ -1398,11 +1602,22 @@ class StitchedSpectrometer(SpectrometerBase):
         # spectrometer grids are not perfectly uniform).
         dwl = min(float(np.median(np.diff(wl1))), float(np.median(np.diff(wl2))))
         self._wl = np.arange(wl1.min(), wl2.max(), dwl)
-        #  |-- spec1 only --|== overlap: average ==|-- spec2 only --|
+        #  |-- spec1 only --|== geometric overlap ==|-- spec2 only --|
         self._m1  = self._wl <= wl2.min()
         self._m2  = self._wl >= wl1.max()
         self._ovl = ~(self._m1 | self._m2)
+        # Geometric overlap bounds, the hard limits set_band() validates
+        # against. Taken from the members' ranges, not from self._wl, so a grid
+        # that stops a fraction of a pixel short cannot narrow them.
+        self.overlap_lo_nm = float(wl2.min())
+        self.overlap_hi_nm = float(wl1.max())
         self.stitch_factor = 1.0
+        # RMS relative mismatch left over after the last fit, or None if never
+        # fitted. This is what says whether ONE scalar is enough for this pair:
+        # small means the two calibrated curves really do agree across the
+        # band, large means a calibration is wrong or the band is too wide.
+        self.stitch_residual: float | None = None
+        self._set_default_band()
         self.name = f"stitched: {self.spec1.name} + {self.spec2.name}"
         self.max_counts = None
         # The intersection of the members' ranges: set_integration_time() on
@@ -1440,6 +1655,72 @@ class StitchedSpectrometer(SpectrometerBase):
         """
         return float(self.stitch_factor) if index == 0 else 1.0
 
+    # ── Overlap band ─────────────────────────────────────────────────────────
+    @property
+    def overlap_band(self) -> tuple[float, float]:
+        """(lo_nm, hi_nm) actually used for the fit and the crossfade."""
+        return (self.band_lo_nm, self.band_hi_nm)
+
+    @property
+    def geometric_overlap(self) -> tuple[float, float]:
+        """(lo_nm, hi_nm) where the two members' ranges intersect at all — the
+        hard bounds any band has to sit inside."""
+        return (self.overlap_lo_nm, self.overlap_hi_nm)
+
+    def _set_default_band(self) -> None:
+        """Centre a band covering OVERLAP_BAND_FRAC of the geometric overlap."""
+        lo, hi = self.overlap_lo_nm, self.overlap_hi_nm
+        margin = 0.5 * (hi - lo) * (1.0 - OVERLAP_BAND_FRAC)
+        self.set_band(lo + margin, hi - margin)
+
+    def reset_band(self) -> tuple[float, float]:
+        """Back to the default band. Returns the new (lo, hi)."""
+        self._set_default_band()
+        return self.overlap_band
+
+    def set_band(self, lo_nm: float, hi_nm: float) -> tuple[float, float]:
+        """Choose the sub-range of the overlap to fit and crossfade over.
+
+        Rejected rather than clamped when it does not fit inside the geometric
+        overlap: a band the operator typed is a statement about where the two
+        detectors agree, and silently moving it would leave the green marker in
+        the GUI showing something other than what the fit used.
+
+        Recomputes only the masks and the blend weights — the common grid and
+        the member masks are untouched, so a band change is free.
+        """
+        lo, hi = float(lo_nm), float(hi_nm)
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            raise RuntimeError("Overlap band bounds must be finite numbers.")
+        if lo >= hi:
+            raise RuntimeError(
+                f"Overlap band low bound ({lo:.2f} nm) must be below the high "
+                f"bound ({hi:.2f} nm).")
+        glo, ghi = self.overlap_lo_nm, self.overlap_hi_nm
+        if lo < glo - 1e-9 or hi > ghi + 1e-9:
+            raise RuntimeError(
+                f"Overlap band {lo:.2f}–{hi:.2f} nm lies outside the range the "
+                f"two spectrometers share ({glo:.2f}–{ghi:.2f} nm).")
+        self.band_lo_nm, self.band_hi_nm = lo, hi
+        # Fit mask: the band, on the common grid. Restricted to self._ovl too,
+        # so a band touching the geometric bounds can never pick up a sample
+        # where only one member has real pixels.
+        self._fit_mask = self._ovl & (self._wl >= lo) & (self._wl <= hi)
+        # Crossfade weight for spec1: 1 below the band, 0 above it, raised
+        # cosine across. Defined over the WHOLE grid so acquire() is one
+        # vectorised blend with no seams to line up by hand.
+        t = np.clip((self._wl - lo) / (hi - lo), 0.0, 1.0)
+        self._w1 = 0.5 * (1.0 + np.cos(np.pi * t))
+        # Outside each member's own pixel range np.interp holds the edge value,
+        # which is not data. Force the weight hard to the member that really
+        # covers that wavelength, whatever the ramp says.
+        self._w1[self._m1] = 1.0
+        self._w1[self._m2] = 0.0
+        # A stale fit is worse than none: the factor was chosen over a
+        # different set of samples, so its residual no longer describes it.
+        self.stitch_residual = None
+        return self.overlap_band
+
     def _sync_integration(self) -> None:
         """Recompute `integration_ms` from the members' current exposures.
 
@@ -1472,44 +1753,79 @@ class StitchedSpectrometer(SpectrometerBase):
         self.members[index].set_integration_time(ms)
         self._sync_integration()
 
-    def _acquire_pair(self) -> tuple[np.ndarray, np.ndarray]:
-        """One frame from each member, calibrated, on their native grids."""
+    def _acquire_pair(self, darks=None) -> tuple[np.ndarray, np.ndarray]:
+        """One frame from each member, calibrated, on their native grids.
+
+        `darks` is an optional (dark1, dark2) pair of RAW member frames in
+        self.members order, subtracted before calibrate() — the same order the
+        live view uses, and the only order that is correct, since a calibration
+        multiplies the dark pedestal along with the signal.
+        """
         raw1 = np.asarray(self.spec1.acquire(), float)
         raw2 = np.asarray(self.spec2.acquire(), float)
         self.last_member_raw = (raw1, raw2)
-        return self.spec1.calibrate(raw1), self.spec2.calibrate(raw2)
+        sig1, sig2 = raw1, raw2
+        if darks is not None:
+            d1, d2 = (np.asarray(d, float) for d in darks)
+            if d1.shape != raw1.shape or d2.shape != raw2.shape:
+                raise RuntimeError(
+                    "The recorded dark does not match this pair's frames — "
+                    "re-record it before fitting.")
+            sig1 = np.clip(raw1 - d1, 0, None)
+            sig2 = np.clip(raw2 - d2, 0, None)
+        return self.spec1.calibrate(sig1), self.spec2.calibrate(sig2)
 
     def acquire(self) -> np.ndarray:
         i1, i2 = self._acquire_pair()
         i1 = i1 * self.member_scale(0)
-        out = np.empty_like(self._wl)
-        out[self._m1] = np.interp(self._wl[self._m1], self._wl1, i1)
-        out[self._m2] = np.interp(self._wl[self._m2], self._wl2, i2)
-        o = self._ovl
-        out[o] = 0.5 * (np.interp(self._wl[o], self._wl1, i1)
-                        + np.interp(self._wl[o], self._wl2, i2))
-        return out
+        # One crossfade over the whole grid. _w1 is already 1 where only spec1
+        # has pixels and 0 where only spec2 does, so the edge-held values
+        # np.interp produces outside a member's range are multiplied away.
+        w1 = self._w1
+        return (w1 * np.interp(self._wl, self._wl1, i1)
+                + (1.0 - w1) * np.interp(self._wl, self._wl2, i2))
 
-    def fit_stitch_factor(self) -> float:
+    def fit_stitch_factor(self, darks=None) -> float:
         """Take one frame from each member and choose the factor that makes
-        spec1 match spec2 over the overlap, least-squares. The residual is
+        spec1 match spec2 over the OVERLAP BAND, least-squares. The residual is
         quadratic in the factor, so the minimum is the closed form
         s = sum(I1*I2) / sum(I1^2) — no iterative optimiser needed.
+
+        Fitted over the band rather than the whole geometric overlap: the dead
+        edges are pure noise and would pull the fit without carrying signal.
+
+        `darks` (raw member frames, self.members order) is subtracted first.
+        Pass it whenever a dark has been recorded — a long-exposure member
+        carries a pedestal that the fit would otherwise partly match instead of
+        matching the light.
 
         The fit is over raw counts, so the result is the sensitivity ratio
         TIMES the exposure ratio t2/t1. That makes it exposure-dependent: any
         change to either member's integration time leaves it stale and it has
         to be re-fitted.
+
+        Also records `stitch_residual`, the RMS of (s*a - b) over the band
+        relative to that band's peak — how well one scalar actually did.
         """
-        i1, i2 = self._acquire_pair()
-        o = self._ovl
+        i1, i2 = self._acquire_pair(darks)
+        o = self._fit_mask
+        if not o.any():
+            raise RuntimeError(
+                f"The overlap band {self.band_lo_nm:.1f}–{self.band_hi_nm:.1f} "
+                f"nm contains no grid points — widen it.")
         a = np.interp(self._wl[o], self._wl1, i1)
         b = np.interp(self._wl[o], self._wl2, i2)
         denom = float(np.dot(a, a))
         if not np.isfinite(denom) or denom <= 0.0:
             raise RuntimeError(
-                "No signal in the overlap region — cannot fit a stitch factor.")
+                f"No signal from {self.spec1.name} in the overlap band "
+                f"{self.band_lo_nm:.1f}–{self.band_hi_nm:.1f} nm — cannot fit "
+                f"a stitch factor.")
         self.stitch_factor = float(np.dot(a, b)) / denom
+        scale = float(np.max(np.abs(b)))
+        self.stitch_residual = (
+            float(np.sqrt(np.mean((self.stitch_factor * a - b) ** 2)) / scale)
+            if scale > 0.0 else None)
         return self.stitch_factor
 
     def calibration_targets(self) -> list[SpectrometerBase]:
@@ -2016,3 +2332,239 @@ if __name__ == "__main__":
           f"{sim.max_integration_ms:g} ms, sub-ms member "
           f"{fast.min_integration_ms:g}–{fast.max_integration_ms:g} ms, "
           f"stitched {pair.min_integration_ms:g}–{pair.max_integration_ms:g} ms")
+
+    # ── Calibration files: one ragged line must not lose the whole file ──────
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        good = Path(tmp) / "good.txt"
+        good.write_text("400 0.5\n500 1.0\n600 0.25\n")
+        wl, fac, skipped = load_calibration_file(good)
+        assert skipped == 0 and len(wl) == 3 and fac[1] == 1.0, (wl, fac)
+        # Exactly the shape Niquest_New.txt had: a trailing single-field line.
+        ragged = Path(tmp) / "ragged.txt"
+        ragged.write_text("400 0.5\n500 1.0\n600 0.25\n 0")
+        wl, fac, skipped = load_calibration_file(ragged)
+        assert skipped == 1 and len(wl) == 3, (wl, skipped)
+        # Still refused when nothing usable is left — a silent empty
+        # calibration would be worse than an error.
+        junk = Path(tmp) / "junk.txt"
+        junk.write_text("# only a comment\nnot numbers\n")
+        try:
+            load_calibration_file(junk)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("an unusable calibration file must raise")
+    print("  calibration loader: clean ok, 1 ragged line skipped, junk refused")
+
+    # ── Stitching: crossfade, band, and the dark-aware fit ───────────────────
+    # Two windows onto ONE analytic spectrum, so the true ratio between the
+    # members is exactly their gain ratio. SimulatedSpectrometer normalises
+    # each instance against its own window's peak, which would put an unknown
+    # factor between the halves and leave nothing to check the fit against.
+    def _true_spectrum(wl):
+        return 4000.0 * np.exp(-0.5 * ((np.asarray(wl, float) - 950.0) / 120.0) ** 2)
+
+    class _Half(SpectrometerBase):
+        """One half of the band, with a settable gain and dark pedestal."""
+        def __init__(self, lo, hi, gain=1.0, dark=0.0, n=512):
+            self._w = np.linspace(lo, hi, n)
+            self._gain, self._dark = gain, dark
+            self.name = f"half {lo:.0f}-{hi:.0f}"
+            self.max_counts = 65535.0
+
+        @property
+        def wavelengths(self):
+            return self._w
+
+        def set_integration_time(self, ms):
+            self.integration_ms = float(ms)
+
+        def acquire(self):
+            return _true_spectrum(self._w) * self._gain + self._dark
+
+    blue = _Half(700.0, 1000.0, gain=1.0)
+    red  = _Half(900.0, 1200.0, gain=4.0)
+    st = StitchedSpectrometer(blue, red)
+    glo, ghi = st.geometric_overlap
+    assert abs(glo - 900.0) < 1.0 and abs(ghi - 1000.0) < 1.0, (glo, ghi)
+    # Default band is the central OVERLAP_BAND_FRAC of that.
+    blo, bhi = st.overlap_band
+    span = ghi - glo
+    assert abs((bhi - blo) - span * OVERLAP_BAND_FRAC) < 1e-6, (blo, bhi)
+    assert abs((blo - glo) - (ghi - bhi)) < 1e-6, "band must be centred"
+
+    # set_band refuses what it cannot honour, rather than clamping silently.
+    for bad in ((glo - 50.0, bhi), (blo, ghi + 50.0), (bhi, blo)):
+        try:
+            st.set_band(*bad)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"set_band{bad} should have been refused")
+    assert st.overlap_band == (blo, bhi), "a refused band must change nothing"
+
+    # The fit recovers the gain ratio, and the crossfade leaves no seam.
+    factor = st.fit_stitch_factor()
+    assert abs(factor - 4.0) < 0.4, factor
+    assert st.stitch_residual is not None and st.stitch_residual < 0.05, \
+        st.stitch_residual
+    merged = st.acquire()
+    # No step anywhere: the biggest jump between neighbours must stay in scale
+    # with the curve's own gradient, which the old hard 50/50 average failed at
+    # both seams.
+    step = np.max(np.abs(np.diff(merged)))
+    assert step < 0.05 * merged.max(), f"seam step {step:.3g} vs {merged.max():.3g}"
+    # Below the band only spec1 contributes, above it only spec2.
+    assert st._w1[st._wl < st.band_lo_nm].min() == 1.0
+    assert st._w1[st._wl > st.band_hi_nm].max() == 0.0
+    print(f"  stitching: band {st.band_lo_nm:.1f}–{st.band_hi_nm:.1f} nm, "
+          f"factor {factor:.3f} (true 4.0), residual "
+          f"{st.stitch_residual * 100:.2f}%, no seam step")
+
+    # A pedestal on the long-exposure member wrecks an undarkened fit and is
+    # harmless once the dark is passed — the reason fit_stitch_factor takes it.
+    st_d = StitchedSpectrometer(_Half(700.0, 1000.0, gain=1.0),
+                                _Half(900.0, 1200.0, gain=4.0, dark=500.0))
+    dark_frames = (np.zeros(512), np.full(512, 500.0))
+    naive = st_d.fit_stitch_factor()
+    darked = st_d.fit_stitch_factor(dark_frames)
+    assert abs(darked - 4.0) < abs(naive - 4.0), (naive, darked)
+    assert abs(darked - 4.0) < 0.4, darked
+    print(f"  stitch fit vs a 500-count pedestal: undarkened {naive:.3f}, "
+          f"dark-subtracted {darked:.3f} (true 4.0)")
+
+    # A dark that does not match the frames is refused, not broadcast.
+    try:
+        st_d.fit_stitch_factor((np.zeros(8), np.zeros(8)))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a mismatched dark must be refused")
+
+    # ── Piezo Jena: recovering from a controller that lost the plot ──────────
+    class _FakePiezoSerial:
+        """A Piezo Jena controller that emits its reset banner for the first
+        `n_banner` position queries, then behaves. `stuck` makes it accept "wr"
+        without ever moving, the way one does after rebooting out of remote
+        mode.
+        """
+        def __init__(self, n_banner=0, stuck=False, start_um=0.0):
+            self.n_banner, self.stuck = n_banner, stuck
+            self.pos_um = start_um
+            self.timeout = 2.0
+            self.writes = []
+            self._out = b""
+
+        # -- pyserial surface the driver actually uses --
+        def write(self, data):
+            self.writes.append(data)
+            cmd = data.strip().lower()
+            if cmd.startswith(b"wr,"):
+                if not self.stuck:
+                    self.pos_um = float(cmd[3:])
+            elif cmd == b"rd":
+                if self.n_banner > 0:
+                    self.n_banner -= 1
+                    self._out = b"NV1CL V1.236>"      # no newline, on purpose
+                else:
+                    self._out = b"rd,%.2f\r\n" % self.pos_um
+            return len(data)
+
+        def read_until(self, sep):
+            out, self._out = self._out, b""
+            return out
+
+        def read(self, n):
+            out, self._out = self._out[:n], self._out[n:]
+            return out
+
+        @property
+        def in_waiting(self):
+            return len(self._out)
+
+        def reset_input_buffer(self):
+            self._out = b""
+
+        def reset_output_buffer(self):
+            pass
+
+        def close(self):
+            pass
+
+    def _fake_piezo(ser, travel_um=320.0):
+        """A PiezoJenaStage wrapped around `ser`, skipping __init__'s port
+        probe — there is no port to probe without hardware."""
+        st = PiezoJenaStage.__new__(PiezoJenaStage)
+        st._ser, st._fault = ser, None
+        st.travel_mm = travel_um / 1000.0
+        st.name = "Piezo Jena [fake]"
+        return st
+
+    # One banner, then a good reply: recovered inside NTRIES (3).
+    pz = _fake_piezo(_FakePiezoSerial(n_banner=1, start_um=72.5))
+    assert abs(pz.get_position() - 0.0725) < 1e-9, pz.get_position()
+    # Two banners still fits in three attempts; four does not.
+    pz = _fake_piezo(_FakePiezoSerial(n_banner=2, start_um=72.5))
+    assert abs(pz.get_position() - 0.0725) < 1e-9, pz.get_position()
+    pz = _fake_piezo(_FakePiezoSerial(n_banner=4, start_um=72.5))
+    try:
+        pz.get_position()
+    except RuntimeError as e:
+        assert "NV1CL" in str(e) and "3 attempts" in str(e), str(e)
+    else:
+        raise AssertionError("an unbroken run of banners must still raise")
+    print(f"  piezo readback: recovers from 1-2 banners, raises after "
+          f"{PiezoJenaStage.NTRIES}")
+
+    # THE silent-corruption case: "err,2" parsed as a position of 0.002 mm,
+    # because it happens to contain a comma. It must be rejected instead.
+    class _ErrSerial(_FakePiezoSerial):
+        def write(self, data):
+            self.writes.append(data)
+            if data.strip().lower() == b"rd":
+                self._out = b"err,2\r\n"
+            return len(data)
+
+    pz = _fake_piezo(_ErrSerial())
+    try:
+        got = pz.get_position()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(f"err,2 must not parse as a position (got {got})")
+    print("  piezo readback: 'err,2' rejected, not read as 0.002 mm")
+
+    # A move that lands: retries are invisible, no fault.
+    ser = _FakePiezoSerial(n_banner=1)
+    pz = _fake_piezo(ser)
+    pz.move_to(0.1)
+    assert abs(pz.get_position() - 0.1) < 1e-9, pz.get_position()
+    assert pz.position_fault() is None, pz.position_fault()
+    # max_step_mm = 0 means move_to takes the no-readback fast path: exactly
+    # one "wr" for a single move.
+    assert sum(w.startswith(b"wr,") for w in ser.writes) == 1, ser.writes
+
+    # A move that never lands: NTRIES attempts, then a LATCHED fault rather
+    # than an exception — so a scan can record the real position and go on.
+    ser = _FakePiezoSerial(stuck=True, start_um=40.0)
+    pz = _fake_piezo(ser)
+    pz.SETTLE_TIMEOUT_S = 0.1     # the wait is the point elsewhere, not here
+    pz.move_to(0.1)                       # returns instead of raising
+    fault = pz.position_fault()
+    assert fault and "did not reach" in fault, fault
+    assert sum(w.startswith(b"wr,") for w in ser.writes) == PiezoJenaStage.NTRIES, \
+        ser.writes
+    assert abs(pz.get_position() - 0.04) < 1e-9, "the real position is readable"
+    # Re-asserted the modes on each retry — the actual fix for a rebooted box.
+    assert ser.writes.count(b"i1\r\n") >= PiezoJenaStage.NTRIES - 1, ser.writes
+    pz.clear_position_faults()
+    assert pz.position_fault() is None
+    # And the next move clears it on its own, so a fault never outlives its move.
+    ser.stuck = False
+    pz.move_to(0.1)
+    assert pz.position_fault() is None, pz.position_fault()
+    print(f"  piezo move: {PiezoJenaStage.NTRIES} attempts with mode re-assert, "
+          f"then a latched fault (not an exception); window "
+          f"±{PiezoJenaStage._TOL_UM:g} um = {PiezoJenaStage.resolution_mm * 1000:g} um "
+          f"resolution")

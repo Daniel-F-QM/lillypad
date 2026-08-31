@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import time
 import datetime
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 
 import numpy as np
 
@@ -709,3 +709,66 @@ if __name__ == "__main__":
         stage.move_to(_um_to_stage(t))
     print(f"  moves issued for a {d.size}-point ascending sweep: {raw[0]} "
           f"(expect {d.size + 1} — one pre-move entering the range)")
+
+    # ---------------------------------------------------------------------
+    # A stage that reports a bad move through position_fault() instead of
+    # raising must not cost the operator the whole scan. This is the path a
+    # Piezo Jena takes after its retries are exhausted: with
+    # abort_on_stage_fault off, the column is flagged, the position it really
+    # reached is recorded, and the sweep carries on. An exception, by
+    # contrast, unwinds past run() and every measured column is lost.
+    # ---------------------------------------------------------------------
+    from hardware import SimulatedSpectrometer
+
+    class _FaultingStage(SimulatedStage):
+        """Misses its target on one column and says so, without raising."""
+        def __init__(self, fault_at_um, **kw):
+            super().__init__(**kw)
+            self._fault_at = fault_at_um
+            self._fault = None
+
+        def _move_to_raw(self, position_mm):
+            self._fault = None
+            if abs(_stage_to_um(position_mm) - self._fault_at) < 1e-6:
+                super()._move_to_raw(position_mm - 0.002)   # 2 um short
+                self._fault = "stage did not reach the commanded position"
+                return
+            super()._move_to_raw(position_mm)
+
+        def position_fault(self):
+            return self._fault
+
+    small = FrogScanConfig(delay_start_fs=-30, delay_stop_fs=30,
+                           delay_step_fs=10.0, zero_pos_um=150000.0,
+                           capture_background=False)
+    targets = small.positions_um()
+    n_pts = small.delays_fs().size
+
+    def run_with(abort_on_fault):
+        stage = _FaultingStage(targets[2], travel_mm=300.0)
+        spec = SimulatedSpectrometer(stage, gate="shg")
+        cfg2 = replace(small, abort_on_stage_fault=abort_on_fault)
+        w = FrogScanWorker(stage, spec, cfg2)
+        out = {"result": None, "error": None, "faults": []}
+        w.finished_scan.connect(lambda r: out.__setitem__("result", r))
+        w.error.connect(lambda m: out.__setitem__("error", m))
+        w.stage_fault.connect(lambda i, dly, why: out["faults"].append((i, why)))
+        w.run()
+        return out
+
+    keep = run_with(False)
+    assert keep["result"] is not None, "the scan must finish and keep its data"
+    assert keep["result"].trace.shape[1] == n_pts, keep["result"].trace.shape
+    assert len(keep["faults"]) == 1 and keep["faults"][0][0] == 2, keep["faults"]
+    assert keep["result"].stage_faults[2], keep["result"].stage_faults
+    # The column is labelled with where the stage REALLY was, not the command.
+    gap = abs(keep["result"].positions_readback_um[2] - targets[2])
+    assert gap > 1.0, gap
+
+    stop = run_with(True)
+    assert stop["result"] is None, "abort_on_stage_fault must stop the scan"
+    assert stop["error"] and "Stage fault" in stop["error"], stop["error"]
+    assert len(stop["faults"]) == 1, stop["faults"]
+    print(f"  latched stage fault at column 2 of {n_pts}: "
+          f"abort off -> full trace kept, column flagged, readback "
+          f"{gap:.1f} um off target; abort on -> stopped via stage_fault")

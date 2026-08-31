@@ -106,6 +106,13 @@ PALETTE = dict(DARK_PALETTE)
 # greyscale), which the theme accents do not.
 MEMBER_COLORS = ("#56B4E9", "#E69F00")      # SLOT order: (S1, S2)
 
+# Shading for the overlap band in the per-spectrometer view: the stretch the
+# stitch factor is fitted over and the two spectra are crossfaded across. Green
+# because it has to sit UNDER both member curves without being confused for
+# either, and Okabe-Ito's bluish green is the remaining unused hue in that set.
+OVERLAP_BAND_COLOR = "#009E73"
+OVERLAP_BAND_ALPHA = 0.16
+
 # Simulated members offered alongside real devices in the multi-spectrometer
 # slots, so the mode can be exercised without two spectrometers on the bench.
 # These are sentinels, not device ids — _open_slot_device matches them BEFORE
@@ -1855,6 +1862,15 @@ class FrogCanvas(FigureCanvasQTAgg):
         (self.line_m2,) = self.ax_spec.plot([], [], color=MEMBER_COLORS[1], lw=1)
         self.line_m1.set_visible(False)
         self.line_m2.set_visible(False)
+        # Overlap band marker. A static patch, NOT one of the blitted artists:
+        # it changes only when the band or the view does, and both of those
+        # already go through _request_full(), which re-caches the blit
+        # backgrounds it has to be baked into.
+        self.band_span = self.ax_spec.axvspan(
+            0.0, 0.0, facecolor=OVERLAP_BAND_COLOR, alpha=OVERLAP_BAND_ALPHA,
+            edgecolor="none", zorder=0)
+        self.band_span.set_visible(False)
+        self._band = None
         self._overlay = False
         self.im = self.ax_trace.imshow(np.zeros((2, 2)), origin="lower",
                                        aspect="auto", cmap="magma",
@@ -2507,6 +2523,10 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_spec.set_visible(not overlay)
         self.line_m1.set_visible(overlay)
         self.line_m2.set_visible(overlay)
+        # The band only means anything next to the two curves it describes: on
+        # the combined trace the crossfade has already happened and shading it
+        # would suggest there is still something to see there.
+        self.band_span.set_visible(overlay and self._band is not None)
         for ln in ((self.line_spec,) if overlay else (self.line_m1, self.line_m2)):
             ln.set_data([], [])
         # Switching views is rare and changes which curves exist on screen; a
@@ -2515,12 +2535,34 @@ class FrogCanvas(FigureCanvasQTAgg):
         # keeps it batch-safe — a scan column reaches here inside batch().
         self._request_full()
 
+    def set_overlap_band(self, lo_nm, hi_nm):
+        """Shade the stitched pair's overlap band, or hide it when passed None.
+
+        No-op when the band has not moved: this is called from every overlay
+        frame (60 ms), and a full redraw per frame to re-place an unchanged
+        patch would cost far more than the curves themselves.
+        """
+        band = None if lo_nm is None or hi_nm is None else (float(lo_nm),
+                                                            float(hi_nm))
+        if band == self._band:
+            return
+        self._band = band
+        if band is not None:
+            lo, hi = band
+            # axvspan gives a Rectangle drawn in data-x / AXES-y, so setting
+            # the bounds to full height keeps it spanning the panel whatever
+            # the y limits autoscale to.
+            self.band_span.set_bounds(lo, 0.0, hi - lo, 1.0)
+        self.band_span.set_visible(self._overlay and band is not None)
+        self._request_full()      # static artist: it lives in the blit cache
+
     def clear_members(self):
         """Drop back to the combined curve and forget the member frames —
         used on a device swap, so a dead pair's curves cannot linger."""
         self._set_spec_mode(False)
         self.line_m1.set_data([], [])
         self.line_m2.set_data([], [])
+        self.set_overlap_band(None, None)
 
     def set_proportions(self, spec_frac):
         """Width of the spectrum column as a fraction of the plot area. Applies
@@ -3376,32 +3418,48 @@ class FrogWindow(QMainWindow):
         act_add.triggered.connect(self._add_calibration_file)
         menu.addAction(act_add)
 
-    def _apply_calibration(self, spec, path):
-        """Assign `path` (or None = raw counts) to one physical spectrometer."""
+    def _apply_calibration(self, spec, path) -> bool:
+        """Assign `path` (or None = raw counts) to one physical spectrometer.
+
+        Returns True only if the device really carries it now. A failure is
+        raised to a modal dialog rather than a status message: an unloaded
+        calibration leaves the device on raw counts while every label still
+        names the file, and that mismatch silently corrupts a whole session's
+        data — it must not be allowed to scroll past.
+        """
         if self._scan_running():
             self.status.showMessage(
                 "A scan is running — stop it before changing calibration.", 4000)
-            return
+            return False
         if spec not in self.spec.calibration_targets():
             self.status.showMessage(
                 "That spectrometer is no longer connected.", 4000)
-            return
+            return False
+        skipped = 0
         with self._device_lock() as ok:
             if not ok:
                 self.status.showMessage(FEED_BUSY_MSG, 4000)
-                return
+                return False
             try:
                 if path is None:
                     spec.clear_calibration()
                 else:
-                    spec.set_calibration(path)
+                    skipped = spec.set_calibration(path)
             except Exception as e:
-                self.status.showMessage(f"Calibration failed: {e}", 6000)
-                return
-        self.status.showMessage(
-            f"{spec.name}: calibration "
-            + (f"'{path.stem}' applied." if path is not None
-               else "removed (raw counts)."), 4000)
+                QMessageBox.warning(
+                    self, "Calibration not applied",
+                    f"{spec.name} could not load '{getattr(path, 'stem', path)}':"
+                    f"\n\n{e}\n\nThe spectrometer is still on "
+                    f"{spec.calibration_name or 'raw counts'}.")
+                return False
+        msg = (f"{spec.name}: calibration "
+               + (f"'{path.stem}' applied." if path is not None
+                  else "removed (raw counts)."))
+        if skipped:
+            msg += (f"  NOTE: {skipped} malformed line(s) in the file were "
+                    f"skipped.")
+        self.status.showMessage(msg, 8000 if skipped else 4000)
+        return True
 
     def _add_calibration_file(self):
         """Copy a calibration file into calibration_files/ so it shows up in
@@ -3465,10 +3523,26 @@ class FrogWindow(QMainWindow):
         if stitched:
             stale = ("  (stale — integration times changed)"
                      if self._stitch_stale else "")
-            fct = QAction(f"Stitch factor: {self.spec.stitch_factor:.4g}{stale}",
-                          menu)
+            res = self.spec.stitch_residual
+            # The residual is the honest answer to "is one scalar enough for
+            # this pair?", so it belongs next to the factor rather than in a
+            # status message that has already scrolled away.
+            quality = ("  — not fitted yet" if res is None else
+                       f"  (mismatch {res * 100:.1f}%)")
+            fct = QAction(f"Stitch factor: {self.spec.stitch_factor:.4g}"
+                          f"{quality}{stale}", menu)
             fct.setEnabled(False)
             menu.addAction(fct)
+            lo, hi = self.spec.overlap_band
+            glo, ghi = self.spec.geometric_overlap
+            act_band = QAction(f"Overlap band: {lo:.1f}–{hi:.1f} nm "
+                               f"(of {glo:.1f}–{ghi:.1f})…", menu)
+            act_band.setToolTip(
+                "The part of the overlap the stitch factor is fitted over and "
+                "the two spectra are crossfaded across — shown shaded green in "
+                "the per-spectrometer view")
+            act_band.triggered.connect(self._set_overlap_band)
+            menu.addAction(act_band)
         menu.addSeparator()
         for slot in (0, 1):
             self._add_slot_spec_menu(menu, slot)
@@ -3577,15 +3651,36 @@ class FrogWindow(QMainWindow):
                 f"the pair.", 5000)
 
     def _select_slot_calibration(self, slot, path):
-        self._multi["cals"][slot] = path
         member = self._multi_members[slot]
         if member is not None and isinstance(self.spec, StitchedSpectrometer):
-            self._apply_calibration(member, path)   # live: apply right away
+            # Commit the slot ONLY once the device really carries the file.
+            # The menu label is drawn from _multi["cals"], so recording it
+            # first made the menu claim a calibration that had failed to load
+            # and left that member silently on raw counts.
+            if not self._apply_calibration(member, path):
+                return
+            self._multi["cals"][slot] = path
+            return
+        # Not live yet — nothing to verify against, so the file is checked on
+        # its own and only then remembered for _connect_multi_pair.
+        if path is not None:
+            try:
+                _wl, _fac, skipped = load_calibration_file(path)
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Calibration not applied",
+                    f"'{path.stem}' could not be read:\n\n{e}\n\n"
+                    f"Slot {slot + 1} is unchanged.")
+                return
         else:
-            self.status.showMessage(
-                f"Slot {slot + 1} calibration: "
-                f"{path.stem if path else 'none'} — applied when the pair "
-                f"connects.", 4000)
+            skipped = 0
+        self._multi["cals"][slot] = path
+        msg = (f"Slot {slot + 1} calibration: "
+               f"{path.stem if path else 'none'} — applied when the pair "
+               f"connects.")
+        if skipped:
+            msg += f"  NOTE: {skipped} malformed line(s) skipped."
+        self.status.showMessage(msg, 8000 if skipped else 4000)
 
     def _enable_multi_mode(self):
         self._multi["on"] = True
@@ -3632,12 +3727,14 @@ class FrogWindow(QMainWindow):
             if not ok:
                 return False, err
         opened = []
+        ragged = []
         try:
             for serial in (s1, s2):
                 opened.append(self._open_slot_device(serial))
-            for spec, cal in zip(opened, self._multi["cals"]):
+            for slot, (spec, cal) in enumerate(zip(opened, self._multi["cals"])):
                 if cal is not None:
-                    spec.set_calibration(cal)
+                    if spec.set_calibration(cal):
+                        ragged.append(f"slot {slot + 1} ('{cal.stem}')")
             stitched = StitchedSpectrometer(*opened)
         except Exception as e:
             for s in opened:
@@ -3656,10 +3753,16 @@ class FrogWindow(QMainWindow):
         # S1/S2 spinboxes from the wrong members.
         self._sync_multi_ui()
         wl = stitched.wavelengths
+        lo, hi = stitched.overlap_band
         self.status.showMessage(f"Spectrometer: {stitched.name}", 5000)
-        return True, (f"Stitched pair connected: {stitched.name}, "
-                      f"{wl[0]:.0f}–{wl[-1]:.0f} nm. Use Auto-stitch with "
-                      f"light across the overlap to match the two devices.")
+        msg = (f"Stitched pair connected: {stitched.name}, "
+               f"{wl[0]:.0f}–{wl[-1]:.0f} nm, overlap band {lo:.1f}–{hi:.1f} "
+               f"nm. Use Auto-stitch with light across the overlap to match "
+               f"the two devices.")
+        if ragged:
+            msg += (f"\n\nNOTE: malformed lines were skipped in the "
+                    f"calibration for {', '.join(ragged)} — check the file.")
+        return True, msg
 
     def _disable_multi_mode(self):
         """Leave multi mode, keeping slot 1's device as the single
@@ -3723,21 +3826,61 @@ class FrogWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "Multi-spectrometer", msg)
 
+    def _fit_darks(self):
+        """The member darks to fit against, or None when they cannot be used.
+
+        Same all-or-nothing rule as the per-spectrometer view: fitting one
+        member darkened and the other not would put the two on different
+        baselines, which is precisely what the fit is trying to measure.
+        """
+        darks = self.background_members
+        if not self.chk_dark.isChecked() or darks is None:
+            return None
+        frames = getattr(self.spec, "last_member_raw", None)
+        if frames is None or len(darks) != len(frames):
+            return None
+        if not all(np.shape(d) == np.shape(f) for d, f in zip(darks, frames)):
+            return None
+        return darks
+
+    def _stale_dark_note(self):
+        """Why a recorded dark stops matching after the factor moves.
+
+        The combined background was captured through acquire(), so it has the
+        stitch factor of the moment baked into it; the per-spectrometer view
+        subtracts raw member darks and stays right. Changing the factor
+        therefore breaks only the combined view, silently.
+        """
+        return ("  The dark was recorded at the previous factor — re-record it."
+                if self.background is not None else "")
+
     def _fit_stitch_factor(self):
         if not isinstance(self.spec, StitchedSpectrometer):
             return False, "No stitched pair is connected."
         if self._scan_running():
             return False, "A scan is running — stop it before fitting."
+        darks = self._fit_darks()
         with self._device_lock() as ok:
             if not ok:
                 return False, FEED_BUSY_MSG
             try:
-                factor = self.spec.fit_stitch_factor()
+                factor = self.spec.fit_stitch_factor(darks)
             except Exception as e:
                 return False, f"Stitch-factor fit failed: {e}"
         self._stitch_stale = False
+        lo, hi = self.spec.overlap_band
+        res = self.spec.stitch_residual
+        quality = ("" if res is None else
+                   f" Residual mismatch {res * 100:.1f}% — "
+                   + ("the two spectra agree across the band."
+                      if res < 0.05 else
+                      "one scalar does not reconcile them here; check the "
+                      "calibrations or narrow the band."))
         return True, (f"Stitch factor fitted: {factor:.4g} "
-                      f"(applied to {self.spec.spec1.name}).")
+                      f"(applied to {self.spec.spec1.name}) over "
+                      f"{lo:.1f}–{hi:.1f} nm"
+                      + ("" if darks is not None else ", no dark subtracted")
+                      + f".{quality}{self._stale_dark_note()}")
 
     def _set_stitch_factor(self):
         if not isinstance(self.spec, StitchedSpectrometer):
@@ -3748,8 +3891,41 @@ class FrogWindow(QMainWindow):
             self.spec.stitch_factor, 1e-6, 1e6, 6)
         if ok:
             self.spec.stitch_factor = float(val)   # atomic — no lock needed
+            self.spec.stitch_residual = None   # hand-set: nothing was measured
             self._stitch_stale = False   # the user just said what they want
-            self.status.showMessage(f"Stitch factor set to {val:.4g}.", 4000)
+            self.status.showMessage(
+                f"Stitch factor set to {val:.4g}.{self._stale_dark_note()}",
+                6000 if self.background is not None else 4000)
+
+    def _set_overlap_band(self):
+        """Pick the sub-range of the overlap that the fit and blend use."""
+        if not isinstance(self.spec, StitchedSpectrometer):
+            return
+        lo, hi = self.spec.overlap_band
+        glo, ghi = self.spec.geometric_overlap
+        new_lo, ok = QInputDialog.getDouble(
+            self, "Overlap band",
+            f"Band START (nm) — the two spectrometers share "
+            f"{glo:.1f}–{ghi:.1f} nm.\nEnter {glo:.1f} to reset to the full "
+            f"shared range:", lo, glo, ghi, 1)
+        if not ok:
+            return
+        new_hi, ok = QInputDialog.getDouble(
+            self, "Overlap band", "Band END (nm):", hi, glo, ghi, 1)
+        if not ok:
+            return
+        try:
+            lo, hi = self.spec.set_band(new_lo, new_hi)
+        except Exception as e:
+            QMessageBox.warning(self, "Overlap band", str(e))
+            return
+        # The shading and the merged curve both change; push the band to the
+        # canvas now rather than waiting for the next overlay frame, so the
+        # combined view updates too.
+        self.canvas.set_overlap_band(lo, hi)
+        self.status.showMessage(
+            f"Overlap band set to {lo:.1f}–{hi:.1f} nm — re-run Auto-stitch "
+            f"to fit over it.", 6000)
 
     def _build_spectrum_group(self):
         grp = QGroupBox("Spectrum")
@@ -4364,6 +4540,9 @@ class FrogWindow(QMainWindow):
                 y = np.clip(y - darks[idx], 0, None)
             y = mem.calibrate(y) * spec.member_scale(idx)
             curves.append((np.asarray(mem.wavelengths, float), y))
+        # Cheap and idempotent — set_overlap_band returns immediately unless
+        # the band actually moved.
+        self.canvas.set_overlap_band(*spec.overlap_band)
         if self.chk_dark.isChecked() and not subtract and not self._dark_member_warned:
             # One shot only — this runs every 60 ms and would bury the status bar.
             self._dark_member_warned = True
@@ -4507,7 +4686,18 @@ class FrogWindow(QMainWindow):
                     return
                 fn()
                 self._refresh_positions()   # still inside the lock
-                if done_msg:
+                # An adapter that reports a failed move through position_fault()
+                # instead of raising (the piezo does, so a scan can record the
+                # column and carry on) would otherwise leave a manual move
+                # looking successful while the stage sits somewhere else.
+                fault = None
+                try:
+                    fault = self.stage.position_fault()
+                except Exception:
+                    pass
+                if fault:
+                    self.status.showMessage(f"Stage: {fault}", 8000)
+                elif done_msg:
                     self.status.showMessage(done_msg, 3000)
         except Exception as e:
             self.status.showMessage(f"Stage error: {e}", 5000)
