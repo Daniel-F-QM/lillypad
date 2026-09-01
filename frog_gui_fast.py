@@ -318,7 +318,16 @@ def resource_path(*parts):
     return base.joinpath(*parts)
 
 
-ICON_PATH    = resource_path("icons", "Lilypad.png")
+# Window/taskbar icon: the multi-frame .ico (16→256 px), NOT the 2481² PNG.
+# Windows asks for 16/20/24/32/40/48/64 px depending on the surface (title bar,
+# taskbar, Alt-Tab) and the monitor DPI. A single huge bitmap makes Qt decode
+# ~25 MB and smooth-downscale it on the GUI thread for every one of those, which
+# is slow and lossy; worse, with an explicit AppUserModelID (see main()) the
+# shell no longer falls back to the .exe's own icon, so a window icon that is
+# not ready in time gets cached as a blank taskbar button. Qt's ICO handler
+# reads every frame, so QIcon can hand back the exact size instead.
+ICON_ICO_PATH = resource_path("icons", "Lilypad.ico")
+ICON_PATH    = resource_path("icons", "Lilypad.png")   # README / large uses
 SUN_ICON     = resource_path("icons", "sun.png")
 MOON_ICON    = resource_path("icons", "moon.png")
 RESCALE_ICON = resource_path("icons", "rescale.png")
@@ -337,6 +346,25 @@ HORIZ_ICON = {"dark":  resource_path("icons", "horizontal_dark.png"),
               "light": resource_path("icons", "horizontal_light.png")}
 VERT_ICON  = {"dark":  resource_path("icons", "vertical_dark.png"),
               "light": resource_path("icons", "vertical_light.png")}
+
+
+_APP_ICON = None
+
+
+def app_icon():
+    """The application icon, built once from the multi-resolution .ico.
+
+    Cached lazily rather than at import: a QIcon may not be constructed before
+    the QApplication exists. The pixmap loop realises the sizes Windows asks
+    for while we are still in main(), so the HICON is ready by the time the
+    native window is created and the shell samples the taskbar button."""
+    global _APP_ICON
+    if _APP_ICON is None:
+        src = ICON_ICO_PATH if ICON_ICO_PATH.exists() else ICON_PATH
+        _APP_ICON = QIcon(str(src)) if src.exists() else QIcon()
+        for px in (16, 20, 24, 32, 40, 48, 64, 256):
+            _APP_ICON.pixmap(px, px)
+    return _APP_ICON
 
 
 def app_dir():
@@ -2737,8 +2765,7 @@ class FrogWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Lillypad — Fast")
-        if ICON_PATH.exists():
-            self.setWindowIcon(QIcon(str(ICON_PATH)))
+        self.setWindowIcon(app_icon())
         self.setMinimumSize(1180, 760)
         self._theme = "dark"
 
@@ -5139,15 +5166,21 @@ class FrogWindow(QMainWindow):
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
+    # Without this the taskbar groups us under the Python launcher and shows its
+    # icon when run from source. Microsoft specifies the form
+    # Company.Product.SubProduct.Version — a bare "Lillypad" (what this used to
+    # be) is not a valid AppUserModelID. The shell caches a taskbar icon per
+    # AUMID, so changing the string also abandons any blank icon cached against
+    # the old one. Must run before the first window exists.
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Lillypad")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "AlcortaFleischmann.Lillypad")
     except (AttributeError, OSError):
         pass  # not Windows — silently skip
     app = QApplication(sys.argv)
     app.setApplicationName("Lillypad")
-    if ICON_PATH.exists():
-        app.setWindowIcon(QIcon(str(ICON_PATH)))
+    app.setWindowIcon(app_icon())
     app.setFont(QFont("Segoe UI", 10, QFont.Normal))
     apply_app_palette(app, PALETTE)
     app.setStyleSheet(build_stylesheet(PALETTE, "dark"))

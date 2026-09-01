@@ -96,7 +96,13 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX off deliberately. It saves little on a PySide6 bundle (the bulk is Qt
+    # DLLs and the zaber core, which compress poorly or must not be touched at
+    # all), it is a known cause of stripped or blank icon resources in the packed
+    # PE, and PyInstaller applies it *silently* only when upx happens to be on
+    # the build machine's PATH — so leaving it on makes the shipped .exe depend
+    # on who built it.
+    upx=False,
     upx_exclude=[],
     console=False,
     disable_windowed_traceback=False,
@@ -112,9 +118,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
-    # The ~19 MB zaber-motion core is a packed native library; UPX has no real
-    # gain on it and compressing it risks a load failure at runtime.
-    upx_exclude=[os.path.basename(src) for src, _ in _zaber_libs],
+    upx=False,          # see the EXE() block above
+    upx_exclude=[],
     name='Lillypad',
 )
