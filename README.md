@@ -29,6 +29,9 @@
   separately from whether it *was* clean.
 - **Bracketed background** — dark frames captured before and after the scan,
   stored alongside the trace rather than silently subtracted.
+- **Alignment mode** — a four-point symmetry check that overlays the difference
+  between equal ± delays on the spectrum, and a raw-counts view of the FROG
+  trace that shows what calibration and dark subtraction hide.
 - **Three export formats** — `.dwc` FROG trace, `.npz` archive (raw counts,
   backgrounds, saturation record, full metadata), and a spreadsheet `.csv`.
 - **Light and dark themes**, log/linear spectrum, manual or auto axis limits,
@@ -420,6 +423,49 @@ own dark and calibration applied. That is the view for judging the stitch: with
 a good factor the two curves lie on top of each other across the overlap. The
 icon shows the view you get by clicking. The combined curve returns
 automatically during a scan, since the scan records stitched columns.
+
+### Alignment mode
+
+Two diagnostic views, each on a button pinned to the panel it acts on. Neither
+one touches the recorded data: the `FrogResult` and every export are exactly
+what they would have been with alignment mode switched off.
+
+**Δ, top-right of the Spectrum panel — temporal symmetry.** A misaligned or
+chirped beam shows up as a difference between equal positive and negative
+delays, and finding it otherwise means running a whole scan and eyeballing the
+trace. Pressing Δ parks the live feed, steps the stage through −2x, −x, +x and
++2x (x is the *Alignment Step* box in the Spectrum group), measures a spectrum
+at each with the current averaging settings, returns to where it started, and
+overlays `S(+x) − S(−x)` and `S(+2x) − S(−2x)` on the panel. A symmetric pulse
+gives two flat curves on the dashed zero line; the status bar reports the peak
+imbalance as a percentage of the largest measured signal. The curves are in
+real counts on the spectrum's own y axis, and the live feed keeps drawing
+underneath them — press Δ again to clear.
+
+The four delays are relative to **wherever the stage is standing**, not to the
+marked zero, so no zero is required; park where you want to test symmetry
+(*Move to 0 fs*, usually) first. The points are visited in increasing order,
+like a scan, so all four are approached from the same side and the mechanical
+backlash cancels out of the ± comparison. A sweep that would leave the travel
+range is refused rather than clamped — a clamped target silently destroys the
+symmetry the measurement is about — and so is one asked for while a scan is
+running, or before the stage is homed.
+
+**RAW, top-left of the FROG Trace panel — raw counts (multi-spectrometer mode
+only).** The displayed trace is dark-subtracted, per-member intensity-calibrated
+and crossfaded at the stitch factor. All three suppress or reshape the low-level
+background where alignment artefacts live — satellite pulses, scatter, an arm
+that is not actually seeing the beam. RAW shows what the detectors reported
+instead: no dark subtraction, no calibration, each spectrometer's half
+normalised to its own maximum over the whole trace, and the two hard-**cut** at
+the middle of the overlap band rather than blended. The seam is deliberate; so
+is the pedestal that appears once the dark is left in.
+
+The raw columns are recorded as the scan runs, so RAW can be toggled mid-scan
+and on the finished trace, and the display threshold and colour map keep
+working over it. The cut is fixed when the scan starts: moving the overlap band
+afterwards re-cuts the *next* scan, not the one on screen. The button is hidden
+for a single spectrometer and disabled until a scan has recorded something.
 
 **Adding a device class.** Implement `StageBase` or `SpectrometerBase` in
 [hardware.py](hardware.py). Moves must block until settled, so the scan loop can

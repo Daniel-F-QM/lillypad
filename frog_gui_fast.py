@@ -140,6 +140,12 @@ MEMBER_COLORS = ("#56B4E9", "#E69F00")      # SLOT order: (S1, S2)
 OVERLAP_BAND_COLOR = "#009E73"
 OVERLAP_BAND_ALPHA = 0.16
 
+# The two symmetry-difference curves of alignment mode, S(+x)-S(-x) and
+# S(+2x)-S(-2x). Okabe-Ito again, and deliberately the two hues MEMBER_COLORS
+# and the overlap band do NOT use: a difference curve can be on screen at the
+# same time as either of those and must never be mistaken for one.
+DIFF_COLORS = ("#D55E00", "#CC79A7")        # (+/-x, +/-2x)
+
 # Simulated members offered alongside real devices in the multi-spectrometer
 # slots, so the mode can be exercised without two spectrometers on the bench.
 # These are sentinels, not device ids — _open_slot_device matches them BEFORE
@@ -770,6 +776,100 @@ class ExportWorker(QThread):
             self.error.emit(str(e))
         else:
             self.done.emit(self._path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alignment worker — the four-point symmetry check
+# ─────────────────────────────────────────────────────────────────────────────
+class AlignmentWorker(QThread):
+    """Measures one spectrum at each of -2x, -x, +x, +2x fs and comes back.
+
+    A thread rather than the blocking _stage_action path: four moves plus
+    n_average frames each takes seconds, and the window must stay alive.
+
+    The offsets are RELATIVE to wherever the stage is standing when the worker
+    starts — the operator parks at the delay whose symmetry they want to judge
+    (usually zero) and presses the button, so no marked zero is required.
+
+    The four points are visited in increasing order, exactly like a scan, so
+    every one of them is approached from the same side and the mechanical
+    backlash cancels out of the +/- comparison. Whatever happens, the stage is
+    put back where it started.
+
+    Frames are returned RAW: the window applies the same dark/calibration path
+    the live spectrum uses, so the differences sit on the displayed baseline
+    instead of a second, drifting derivation of it.
+
+    Signals:
+      progress(done, total)
+      done([(raw, member_frames_or_None)] x 4)   # in offset order
+      error(message)
+    """
+    progress = Signal(int, int)
+    done     = Signal(object)
+    error    = Signal(str)
+
+    def __init__(self, stage, spectrometer, config, step_fs, parent=None):
+        super().__init__(parent)
+        self.stage = stage
+        self.spec  = spectrometer
+        self.cfg   = config
+        self.offsets_fs = (-2.0 * step_fs, -step_fs, step_fs, 2.0 * step_fs)
+
+    def _measure(self):
+        """One averaged raw frame here. Mirrors FrogScanWorker._measure minus
+        the saturation bookkeeping and the calibration."""
+        cfg = self.cfg
+        if cfg.wait_after_move_s:
+            time.sleep(cfg.wait_after_move_s)
+        for _ in range(max(0, cfg.idle_shots)):
+            self.spec.acquire()                    # discard settling frames
+        n     = max(1, cfg.n_average)
+        acc   = None
+        m_acc = None
+        for _ in range(n):
+            s = np.asarray(self.spec.acquire(), float)
+            acc = s if acc is None else acc + s
+            frames = getattr(self.spec, "last_member_raw", None)
+            if frames is not None:
+                if m_acc is None:
+                    m_acc = [np.asarray(f, float).copy() for f in frames]
+                else:
+                    for a, f in zip(m_acc, frames):
+                        a += f
+        members = None if m_acc is None else tuple(a / n for a in m_acc)
+        return acc / n, members
+
+    def run(self):
+        start_um = None
+        out, err = [], None
+        try:
+            start_um = _stage_to_um(self.stage.get_position())
+            pf = self.cfg.pass_factor
+            for k, off in enumerate(self.offsets_fs):
+                # zero = 0.0 makes this a RELATIVE conversion, as _jog does.
+                d_um = float(delay_to_position_um(off, 0.0, pf))
+                self.stage.move_to(_um_to_stage(start_um + d_um))
+                out.append(self._measure())
+                self.progress.emit(k + 1, len(self.offsets_fs))
+        except Exception as e:
+            err = str(e)
+        # Always come home, including after a failure part-way through: leaving
+        # the stage parked at +2x would silently shift every later jog, move
+        # and scan the operator makes from here.
+        if start_um is not None:
+            try:
+                self.stage.move_to(_um_to_stage(start_um))
+            except Exception as e:
+                if err is None:
+                    err = f"could not return to the start position: {e}"
+        # Reported only once the stage is back: the slot restarts the live feed
+        # and reads the position, and neither may happen while this thread is
+        # still driving the hardware.
+        if err is None:
+            self.done.emit(out)
+        else:
+            self.error.emit(err)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2010,6 +2110,7 @@ class FrogCanvas(FigureCanvasQTAgg):
     limits_changed = Signal()        # zoom/reset happened → window syncs dialog
     log_toggle_requested = Signal()  # click on spectrum y-axis strip
     proportions_changed = Signal(int)  # split handle dragged → dialog follows
+    axes_relaid = Signal()           # axes repositioned → overlay buttons follow
 
     def __init__(self):
         self.fig = Figure(facecolor=PALETTE["plot_bg"])
@@ -2052,6 +2153,20 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.band_span.set_visible(False)
         self._band = None
         self._overlay = False
+        # Alignment mode: the two symmetry-difference curves. Independent of
+        # the combined/member switch above, so they stay on screen over a live
+        # spectrum, a scan column or the per-member view without any of those
+        # having to know about them. Drawn in the SAME count units as the
+        # spectrum, hence the zero reference line — a difference is only
+        # readable against the level it is a difference from.
+        (self.line_d1,) = self.ax_spec.plot([], [], color=DIFF_COLORS[0], lw=1.2)
+        (self.line_d2,) = self.ax_spec.plot([], [], color=DIFF_COLORS[1], lw=1.2)
+        self.line_d1.set_visible(False)
+        self.line_d2.set_visible(False)
+        # Static, like band_span: it moves only when the view does.
+        self.diff_zero = self.ax_spec.axhline(
+            0.0, color=PALETTE["text_dim"], lw=0.8, ls="--", zorder=0)
+        self.diff_zero.set_visible(False)
         self.im = self.ax_trace.imshow(np.zeros((2, 2)), origin="lower",
                                        aspect="auto", cmap="magma",
                                        extent=[-1, 1, 0, 1])
@@ -2114,10 +2229,14 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_ac.set_animated(True)
         self.line_m1.set_animated(True)
         self.line_m2.set_animated(True)
+        self.line_d1.set_animated(True)
+        self.line_d2.set_animated(True)
         self.im.set_animated(True)
         self._animated = [(self.ax_spec, self.line_spec),
                           (self.ax_spec, self.line_m1),
                           (self.ax_spec, self.line_m2),
+                          (self.ax_spec, self.line_d1),
+                          (self.ax_spec, self.line_d2),
                           (self.ax_trace, self.im),
                           (self.ax_ac, self.line_ac)]
         self._bg = None            # cached full-figure background (no animated)
@@ -2251,6 +2370,10 @@ class FrogCanvas(FigureCanvasQTAgg):
         # Everything moved, so both cached backgrounds describe the old geometry.
         self._bg = None
         self._bg_static = None
+        # Anything parented to the canvas and pinned to an axes (the trace's
+        # overlay button) has to follow. Emitted last, so it reads the geometry
+        # this call just set.
+        self.axes_relaid.emit()
         self.draw_idle()
 
     def _left_margin(self):
@@ -2264,6 +2387,18 @@ class FrogCanvas(FigureCanvasQTAgg):
         base = (_GEO_H_COLGAP if self._layout_mode == "horizontal"
                 else _GEO_V_COLGAP)
         return max(base, _GEO_GAP_PX / max(self.width(), 1))
+
+    def panel_edges_px(self, ax):
+        """(left, top, right) of `ax` in canvas widget pixels.
+
+        Read from ax.get_position() — the figure fractions _layout_axes just
+        wrote — rather than get_window_extent(), which needs a renderer and so
+        is unusable before the first draw. Same y flip as the split handle:
+        figure fractions count up from the bottom, Qt from the top.
+        """
+        pos = ax.get_position()
+        w, h = float(self.width()), float(self.height())
+        return pos.x0 * w, (1.0 - pos.y1) * h, pos.x1 * w
 
     def _position_split_handle(self, renderer=None):
         """Put the separator over the band the split governs, in the clear strip
@@ -2374,7 +2509,10 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_ac.set_color(pal["accent2"])
         # line_m1/line_m2 keep MEMBER_COLORS in both themes — they are chosen
         # to work on either background, and re-theming them would cost the
-        # colourblind separation that is the whole point.
+        # colourblind separation that is the whole point. Same for the two
+        # DIFF_COLORS curves; their zero reference is a plain rule, so it does
+        # follow the theme.
+        self.diff_zero.set_color(pal["text_dim"])
         self._style()   # re-applies axes/tick/label/grid colors from PALETTE
         self._apply_cmap()   # masked pixels must follow the new background
         self._split.update()  # a Qt child: draw_idle would not repaint it
@@ -2435,6 +2573,11 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.ax_spec.draw_artist(self.line_spec)
             self.ax_spec.draw_artist(self.line_m1)
             self.ax_spec.draw_artist(self.line_m2)
+            # The alignment differences are animated too, so the restore above
+            # wiped them out of the buffer — every live frame has to put them
+            # back or they would flicker away under the feed.
+            self.ax_spec.draw_artist(self.line_d1)
+            self.ax_spec.draw_artist(self.line_d2)
             # Only the spectrum panel changed, so that is all Qt has to repaint:
             # restore_region above left the trace/AC regions of the buffer byte
             # for byte identical to what is already on screen. matplotlib's Qt
@@ -2758,6 +2901,43 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_m2.set_data([], [])
         self.set_overlap_band(None, None)
 
+    def show_diff(self, wl, d1, d2):
+        """Overlay the two alignment symmetry differences on the spectrum.
+
+        Untouched by every other spectrum path, so the live feed keeps drawing
+        underneath: the curves stay until clear_diff().
+        """
+        self.line_d1.set_data(wl, d1)
+        self.line_d2.set_data(wl, d2)
+        self.line_d1.set_visible(True)
+        self.line_d2.set_visible(True)
+        self.diff_zero.set_visible(True)
+        # A difference dips below zero, so the y range almost always has to
+        # move; and diff_zero is a static artist that has to be baked into the
+        # blit backgrounds either way. Autoscale first so one full draw covers
+        # both — _autoscale_y reads the visible lines, which now include these.
+        if self.autoscale_y:
+            self._autoscale_y()
+        self._request_full()
+
+    def clear_diff(self):
+        """Take the alignment differences off the spectrum panel.
+
+        Data cleared as well as hidden, for the reason in _set_spec_mode: a
+        hidden line still holding a frame keeps driving relim().
+        """
+        self.line_d1.set_data([], [])
+        self.line_d2.set_data([], [])
+        self.line_d1.set_visible(False)
+        self.line_d2.set_visible(False)
+        self.diff_zero.set_visible(False)
+        if self.autoscale_y:
+            self._autoscale_y()
+        self._request_full()
+
+    def diff_visible(self):
+        return bool(self.line_d1.get_visible())
+
     def set_proportions(self, spec_frac):
         """Width of the spectrum column as a fraction of the plot area. Applies
         in both layout modes.
@@ -3052,6 +3232,21 @@ class FrogWindow(QMainWindow):
         # without touching self.spec from the GUI thread while the worker is
         # inside acquire().
         self._scan_wl      = None
+        # ── Alignment mode ────────────────────────────────────────────────
+        # Diagnostic views only: none of this reaches the FrogResult or any
+        # export. _align_worker runs the four-point symmetry measurement;
+        # _align_trace holds the RAW (uncalibrated, un-darked) counterpart of
+        # _scan_trace for a stitched pair — the two members interpolated onto
+        # the common grid and hard-cut at _align_cut, with _align_peak the
+        # running max of each half so the halves can be normalized at render
+        # time without any stored column going stale.
+        self._align_worker   = None
+        self._align_trace    = None
+        self._align_wl       = None   # the two members' native grids
+        self._align_cut      = 0
+        self._align_peak     = [0.0, 0.0]
+        self._align_view     = None   # scratch buffer for the normalized view
+        self._align_trace_on = False
         self._feed_was_on  = True
         self._pending_fit  = True
         self._export_fmt   = "dwc"
@@ -3300,6 +3495,12 @@ class FrogWindow(QMainWindow):
             self.background_exposures = None
             self._dark_member_warned = False
             self.canvas.clear_members()   # a dead pair's curves must not linger
+            # Same for both halves of alignment mode: a difference and a raw
+            # trace describe the device that measured them, right down to the
+            # pixel grid they sit on.
+            self._uncheck_align_spec()
+            self.canvas.clear_diff()
+            self._clear_align_trace()
             self.chk_dark.setChecked(False); self.chk_dark.setEnabled(False)
             self.last_spectrum = None
             self._live_frame = None
@@ -3609,6 +3810,31 @@ class FrogWindow(QMainWindow):
         self.btn_overlay.move(42, 6)        # 6 + 30 + 6, right of auto-fit
         self.btn_overlay.hide()
         self.btn_overlay.toggled.connect(self._on_overlay_toggled)
+
+        # Alignment mode, spectrum side: step to +/-x and +/-2x and overlay the
+        # two differences. Pinned to the panel by _position_align_button.
+        self.btn_align_spec = QPushButton("Δ", self.canvas)
+        self.btn_align_spec.setObjectName("overlay")
+        self.btn_align_spec.setCheckable(True)
+        self.btn_align_spec.setFixedSize(30, 30)
+        self.btn_align_spec.setToolTip(
+            "Alignment mode — measure at −2x, −x, +x, +2x (Alignment Step) and "
+            "overlay S(+x)−S(−x) and S(+2x)−S(−2x).\nA symmetric pulse gives "
+            "two flat curves on zero. Press again to clear.")
+        self.btn_align_spec.show()
+        self.btn_align_spec.toggled.connect(self._on_align_spec_toggled)
+
+        # Alignment mode, trace side. Pinned to the trace panel rather than to
+        # the canvas corner, because that panel moves with the split fraction,
+        # the window width and the layout mode.
+        self.btn_align_trace = QPushButton("RAW", self.canvas)
+        self.btn_align_trace.setObjectName("overlay")
+        self.btn_align_trace.setCheckable(True)
+        self.btn_align_trace.setFixedSize(46, 30)
+        self.btn_align_trace.hide()
+        self.btn_align_trace.toggled.connect(self._on_align_trace_toggled)
+        self.canvas.axes_relaid.connect(self._position_align_button)
+        self._position_align_button()
 
         self._refresh_layout_button()    # needs the canvas for the current mode
 
@@ -4302,6 +4528,20 @@ class FrogWindow(QMainWindow):
         self.chk_dark = QCheckBox("Subtract Dark")
         self.chk_dark.setEnabled(False)
         lay.addWidget(self.chk_dark)
+        lay.addWidget(_hline())
+        # Half-width of the alignment mode's four-point sweep (the Δ button
+        # over the spectrum). Its own box rather than the stage jog step: that
+        # one switches to um, and an alignment offset is only ever a delay.
+        lay.addWidget(QLabel("Alignment Step"))
+        self.spin_align_step = DoubleSpinBox()
+        self.spin_align_step.setDecimals(0)
+        self.spin_align_step.setRange(1.0, 100000.0)
+        self.spin_align_step.setValue(100.0)
+        self.spin_align_step.setSuffix(" fs")
+        self.spin_align_step.setToolTip(
+            "Half-width x of the alignment sweep: spectra are taken at "
+            "−2x, −x, +x and +2x from the current position.")
+        lay.addWidget(self.spin_align_step)
         return grp
 
     def _build_stage_group(self):
@@ -4553,6 +4793,7 @@ class FrogWindow(QMainWindow):
             self.canvas.clear_members()
         self._sync_integration_ui()
         self._refresh_overlay_button()
+        self._refresh_align_trace_button()
         self._refresh_avantes_button()
 
     def _refresh_avantes_button(self):
@@ -4804,7 +5045,18 @@ class FrogWindow(QMainWindow):
             self._flush_pending_fit()
 
     def _dark_corrected(self, raw):
-        """The merged live frame with the dark removed, ready to plot.
+        """The merged live frame with the dark removed, ready to plot."""
+        return self._corrected_frame(
+            raw, getattr(self.spec, "last_member_raw", None))
+
+    def _corrected_frame(self, raw, frames):
+        """`raw` with the dark removed and the calibration applied.
+
+        `frames` are the RAW member frames `raw` was merged from (None for a
+        single device). Passed in rather than read from the device here, so a
+        caller holding a frame from some time ago — the alignment sweep — gets
+        the correction for ITS OWN member frames instead of whatever the feed
+        has acquired since.
 
         A stitched pair is rebuilt from the member frames rather than having a
         stored merged dark subtracted: the pedestal comes off each member
@@ -4819,7 +5071,6 @@ class FrogWindow(QMainWindow):
                 else self.spec.calibrate(raw)
         if isinstance(self.spec, StitchedSpectrometer):
             darks = self._usable_member_darks()
-            frames = getattr(self.spec, "last_member_raw", None)
             if darks is None or frames is None:
                 self._warn_dark_mismatch()
                 return raw          # already calibrated and merged by acquire()
@@ -4904,6 +5155,263 @@ class FrogWindow(QMainWindow):
         self.canvas.fit_xy()
         if hasattr(self, 'dlg_graphics'):
             self.dlg_graphics.sync_limits()
+
+    # ── Alignment mode: spectrum symmetry ────────────────────────────────────
+    def _align_running(self):
+        return (self._align_worker is not None
+                and self._align_worker.isRunning())
+
+    def _uncheck_align_spec(self):
+        """Pop the Δ button back out without re-entering its own handler."""
+        self.btn_align_spec.blockSignals(True)
+        self.btn_align_spec.setChecked(False)
+        self.btn_align_spec.blockSignals(False)
+
+    def _on_align_spec_toggled(self, on):
+        if not on:
+            self.canvas.clear_diff()
+            self.status.showMessage("Alignment differences cleared.", 2500)
+            return
+        if self._align_running():
+            self._uncheck_align_spec(); return
+        if self._scan_running():
+            self.status.showMessage("A scan is running — the stage is busy.", 3000)
+            self._uncheck_align_spec(); return
+        if self.spec is None or self.stage is None:
+            self.status.showMessage("Connect a stage and a spectrometer first.", 4000)
+            self._uncheck_align_spec(); return
+        if getattr(self.stage, "needs_homing", False):
+            self.status.showMessage(
+                "Stage is not homed — press Home before an alignment sweep.", 6000)
+            self._uncheck_align_spec(); return
+
+        # Same handover contract as _start_scan: the worker drives the stage
+        # and the spectrometer for the whole sweep, so the feed has to let go
+        # of them first, and refusing beats running against a device the feed
+        # thread is still inside.
+        self._feed_was_on = self.btn_feed.isChecked()
+        if not self._feed.pause():
+            if self._feed_was_on:
+                self._feed.resume()
+            self.status.showMessage(f"Alignment not started — {FEED_BUSY_MSG}", 6000)
+            self._uncheck_align_spec(); return
+
+        # Only now is it safe to read the stage from this thread — the feed is
+        # parked, so nothing else is talking to it. Checked BEFORE moving:
+        # clamping a target would quietly destroy the +/- symmetry the whole
+        # measurement is about, so an out-of-range sweep is refused instead.
+        step = float(self.spin_align_step.value())
+        pf   = self.scan_cfg.pass_factor
+        try:
+            start_um = _stage_to_um(self.stage.get_position())
+        except Exception as e:
+            if self._feed_was_on:
+                self._feed.resume()
+            self.status.showMessage(f"Alignment failed — stage: {e}", 5000)
+            self._uncheck_align_spec(); return
+        span_um = abs(float(delay_to_position_um(2.0 * step, 0.0, pf)))
+        lo, hi = self._travel_range_um()
+        if start_um - span_um < lo or start_um + span_um > hi:
+            if self._feed_was_on:
+                self._feed.resume()
+            self.status.showMessage(
+                f"±2×{step:.0f} fs (±{span_um:.1f} um) from here leaves the "
+                f"travel range [{lo:.1f}, {hi:.1f}] um — move away from the "
+                f"limit or reduce the Alignment Step.", 7000)
+            self._uncheck_align_spec(); return
+
+        self.btn_hw.setEnabled(False)
+        self.btn_scan.setEnabled(False)
+        self._set_stage_controls_enabled(False)
+        self.btn_align_spec.setEnabled(False)
+        self._moving(True)
+
+        self._align_worker = AlignmentWorker(self.stage, self.spec,
+                                             self.scan_cfg, step)
+        self._align_worker.progress.connect(self._on_align_progress)
+        self._align_worker.done.connect(self._on_align_done)
+        self._align_worker.error.connect(self._on_align_error)
+        self._align_worker.start()
+        self.status.showMessage(
+            f"Alignment sweep: −{2 * step:.0f}, −{step:.0f}, "
+            f"+{step:.0f}, +{2 * step:.0f} fs…", 0)
+
+    def _on_align_progress(self, done, total):
+        self.status.showMessage(f"Alignment sweep: point {done}/{total}…", 0)
+
+    def _on_align_done(self, results):
+        """Slot for AlignmentWorker.done — results in offset order."""
+        self._reset_align_ui()
+        try:
+            # Corrected through exactly the path the spectrum panel uses, each
+            # frame with ITS OWN member frames, so the differences sit on the
+            # displayed baseline rather than a second derivation of it.
+            s = [np.asarray(self._corrected_frame(raw, frames), float)
+                 for raw, frames in results]
+            wl = np.asarray(self.spec.wavelengths, float)
+            d1 = s[2] - s[1]        # S(+x)  - S(-x)
+            d2 = s[3] - s[0]        # S(+2x) - S(-2x)
+        except Exception as e:
+            self.status.showMessage(f"Alignment differences failed: {e}", 5000)
+            self._uncheck_align_spec()
+            return
+        self.canvas.show_diff(wl, d1, d2)
+        step = float(self.spin_align_step.value())
+        # Peak absolute imbalance as a fraction of the largest measured signal:
+        # the one number that says "symmetric" or "not" without reading the
+        # curves off the panel.
+        scale = max(float(max(np.max(np.abs(x)) for x in s)), 1e-12)
+        r1 = float(np.max(np.abs(d1))) / scale
+        r2 = float(np.max(np.abs(d2))) / scale
+        self.status.showMessage(
+            f"Alignment: peak asymmetry {100 * r1:.1f}% at ±{step:.0f} fs, "
+            f"{100 * r2:.1f}% at ±{2 * step:.0f} fs.", 8000)
+
+    def _on_align_error(self, msg):
+        self._reset_align_ui()
+        self._uncheck_align_spec()
+        self.status.showMessage(f"Alignment sweep failed: {msg}", 6000)
+
+    def _reset_align_ui(self):
+        """Hand the devices back and re-enable what the sweep locked out."""
+        self._moving(False)
+        self.btn_hw.setEnabled(True)
+        self.btn_scan.setEnabled(True)
+        self._set_stage_controls_enabled(True)
+        self.btn_align_spec.setEnabled(True)
+        self._refresh_positions()
+        if self._feed_was_on:
+            self._feed.resume()
+
+    # ── Alignment mode: raw stitched trace ───────────────────────────────────
+    def _position_align_button(self):
+        """Pin the two alignment buttons to the panels they act on.
+
+        Δ goes to the spectrum panel's top-RIGHT and RAW to the trace panel's
+        top-LEFT. Not the canvas corner the auto-fit and per-spectrometer
+        buttons use: that corner already holds those two and the panel title,
+        and every one of these edges moves with the split fraction, the window
+        width and the layout mode.
+        """
+        c = self.canvas
+        _l, top, right = c.panel_edges_px(c.ax_spec)
+        self.btn_align_spec.move(round(right) - self.btn_align_spec.width() - 6,
+                                 round(top) + 6)
+        left, top, _r = c.panel_edges_px(c.ax_trace)
+        self.btn_align_trace.move(round(left) + 6, round(top) + 6)
+
+    def _refresh_align_trace_button(self):
+        """Show the RAW toggle only for a stitched pair, and only enable it
+        once there is a scan whose raw member columns were recorded."""
+        stitched = isinstance(self.spec, StitchedSpectrometer)
+        self.btn_align_trace.setVisible(stitched)
+        if not stitched:
+            return
+        ready = self._align_trace is not None
+        self.btn_align_trace.setEnabled(ready)
+        self.btn_align_trace.setToolTip(
+            "Raw counts — no calibration, no dark subtraction. Each "
+            "spectrometer is normalised to its own maximum and the two are "
+            "cut (not blended) at the middle of the overlap, so features "
+            "buried in the background show up.\nDisplay only: the recorded "
+            "trace and every export are unaffected."
+            if ready else
+            "Run a scan first — the raw per-spectrometer columns are recorded "
+            "as it goes.")
+
+    def _on_align_trace_toggled(self, on):
+        if on and self._align_trace is None:
+            self.btn_align_trace.blockSignals(True)
+            self.btn_align_trace.setChecked(False)
+            self.btn_align_trace.blockSignals(False)
+            self.status.showMessage(
+                "No raw trace yet — run a scan in multi-spectrometer mode.", 4000)
+            return
+        self._align_trace_on = bool(on)
+        # Re-render at once rather than waiting for the next column, so the
+        # toggle also works on a finished trace.
+        if self._align_trace_on:
+            self.canvas.update_trace(self._align_trace_view(), 1.0)
+        elif self._scan_trace is not None:
+            self.canvas.update_trace(self._scan_trace, self._scan_peak)
+        self.status.showMessage(
+            "FROG trace: raw counts, per-spectrometer normalised." if on else
+            "FROG trace: calibrated, stitched.", 4000)
+
+    def _init_align_trace(self, wl, n_delays):
+        """Allocate the raw trace for a scan about to start, or drop it.
+
+        The cut is fixed HERE, for the whole scan: every column is
+        interpolated and sliced on arrival, so moving the overlap band
+        mid-scan cannot retroactively re-cut what is already stored. The next
+        scan picks up wherever the band has been left.
+        """
+        spec = self.spec
+        if not isinstance(spec, StitchedSpectrometer):
+            self._clear_align_trace()
+            return
+        w = np.asarray(wl, float)
+        cut = 0.5 * (spec.band_lo_nm + spec.band_hi_nm)
+        # Below the cut comes from spec1 (the bluer member), above from spec2.
+        # Neither half extrapolates: the common grid starts at spec1's first
+        # pixel, and the cut sits inside the overlap, so spec2 covers w[k:].
+        self._align_cut   = int(np.searchsorted(w, cut))
+        self._align_trace = np.zeros((w.size, n_delays), np.float32)
+        self._align_view  = None
+        self._align_peak  = [0.0, 0.0]
+        self._align_wl    = [np.asarray(m.wavelengths, float) for m in spec.members]
+        self._refresh_align_trace_button()
+
+    def _store_align_column(self, i, members_raw):
+        """Fold one column's RAW member frames into the raw trace. O(n_wl)."""
+        if self._align_trace is None or members_raw is None:
+            return
+        w = self._scan_wl
+        k = self._align_cut
+        wl1, wl2 = self._align_wl
+        m1, m2 = members_raw
+        lo = np.interp(w[:k], wl1, np.asarray(m1, float))
+        hi = np.interp(w[k:], wl2, np.asarray(m2, float))
+        self._align_trace[:k, i] = lo
+        self._align_trace[k:, i] = hi
+        if lo.size:
+            self._align_peak[0] = max(self._align_peak[0], float(lo.max()))
+        if hi.size:
+            self._align_peak[1] = max(self._align_peak[1], float(hi.max()))
+
+    def _align_trace_view(self):
+        """The raw trace with each member's half normalised to its own max.
+
+        Normalisation happens HERE, not when a column is stored: the two
+        maxima only grow as a scan runs, so scaling on arrival would leave
+        every earlier column on a stale factor. Written into a reused buffer —
+        this runs once per column during a live scan.
+        """
+        raw = self._align_trace
+        k   = self._align_cut
+        if self._align_view is None or self._align_view.shape != raw.shape:
+            self._align_view = np.empty_like(raw)
+        buf = self._align_view
+        np.divide(raw[:k], max(self._align_peak[0], 1.0), out=buf[:k])
+        np.divide(raw[k:], max(self._align_peak[1], 1.0), out=buf[k:])
+        return buf
+
+    def _clear_align_trace(self):
+        """Forget the raw trace and drop out of the raw view.
+
+        Called on a device swap: a raw trace belongs to the pair that measured
+        it — its cut, its grid and its two normalisations all describe those
+        two spectrometers.
+        """
+        self._align_trace = None
+        self._align_view  = None
+        self._align_peak  = [0.0, 0.0]
+        if self.btn_align_trace.isChecked():
+            self.btn_align_trace.blockSignals(True)
+            self.btn_align_trace.setChecked(False)
+            self.btn_align_trace.blockSignals(False)
+        self._align_trace_on = False
+        self._refresh_align_trace_button()
 
     def _toggle_feed(self, on):
         if on:
@@ -5282,6 +5790,9 @@ class FrogWindow(QMainWindow):
             return
         if self.spec is None:
             self.status.showMessage("Connect a spectrometer first.", 4000); return
+        if self._align_running():
+            self.status.showMessage(
+                "An alignment sweep is running — the stage is busy.", 3000); return
         # An unreferenced axis has no usable coordinate frame: every delay the
         # scan would record is measured from a zero that means nothing, and
         # homing afterwards moves the frame again. Refuse rather than save it.
@@ -5339,8 +5850,14 @@ class FrogWindow(QMainWindow):
         self._scan_dirty  = False
         self._scan_last_i = -1
         self._live_frame  = None     # park any leftover live-feed frame too
+        self._init_align_trace(wl, delays.size)
         self.canvas.init_trace(delays, wl)
         self._reset_saturation(); self.progress.setValue(0)
+        # A difference measured at the old position says nothing about the
+        # scan that is starting, and the scan owns the spectrum panel now.
+        if self.canvas.diff_visible():
+            self._uncheck_align_spec()
+            self.canvas.clear_diff()
 
         self.btn_scan.setObjectName("danger"); self.btn_scan.setText("Abort Scan")
         self.btn_scan.style().unpolish(self.btn_scan); self.btn_scan.style().polish(self.btn_scan)
@@ -5364,7 +5881,7 @@ class FrogWindow(QMainWindow):
     def _on_progress(self, done, total):
         self.progress.setValue(int(100 * done / total))
 
-    def _on_column(self, i, delay_fs, pos_um, col):
+    def _on_column(self, i, delay_fs, pos_um, col, members_raw=None):
         """Slot for FrogScanWorker.column_ready — O(1), like _on_spectrum.
 
         Every column is RECORDED here (the data path must never drop), but
@@ -5372,6 +5889,10 @@ class FrogWindow(QMainWindow):
         intermediate redraws instead of queuing them up.
         """
         self._scan_trace[:, i] = col
+        # The raw member frames are interpolated and cut ONCE, here, rather
+        # than kept per column and re-derived at render time: that keeps the
+        # memory to one trace-sized array and the work to O(n_wl) per column.
+        self._store_align_column(i, members_raw)
         # Fold the new column into the running reductions the render needs, so
         # _render_scan_frame stays O(1) in the column index. Recomputing either
         # of these from the whole trace per column made the scan cost O(N^2).
@@ -5414,7 +5935,10 @@ class FrogWindow(QMainWindow):
             if self._scan_wl is not None:
                 self.canvas.update_spectrum(self._scan_wl,
                                             self._scan_col_corrected())
-            self.canvas.update_trace(self._scan_trace, self._scan_peak)
+            if self._align_trace_on and self._align_trace is not None:
+                self.canvas.update_trace(self._align_trace_view(), 1.0)
+            else:
+                self.canvas.update_trace(self._scan_trace, self._scan_peak)
             self.canvas.update_ac(self._scan_delays[:i + 1], ac)
         f = fwhm(self._scan_delays[:i + 1], ac)
         self.lbl_fwhm.setText(f"AC FWHM:  {f:.1f} fs" if np.isfinite(f) else "AC FWHM:  — fs")
@@ -5490,7 +6014,12 @@ class FrogWindow(QMainWindow):
         self.result = result
         # The final render below supersedes any pending intermediate tick.
         self._scan_dirty = False
-        self.canvas.update_trace(result.trace)
+        if self._align_trace_on and self._align_trace is not None:
+            # The raw view is a display mode, not a stage of the scan: finishing
+            # must not silently drop the operator back to the calibrated trace.
+            self.canvas.update_trace(self._align_trace_view(), 1.0)
+        else:
+            self.canvas.update_trace(result.trace)
         ac = result.autocorrelation()
         self.canvas.update_ac(result.delays_fs, ac)
         f = result.fwhm_fs()
@@ -5522,6 +6051,7 @@ class FrogWindow(QMainWindow):
         self.btn_hw.setEnabled(True)
         self._set_stage_controls_enabled(True)
         self._refresh_overlay_button()
+        self._refresh_align_trace_button()
         if self._feed_was_on and self.btn_feed.isChecked():
             self._feed.resume()
 
@@ -5609,6 +6139,14 @@ class FrogWindow(QMainWindow):
             self._worker.abort()
             if not self._worker.wait(int(self._scan_join_timeout_ms())):
                 _ORPHANED_THREADS.append(self._worker)
+                released = False
+        # The alignment sweep has no abort — it is four points long and its
+        # last act is putting the stage back, which is exactly what must not be
+        # cut short. Waited out on the same per-point budget as a scan, with
+        # room for the four moves plus the return.
+        if self._align_worker is not None and self._align_worker.isRunning():
+            if not self._align_worker.wait(int(5 * self._scan_join_timeout_ms())):
+                _ORPHANED_THREADS.append(self._align_worker)
                 released = False
         # A half-written export would be a corrupt file, and the worker holds a
         # live reference to the result — let it finish before tearing down.

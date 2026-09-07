@@ -413,7 +413,8 @@ class FrogScanWorker(QThread):
 
     Signals:
       progress(done, total)
-      column_ready(i, delay_fs, readback_um, column)        # for the live plot
+      column_ready(i, delay_fs, readback_um, column, members)  # for the live plot
+        members: the two RAW member frames (stitched pair) or None
       background_ready("before"|"after", spectrum)
       saturation_warning(i, delay_fs, n_pixels, peak)       # i = -1 for a bg frame
       stage_fault(i, delay_fs, reason)                      # i = -1 outside the sweep
@@ -421,7 +422,7 @@ class FrogScanWorker(QThread):
       error(message)
     """
     progress           = Signal(int, int)
-    column_ready       = Signal(int, float, float, object)
+    column_ready       = Signal(int, float, float, object, object)
     background_ready   = Signal(str, object)
     saturation_warning = Signal(int, float, int, float)
     stage_fault        = Signal(int, float, str)
@@ -437,6 +438,10 @@ class FrogScanWorker(QThread):
         self._abort   = False
         self._sat_thr = None      # full-scale threshold, set in run()
         self._member_thr = None   # per-member thresholds (stitched), set in run()
+        # The members themselves, or None for a single device. Separate from
+        # _member_thr, which is None whenever no member reports a full scale —
+        # the raw frames are still there and still wanted.
+        self._members = None
 
     def abort(self):
         """Request a clean stop after the current step."""
@@ -444,7 +449,14 @@ class FrogScanWorker(QThread):
 
     def _measure(self):
         """One averaged spectrum at the current position. Returns
-        (column, peak_count, n_saturated_pixels)."""
+        (column, peak_count, n_saturated_pixels, member_frames).
+
+        member_frames is None for a single device, and otherwise the two RAW
+        (pre-dark, pre-calibration) member frames averaged over the same shots
+        as the column. They are carried out for the GUI's raw-trace alignment
+        view only — the column, the FrogResult and every export stay exactly
+        as they were.
+        """
         cfg = self.cfg
         if cfg.wait_after_move_s:
             time.sleep(cfg.wait_after_move_s)
@@ -454,18 +466,28 @@ class FrogScanWorker(QThread):
         thr   = self._sat_thr
         n     = max(1, cfg.n_average)
         acc   = None
+        m_acc = None
         peak  = 0.0
         n_sat = 0
         for _ in range(n):
             s = np.asarray(self.spec.acquire(), float)
-            if self._member_thr is not None:
+            if self._members is not None:
                 # Stitched device: per-member raw frames, per-member scales.
-                for raw, t in zip(self.spec.last_member_raw, self._member_thr):
+                # One read of the tuple, used for both the saturation check and
+                # the raw accumulation — re-reading it would mix two shots.
+                frames = self.spec.last_member_raw
+                thrs = self._member_thr or (None, None)
+                for raw, t in zip(frames, thrs):
                     m = float(raw.max())
                     if m > peak:
                         peak = m
                     if t is not None and m >= t:
                         n_sat += int(np.count_nonzero(raw >= t))
+                if m_acc is None:
+                    m_acc = [np.asarray(f, float).copy() for f in frames]
+                else:
+                    for a, f in zip(m_acc, frames):
+                        a += f
             else:
                 m = float(s.max())
                 if m > peak:
@@ -473,9 +495,10 @@ class FrogScanWorker(QThread):
                 if thr is not None and m >= thr:
                     n_sat += int(np.count_nonzero(s >= thr))
             acc = s if acc is None else acc + s
+        members = None if m_acc is None else tuple(a / n for a in m_acc)
         # Saturation was judged above on RAW counts (the threshold is an ADC
         # property); only the returned column is intensity-calibrated.
-        return self.spec.calibrate(acc / n), peak, n_sat
+        return self.spec.calibrate(acc / n), peak, n_sat, members
 
     def run(self):
         try:
@@ -495,6 +518,7 @@ class FrogScanWorker(QThread):
             # against that member's own full scale (the override, if set,
             # applies to every member).
             members = getattr(self.spec, "members", None)
+            self._members = tuple(members) if members else None
             if members:
                 thr = []
                 for mem in members:
@@ -598,7 +622,7 @@ class FrogScanWorker(QThread):
             if check_fault(-1, delays[0]):
                 return
             if cfg.capture_background:
-                bg_before, peak, n_sat = self._measure()
+                bg_before, peak, n_sat, _ = self._measure()
                 self.background_ready.emit("before", bg_before)
                 if check_sat(-1, delays[0], peak, n_sat, bg="before"):
                     return
@@ -608,11 +632,12 @@ class FrogScanWorker(QThread):
                     self.error.emit("Scan aborted by user.")
                     return
                 self.stage.move_to(_um_to_stage(targets[i]))   # absolute, blocking
-                col, peak, n_sat = self._measure()
+                col, peak, n_sat, members_raw = self._measure()
                 pos_um = _stage_to_um(self.stage.get_position())   # read-back tag
                 trace[:, i] = col
                 readback[i] = pos_um
-                self.column_ready.emit(i, float(delays[i]), pos_um, col)
+                self.column_ready.emit(i, float(delays[i]), pos_um, col,
+                                       members_raw)
                 self.progress.emit(i + 1, total)
                 if check_sat(i, delays[i], peak, n_sat):
                     return
@@ -621,7 +646,7 @@ class FrogScanWorker(QThread):
 
             # Background AFTER — captured at the end position.
             if cfg.capture_background and not self._abort:
-                bg_after, peak, n_sat = self._measure()
+                bg_after, peak, n_sat, _ = self._measure()
                 self.background_ready.emit("after", bg_after)
                 check_sat(-1, delays[-1], peak, n_sat, bg="after")
 
