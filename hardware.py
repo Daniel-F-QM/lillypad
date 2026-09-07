@@ -1578,6 +1578,20 @@ class StitchedSpectrometer(SpectrometerBase):
     either member's integration time and the factor must be re-fitted, or the
     seam reappears. The GUI flags this rather than compensating silently.
 
+    Darks
+    -----
+    A dark is held as the two RAW member frames and subtracted per member
+    BEFORE calibration (prepare_pair), because a calibration multiplies the
+    pedestal along with the signal and each member has its own. The merged
+    background is DERIVED from those on demand (combined_dark), never stored:
+    a dark captured through acquire() carries the stitch factor and the band it
+    was taken at inside its overlap region, where the two devices are already
+    mixed, so it cannot be un-mixed and goes silently wrong as soon as either
+    moves. Deriving it keeps the merged curve equal to the crossfade of the two
+    member curves by construction. Exposure is the one thing this cannot
+    absorb — a dark is offset + dark-current x t — so a dark stays valid only
+    for the exposures it was recorded at, and the GUI discards it otherwise.
+
     max_counts is None on purpose: counts on the common grid mix two detectors
     and two calibrations, so no single ADC full scale applies. Saturation goes
     unchecked unless the user sets a Full scale override.
@@ -1753,17 +1767,21 @@ class StitchedSpectrometer(SpectrometerBase):
         self.members[index].set_integration_time(ms)
         self._sync_integration()
 
-    def _acquire_pair(self, darks=None) -> tuple[np.ndarray, np.ndarray]:
-        """One frame from each member, calibrated, on their native grids.
+    def prepare_pair(self, raw1, raw2, darks=None) -> tuple[np.ndarray,
+                                                            np.ndarray]:
+        """Dark-subtract and calibrate two RAW member frames, on their native
+        grids. Pure — pass frames already in hand and it touches no hardware.
 
         `darks` is an optional (dark1, dark2) pair of RAW member frames in
-        self.members order, subtracted before calibrate() — the same order the
-        live view uses, and the only order that is correct, since a calibration
-        multiplies the dark pedestal along with the signal.
+        self.members order, subtracted BEFORE calibrate() — the only order that
+        is correct, since a calibration multiplies the dark pedestal along with
+        the signal.
+
+        `member_scale` is deliberately NOT applied here: the per-spectrometer
+        view needs it per curve, and combine() applies it for the merged frame.
         """
-        raw1 = np.asarray(self.spec1.acquire(), float)
-        raw2 = np.asarray(self.spec2.acquire(), float)
-        self.last_member_raw = (raw1, raw2)
+        raw1 = np.asarray(raw1, float)
+        raw2 = np.asarray(raw2, float)
         sig1, sig2 = raw1, raw2
         if darks is not None:
             d1, d2 = (np.asarray(d, float) for d in darks)
@@ -1775,15 +1793,43 @@ class StitchedSpectrometer(SpectrometerBase):
             sig2 = np.clip(raw2 - d2, 0, None)
         return self.spec1.calibrate(sig1), self.spec2.calibrate(sig2)
 
-    def acquire(self) -> np.ndarray:
-        i1, i2 = self._acquire_pair()
-        i1 = i1 * self.member_scale(0)
+    def combine(self, i1, i2) -> np.ndarray:
+        """Crossfade two CALIBRATED member frames onto the common grid.
+
+        The single definition of what a merged frame IS, so the live view, the
+        stored dark and acquire() cannot drift apart: whatever goes through
+        here lands on the current stitch factor and the current band.
+        """
+        i1 = np.asarray(i1, float) * self.member_scale(0)
         # One crossfade over the whole grid. _w1 is already 1 where only spec1
         # has pixels and 0 where only spec2 does, so the edge-held values
         # np.interp produces outside a member's range are multiplied away.
         w1 = self._w1
         return (w1 * np.interp(self._wl, self._wl1, i1)
-                + (1.0 - w1) * np.interp(self._wl, self._wl2, i2))
+                + (1.0 - w1) * np.interp(self._wl, self._wl2, np.asarray(i2,
+                                                                        float)))
+
+    def combined_dark(self, darks) -> np.ndarray:
+        """The two RAW member darks pushed through the merge pipeline, i.e. the
+        background of a frame acquire() would return right now.
+
+        Derived on demand rather than stored: a dark captured through acquire()
+        would have the stitch factor and the band of the moment baked into its
+        overlap region and could never be un-mixed, so it went silently wrong
+        the moment either changed. Costs two interps.
+        """
+        d1, d2 = darks
+        return self.combine(*self.prepare_pair(d1, d2))
+
+    def _acquire_pair(self, darks=None) -> tuple[np.ndarray, np.ndarray]:
+        """One frame from each member, calibrated, on their native grids."""
+        raw1 = np.asarray(self.spec1.acquire(), float)
+        raw2 = np.asarray(self.spec2.acquire(), float)
+        self.last_member_raw = (raw1, raw2)
+        return self.prepare_pair(raw1, raw2, darks)
+
+    def acquire(self) -> np.ndarray:
+        return self.combine(*self._acquire_pair())
 
     def fit_stitch_factor(self, darks=None) -> float:
         """Take one frame from each member and choose the factor that makes

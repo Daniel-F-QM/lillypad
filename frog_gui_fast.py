@@ -1015,15 +1015,17 @@ class AvantesSettingsDialog(QDialog):
         self.chk_dark = QCheckBox("Dynamic dark correction")
         self.chk_dark.toggled.connect(
             lambda on: self._write("Dark correction",
-                                   lambda d: d.set_dark_correction(on)))
+                                   lambda d: d.set_dark_correction(on),
+                                   voids_dark=True))
         lay.addWidget(self.chk_dark)
         self.chk_prescan = QCheckBox("Prescan (discard the first scan)")
         self.chk_prescan.toggled.connect(
-            lambda on: self._write("Prescan", lambda d: d.set_prescan(on)))
+            lambda on: self._write("Prescan", lambda d: d.set_prescan(on),
+                                   voids_dark=True))
         lay.addWidget(self.chk_prescan)
-        hint = QLabel("These change what a frame contains, so a recorded dark "
-                      "and any fitted stitch factor go stale — re-record and "
-                      "re-fit after changing them.")
+        hint = QLabel("These change what a frame contains: a recorded dark is "
+                      "discarded and any fitted stitch factor goes stale — "
+                      "re-record and re-fit after changing them.")
         hint.setObjectName("dim"); hint.setWordWrap(True)
         lay.addWidget(hint)
 
@@ -1158,7 +1160,7 @@ class AvantesSettingsDialog(QDialog):
         self.lbl_msg.style().polish(self.lbl_msg)
         self.lbl_msg.setText(msg)
 
-    def _write(self, label, fn, refresh=True):
+    def _write(self, label, fn, refresh=True, voids_dark=False):
         """One device write: refused during a scan, taken under the feed
         handover, reported inline.
 
@@ -1166,6 +1168,11 @@ class AvantesSettingsDialog(QDialog):
         parks the LIVE FEED, while the scan worker holds the devices
         independently, which is why _apply_spectrometer and _apply_calibration
         both check separately too.
+
+        `voids_dark` marks a setting that changes what a frame CONTAINS — the
+        on-board corrections, the averaging, the ADC range. A dark recorded
+        before it no longer describes the frames coming out, so it is dropped
+        rather than left to be subtracted from data it does not match.
         """
         if self._loading:
             return                      # _refresh is seeding widgets, not a user edit
@@ -1187,6 +1194,8 @@ class AvantesSettingsDialog(QDialog):
                 self._do(False, f"{label} failed: {e}")
                 return
         self._do(True, f"{label}: applied.")
+        if voids_dark:
+            self.main._invalidate_dark(f"{label.lower()} changed")
         if refresh:
             self._refresh()
 
@@ -1203,7 +1212,9 @@ class AvantesSettingsDialog(QDialog):
             dev.set_averages(avg)
             dev.set_smoothing(smooth)
 
-        self._write("Acquisition settings", apply)
+        # voids_dark: on-board averaging changes the pedestal a frame carries
+        # along with the signal, and smoothing redistributes it across pixels.
+        self._write("Acquisition settings", apply, voids_dark=True)
         # On-board averaging multiplies the frame time, and the main
         # integration spinbox shows what one acquire costs — reseed it, or it
         # disagrees with what the feed is actually pacing to.
@@ -1222,7 +1233,7 @@ class AvantesSettingsDialog(QDialog):
         def apply(dev):
             result["on"] = dev.set_high_res_adc(on)
 
-        self._write("ADC resolution", apply, refresh=False)
+        self._write("ADC resolution", apply, refresh=False, voids_dark=True)
         self.main._reset_saturation()
         if self.main.dlg_hardware.isVisible():
             self.main.dlg_hardware._refresh()   # its full-scale placeholder moved
@@ -2772,11 +2783,23 @@ class FrogWindow(QMainWindow):
         self.scan_cfg      = FrogScanConfig(delay_start_fs=-500, delay_stop_fs=500,
                                             delay_step_fs=1.0, zero_pos_um=150000.0)
         self._stage_units_fs = True     # jog/move fields default to fs
+        # The recorded dark, in exactly one of two forms — never both.
+        #   single device:  self.background, one RAW frame.
+        #   stitched pair:  self.background_members, the two RAW member frames,
+        #                   and self.background stays None.
+        # A pair's dark is kept per member because the pedestal has to come off
+        # BEFORE each member's own calibration, and because the merged
+        # background is then derived (StitchedSpectrometer.combined_dark) at
+        # whatever stitch factor and band are current. Storing the merged frame
+        # instead baked both into its overlap region, where the two devices are
+        # already mixed, and it went silently wrong on the next re-fit.
         self.background    = None
-        # Per-member dark frames for the per-spectrometer view. self.background
-        # lives on the stitched grid and cannot be un-mixed (its overlap region
-        # is an average of both devices), so each member needs its own.
         self.background_members = None
+        # Exposure(s) the dark was recorded at — (exp,) or (exp1, exp2) in
+        # self.spec.members order. A dark is offset + dark-current x t, so it
+        # is only valid at its own exposure; _invalidate_dark drops it when
+        # that changes rather than rescaling something that is not a pure ratio.
+        self.background_exposures = None
         self._dark_member_warned = False
         self._overlay_on   = False   # spectrum panel showing the members apart
         # Set when an integration time changes under a stitched pair: frames
@@ -2926,6 +2949,13 @@ class FrogWindow(QMainWindow):
         sim = SimulatedSpectrometer(
             self.stage, gate=self.sim_gate, pulse=self.sim_pulse,
             wl_start=start, wl_end=end, n_pixels=512,
+            # DIFFERENT pedestals, and deliberately so: the halves used to
+            # default to background_counts=0, which is why every dark bug in
+            # the stitched path could only be found on the bench. Two unequal,
+            # exposure-scaled pedestals (see SimulatedSpectrometer._raw_column)
+            # are what a real pair looks like, and they make a mis-applied dark
+            # show up as a step at the seam.
+            background_counts=300.0 if half == 0 else 1200.0,
             position_to_delay=lambda pos_mm: position_to_delay_fs(
                 _stage_to_um(pos_mm), self.scan_cfg.zero_pos_um,
                 self.scan_cfg.pass_factor))
@@ -3030,6 +3060,7 @@ class FrogWindow(QMainWindow):
             # would crash the dark subtraction outright.
             self.background = None
             self.background_members = None
+            self.background_exposures = None
             self._dark_member_warned = False
             self.canvas.clear_members()   # a dead pair's curves must not linger
             self.chk_dark.setChecked(False); self.chk_dark.setEnabled(False)
@@ -3853,33 +3884,33 @@ class FrogWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "Multi-spectrometer", msg)
 
-    def _fit_darks(self):
-        """The member darks to fit against, or None when they cannot be used.
+    def _usable_member_darks(self):
+        """The recorded member darks, or None when they cannot be applied.
 
-        Same all-or-nothing rule as the per-spectrometer view: fitting one
-        member darkened and the other not would put the two on different
-        baselines, which is precisely what the fit is trying to measure.
+        All-or-nothing on purpose: subtracting from one member and not the
+        other would put the two on different baselines, which is precisely what
+        the overlap comparison — and the stitch fit — exist to measure. The one
+        gate every consumer goes through, so the per-spectrometer view, the
+        merged view and Auto-stitch can never disagree about whether a dark is
+        good.
         """
         darks = self.background_members
-        if not self.chk_dark.isChecked() or darks is None:
-            return None
-        frames = getattr(self.spec, "last_member_raw", None)
-        if frames is None or len(darks) != len(frames):
+        frames = getattr(self.spec, "last_member_raw", None)   # atomic read
+        if darks is None or frames is None or len(darks) != len(frames):
             return None
         if not all(np.shape(d) == np.shape(f) for d, f in zip(darks, frames)):
             return None
         return darks
 
-    def _stale_dark_note(self):
-        """Why a recorded dark stops matching after the factor moves.
+    def _fit_darks(self):
+        """The member darks Auto-stitch fits against, or None.
 
-        The combined background was captured through acquire(), so it has the
-        stitch factor of the moment baked into it; the per-spectrometer view
-        subtracts raw member darks and stays right. Changing the factor
-        therefore breaks only the combined view, silently.
+        Deliberately NOT gated on the Subtract Dark checkbox: that is a display
+        preference, whereas the fit is physics. Two members at different
+        exposures carry different pedestals, and a fit over signal-plus-pedestal
+        returns a factor biased by the difference.
         """
-        return ("  The dark was recorded at the previous factor — re-record it."
-                if self.background is not None else "")
+        return self._usable_member_darks()
 
     def _fit_stitch_factor(self):
         if not isinstance(self.spec, StitchedSpectrometer):
@@ -3907,7 +3938,7 @@ class FrogWindow(QMainWindow):
                       f"(applied to {self.spec.spec1.name}) over "
                       f"{lo:.1f}–{hi:.1f} nm"
                       + ("" if darks is not None else ", no dark subtracted")
-                      + f".{quality}{self._stale_dark_note()}")
+                      + f".{quality}")
 
     def _set_stitch_factor(self):
         if not isinstance(self.spec, StitchedSpectrometer):
@@ -3920,9 +3951,9 @@ class FrogWindow(QMainWindow):
             self.spec.stitch_factor = float(val)   # atomic — no lock needed
             self.spec.stitch_residual = None   # hand-set: nothing was measured
             self._stitch_stale = False   # the user just said what they want
-            self.status.showMessage(
-                f"Stitch factor set to {val:.4g}.{self._stale_dark_note()}",
-                6000 if self.background is not None else 4000)
+            # No dark warning: the merged background is derived from the member
+            # frames at the current factor, so it follows this change by itself.
+            self.status.showMessage(f"Stitch factor set to {val:.4g}.", 4000)
 
     def _set_overlap_band(self):
         """Pick the sub-range of the overlap that the fit and blend use."""
@@ -4508,14 +4539,50 @@ class FrogWindow(QMainWindow):
         if self._overlay_on and self._render_overlay():
             self._flush_pending_fit()
             return
+        self.canvas.update_spectrum(wl, self._dark_corrected(raw))
+        self._flush_pending_fit()
+
+    def _dark_corrected(self, raw):
+        """The merged live frame with the dark removed, ready to plot.
+
+        A stitched pair is rebuilt from the member frames rather than having a
+        stored merged dark subtracted: the pedestal comes off each member
+        before its own calibration, and the crossfade then happens at the
+        CURRENT stitch factor and band. That is what makes this curve equal to
+        the crossfade of the two per-spectrometer curves by construction — a
+        pre-merged dark carried the factor it was recorded at and drifted the
+        moment Auto-stitch ran.
+        """
+        if not self.chk_dark.isChecked():
+            return raw if isinstance(self.spec, StitchedSpectrometer) \
+                else self.spec.calibrate(raw)
+        if isinstance(self.spec, StitchedSpectrometer):
+            darks = self._usable_member_darks()
+            frames = getattr(self.spec, "last_member_raw", None)
+            if darks is None or frames is None:
+                self._warn_dark_mismatch()
+                return raw          # already calibrated and merged by acquire()
+            return self.spec.combine(
+                *self.spec.prepare_pair(*frames, darks))
         spectrum = raw
-        if self.chk_dark.isChecked() and self.background is not None:
+        if self.background is not None:
             spectrum = np.clip(raw - self.background, 0, None)
         # Calibration LAST, and never on what the lamp judged: saturation is a
         # raw-ADC property, the calibration is display/data physics.
-        spectrum = self.spec.calibrate(spectrum)
-        self.canvas.update_spectrum(wl, spectrum)
-        self._flush_pending_fit()
+        return self.spec.calibrate(spectrum)
+
+    def _warn_dark_mismatch(self):
+        """Say once that a recorded dark does not fit the live pair.
+
+        One shot only — the callers run every 60 ms and would bury the status
+        bar. Re-armed whenever a dark is recorded or dropped.
+        """
+        if self._dark_member_warned:
+            return
+        self._dark_member_warned = True
+        self.status.showMessage(
+            "The recorded dark does not match this pair — not subtracted. "
+            "Re-record it.", 6000)
 
     def _flush_pending_fit(self):
         """Run the one-shot fit a device swap queued, once its first frame is
@@ -4535,10 +4602,10 @@ class FrogWindow(QMainWindow):
         """Draw one curve per stitched member. False = nothing to draw yet, so
         the caller falls back to the combined frame.
 
-        Reproduces the decomposition of what acquire() merges — raw, dark,
-        calibrate, member scale — so with a fitted stitch factor the two curves
-        lie on the combined one instead of telling a different story. Each
-        member keeps its NATIVE pixel grid; no interpolation happens here.
+        Runs the SAME prepare_pair() the merged frame does, then applies each
+        member's scale, so the two curves and the merged one are two views of
+        one computation rather than two derivations that can drift. Each member
+        keeps its NATIVE pixel grid; no interpolation happens here.
 
         Reads self.spec.last_member_raw from the GUI thread without the device
         lock, exactly as _update_saturation does: the tuple assignment is
@@ -4549,33 +4616,24 @@ class FrogWindow(QMainWindow):
         slots = self._slot_members()
         if frames is None or len(slots) != 2:
             return False
-        raw_by_id = {id(m): f for m, f in zip(spec.members, frames)}
-        darks = self.background_members if self.chk_dark.isChecked() else None
-        # All or nothing: subtracting from one curve but not the other would
-        # put the two on different baselines, which is exactly the comparison
-        # this view exists to make.
-        subtract = darks is not None and all(
-            d.shape == np.shape(f) for d, f in zip(darks, frames))
+        darks = None
+        if self.chk_dark.isChecked():
+            darks = self._usable_member_darks()
+            if darks is None:
+                self._warn_dark_mismatch()
+        prepared = spec.prepare_pair(*frames, darks)
+        by_id = {id(m): y for m, y in zip(spec.members, prepared)}
         curves = []
         for mem in slots:
-            raw = raw_by_id.get(id(mem))
-            if raw is None:
+            y = by_id.get(id(mem))
+            if y is None:
                 return False
             idx = spec.member_index(mem)
-            y = np.asarray(raw, float)
-            if subtract:
-                y = np.clip(y - darks[idx], 0, None)
-            y = mem.calibrate(y) * spec.member_scale(idx)
-            curves.append((np.asarray(mem.wavelengths, float), y))
+            curves.append((np.asarray(mem.wavelengths, float),
+                           y * spec.member_scale(idx)))
         # Cheap and idempotent — set_overlap_band returns immediately unless
         # the band actually moved.
         self.canvas.set_overlap_band(*spec.overlap_band)
-        if self.chk_dark.isChecked() and not subtract and not self._dark_member_warned:
-            # One shot only — this runs every 60 ms and would bury the status bar.
-            self._dark_member_warned = True
-            self.status.showMessage(
-                "Dark does not match this pair — not subtracted in the "
-                "per-spectrometer view. Re-record it.", 6000)
         self.canvas.update_member_spectra(curves[0][0], curves[0][1],
                                           curves[1][0], curves[1][1])
         return True
@@ -4635,47 +4693,107 @@ class FrogWindow(QMainWindow):
                             self.spec.member_index(mem), ms)
                         changed.append(f"S{i + 1} {ms:g} ms")
                 else:
-                    self.spec.set_integration_time(self.spin_integration.value())
+                    ms = float(self.spin_integration.value())
+                    # Same resolution-limited compare as the pair branch above,
+                    # and for the same reason — but here it also decides whether
+                    # the dark is thrown away, so a debounce that fires without
+                    # the value having moved must not cost the operator a dark.
+                    dp = self.spin_integration.decimals()
+                    if round(_exposure_ms(self.spec), dp) != round(ms, dp):
+                        self.spec.set_integration_time(ms)
+                        changed.append(f"{ms:g} ms")
             except Exception as e:
                 self.status.showMessage(f"Integration time failed: {e}", 5000)
                 return
-        if changed:
+        if not changed:
+            return
+        # A dark holds the pedestal of the exposure it was taken at, so it is
+        # now wrong — on a single device as much as on a pair, which used to go
+        # unmentioned entirely.
+        had_dark = (self.background is not None
+                    or self.background_members is not None)
+        if len(slots) == 2:
             # Frames stay in raw counts, so stitch_factor now carries the wrong
             # exposure ratio and the seam will show. Say so rather than let the
             # user discover it in the data.
             self._stitch_stale = True
-            msg = (f"{', '.join(changed)} — the two spectrometers no longer "
-                   f"share a scale; re-run Multi-Spec → Auto-stitch.")
-            if self.background is not None:
-                msg += " The dark is exposure-specific too — re-record it."
-            self.status.showMessage(msg, 8000)
+            self.status.showMessage(
+                f"{', '.join(changed)} — the two spectrometers no longer "
+                f"share a scale; re-run Multi-Spec → Auto-stitch.", 8000)
+        if had_dark:
+            # Last, so its persistent message is the one left standing.
+            self._invalidate_dark(f"integration time changed to "
+                                  f"{', '.join(changed)}")
 
     def _capture_dark(self):
-        if self.last_spectrum is None:
-            if self._scan_running():
-                self.status.showMessage("A scan is running — spectrometer is busy.", 3000)
+        """Record the dark from a FRESH frame.
+
+        Always acquires rather than reusing self.last_spectrum: that field only
+        moves while the display ticks, so with the feed stopped it holds the
+        last LIT frame and "Record Dark" recorded the light. Acquiring also
+        means the merged frame and the member frames come from one exposure
+        instead of two different ones.
+        """
+        if self._scan_running():
+            self.status.showMessage("A scan is running — spectrometer is busy.", 3000)
+            return
+        with self._device_lock() as ok:
+            if not ok:
+                self.status.showMessage(FEED_BUSY_MSG, 4000)
                 return
-            with self._device_lock() as ok:
-                if not ok:
-                    self.status.showMessage(FEED_BUSY_MSG, 4000)
-                    return
-                self.last_spectrum = np.asarray(self.spec.acquire(), float)
-        self.background = self.last_spectrum.copy()
-        # The per-spectrometer view plots each member's own raw frame, and the
-        # stitched dark cannot be un-mixed into those (its overlap region is an
-        # average of both devices), so keep the members' darks as well. Stored
-        # positionally in self.spec.members order — NOT keyed by id(), which is
-        # recycled across reconnects; _apply_spectrometer clears the field on
-        # every swap, so the order can never go stale.
-        self.background_members = None
+            try:
+                frame = np.asarray(self.spec.acquire(), float)
+            except Exception as e:
+                self.status.showMessage(f"Dark capture failed: {e}", 5000)
+                return
+            # Inside the lock: the frames belong to the acquire above, and the
+            # feed must not overwrite last_member_raw before we have copied it.
+            members = self._slot_members()
+            frames = getattr(self.spec, "last_member_raw", None)
+            if len(members) == 2 and frames is not None:
+                # Stored positionally in self.spec.members order — NOT keyed by
+                # id(), which is recycled across reconnects; _apply_spectrometer
+                # clears the field on every swap, so the order cannot go stale.
+                self.background = None
+                self.background_members = tuple(np.asarray(f, float).copy()
+                                                for f in frames)
+                exposures = tuple(_exposure_ms(m) for m in self.spec.members)
+                where = ", ".join(
+                    f"S{i + 1} {_exposure_ms(m):g} ms"
+                    for i, m in enumerate(members))
+            else:
+                self.background = frame
+                self.background_members = None
+                exposures = (_exposure_ms(self.spec),)
+                where = f"{_exposure_ms(self.spec):g} ms"
+        self.background_exposures = exposures
+        self.last_spectrum = frame
         self._dark_member_warned = False
-        frames = getattr(self.spec, "last_member_raw", None)   # atomic tuple read
-        if frames is not None:
-            # May be one feed frame newer than last_spectrum; both are darks.
-            self.background_members = tuple(np.asarray(f, float).copy()
-                                            for f in frames)
         self.chk_dark.setEnabled(True); self.chk_dark.setChecked(True)
-        self.status.showMessage("Dark recorded.", 3000)
+        self.status.showMessage(f"Dark recorded — {where}.", 4000)
+
+    def _invalidate_dark(self, reason):
+        """Throw the recorded dark away and say why.
+
+        Used when something changes what a frame CONTAINS — an exposure, or an
+        Avantes on-board correction. A dark is offset + dark-current x t, so
+        rescaling it by an exposure ratio is wrong in general and would leave a
+        plausible-looking but incorrect baseline; better to have none. No-op
+        when there is nothing recorded, so callers need not check.
+
+        Not needed for a stitch-factor or overlap-band change: the merged dark
+        is derived from the member frames, so it follows both on its own.
+        """
+        if (self.background is None and self.background_members is None):
+            return
+        self.background = None
+        self.background_members = None
+        self.background_exposures = None
+        self._dark_member_warned = False
+        self.chk_dark.setChecked(False); self.chk_dark.setEnabled(False)
+        # Timeout 0 — a silently dropped dark is exactly the kind of thing that
+        # should not scroll away before the operator looks up.
+        self.status.showMessage(f"Dark discarded — {reason}. Re-record it.", 0)
 
     # ── Manual stage ──────────────────────────────────────────────────────────
     def _set_stage_controls_enabled(self, on):
@@ -5010,17 +5128,40 @@ class FrogWindow(QMainWindow):
             # would under-report clipping. Saturation during a scan is reported
             # per-frame by the worker via saturation_warning -> _on_saturation.
             if self._scan_wl is not None:
-                spectrum = self._scan_col
-                if self.chk_dark.isChecked() and self.background is not None:
-                    # The worker's column is already calibrated; the stored
-                    # dark is raw — bring it to the same scale first.
-                    spectrum = np.clip(
-                        spectrum - self.spec.calibrate(self.background), 0, None)
-                self.canvas.update_spectrum(self._scan_wl, spectrum)
+                self.canvas.update_spectrum(self._scan_wl,
+                                            self._scan_col_corrected())
             self.canvas.update_trace(self._scan_trace)
             self.canvas.update_ac(self._scan_delays[:i + 1], ac)
         f = fwhm(self._scan_delays[:i + 1], ac)
         self.lbl_fwhm.setText(f"AC FWHM:  {f:.1f} fs" if np.isfinite(f) else "AC FWHM:  — fs")
+
+    def _scan_col_corrected(self):
+        """The scan column to plot, with the dark removed.
+
+        A scan column arrives already merged and calibrated, and there are no
+        per-column member frames to rebuild it from, so a stitched pair takes
+        the DERIVED merged dark — the member darks pushed through the current
+        factor and band. That lands on the same baseline the live view used.
+        A single device's dark is raw counts and needs the calibration applied
+        to it first, since the worker's column already carries one.
+        """
+        col = self._scan_col
+        if not self.chk_dark.isChecked():
+            return col
+        if isinstance(self.spec, StitchedSpectrometer):
+            darks = self.background_members
+            if darks is None:
+                return col
+            try:
+                bg = self.spec.combined_dark(darks)
+            except Exception:
+                return col          # mismatched shapes: better raw than wrong
+            if bg.shape != np.shape(col):
+                return col
+            return np.clip(col - bg, 0, None)
+        if self.background is None:
+            return col
+        return np.clip(col - self.spec.calibrate(self.background), 0, None)
 
     def _on_background(self, which, spectrum):
         self.status.showMessage(f"Background ({which}) captured.", 2500)
