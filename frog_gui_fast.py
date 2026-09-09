@@ -221,18 +221,46 @@ def _make_check_icon(color, tag):
     return fp.as_posix()
 
 
+def _glyph_icon(kind, color, px=15):
+    """A play/stop glyph as a QIcon, drawn in `color`.
+
+    Generated rather than loaded from icons/ because this one button has to
+    re-colour itself twice over: once for its state (accent while stopped,
+    danger while running) and once for the theme. A PNG can do neither, and the
+    four files it would otherwise take would still be wrong the moment either
+    palette changes. Same QPainter approach as the spinbox arrows above.
+    """
+    pm = QPixmap(px, px)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(color))
+    if kind == "play":
+        # Inset asymmetrically: a triangle's visual centre sits left of its
+        # bounding box centre, so an even inset reads as shifted left.
+        p.drawPolygon(QPolygonF([QPointF(px * 0.26, px * 0.16),
+                                 QPointF(px * 0.26, px * 0.84),
+                                 QPointF(px * 0.84, px * 0.50)]))
+    else:
+        p.drawRoundedRect(QRectF(px * 0.20, px * 0.20, px * 0.60, px * 0.60),
+                          px * 0.10, px * 0.10)
+    p.end()
+    return QIcon(pm)
+
+
 def build_stylesheet(pal, tag):
     uri_up, uri_dn = _make_arrow_icons(pal["text"], tag)
     uri_chk = _make_check_icon(pal["bg"], tag)
     return f"""
 QMainWindow, QWidget {{ background-color:{pal['bg']}; color:{pal['text']};
     font-family:{FONT_STACK}; font-size:13px; font-weight:400; }}
-QGroupBox {{ border:1px solid {pal['border']}; border-radius:6px; margin-top:12px;
-    padding:10px 6px 8px 6px; font-size:11px; font-weight:700; color:{pal['text_dim']};
+QGroupBox {{ border:1px solid {pal['border']}; border-radius:6px; margin-top:11px;
+    padding:6px 6px 6px 6px; font-size:11px; font-weight:700; color:{pal['text_dim']};
     letter-spacing:1.5px; text-transform:uppercase; }}
 QGroupBox::title {{ subcontrol-origin:margin; left:8px; padding:0 4px; }}
 QPushButton {{ background-color:{pal['surface']}; border:1px solid {pal['border']};
-    border-radius:5px; padding:7px 14px; color:{pal['text']}; font-size:13px;
+    border-radius:5px; padding:5px 12px; color:{pal['text']}; font-size:13px;
     font-weight:600; }}
 QPushButton:focus {{ border-color:{pal['accent']}; }}
 QPushButton:hover {{ border-color:{pal['accent']}; color:{pal['accent']};
@@ -245,11 +273,26 @@ QPushButton#danger {{ border-color:{pal['danger']}; color:{pal['danger']}; }}
 QPushButton#danger:hover {{ background-color:{pal['danger']}; color:{pal['bg']}; }}
 /* Narrow unit toggle: the default 14px side padding leaves too little text box
    inside its fixed width, and clipped "um". */
-QPushButton#unit {{ padding:7px 4px; }}
+QPushButton#unit {{ padding:5px 4px; }}
+/* Secondary actions in the side panel — same colours as the default/accent
+   buttons, but on one text line's worth of padding so the panel fits without
+   scrolling. */
+QPushButton#compact {{ padding:4px 10px; font-size:12px; }}
+QPushButton#accentcompact {{ padding:4px 10px; font-size:12px;
+    border-color:{pal['accent']}; color:{pal['accent']}; }}
+QPushButton#accentcompact:hover {{ background-color:{pal['accent']};
+    color:{pal['bg']}; }}
 QPushButton#overlay {{ border-color:{pal['accent']}; color:{pal['accent']};
     padding:0px; font-size:12px; border-radius:4px; }}
 QPushButton#overlay:hover {{ background-color:{pal['accent']}; color:{pal['bg']}; }}
 QPushButton#overlay:pressed {{ background-color:{pal['accent']}; color:{pal['bg']}; }}
+/* Same header button, in the stop colour — the live feed's running state. */
+QPushButton#overlaydanger {{ border-color:{pal['danger']}; color:{pal['danger']};
+    padding:0px; font-size:12px; border-radius:4px; }}
+QPushButton#overlaydanger:hover {{ background-color:{pal['danger']};
+    color:{pal['bg']}; }}
+QPushButton#overlaydanger:pressed {{ background-color:{pal['danger']};
+    color:{pal['bg']}; }}
 QPushButton::menu-indicator {{ image: url("{uri_dn}"); width:8px; height:7px;
     subcontrol-origin:padding; subcontrol-position:center right; right:6px; }}
 QMenu {{ background-color:{pal['surface']}; border:1px solid {pal['border']};
@@ -261,13 +304,13 @@ QMenu::item:selected {{ background-color:{pal['border_hover']};
 QMenu::indicator {{ width:12px; height:12px; left:8px; }}
 QDoubleSpinBox, QSpinBox {{ background-color:{pal['surface']};
     border:1px solid {pal['border']}; border-radius:4px;
-    padding:4px 24px 4px 8px; color:{pal['text']}; font-weight:400;
-    min-height:26px; selection-background-color:{pal['accent']};
+    padding:2px 18px 2px 6px; color:{pal['text']}; font-weight:400;
+    min-height:20px; selection-background-color:{pal['accent']};
     selection-color:{pal['bg']}; }}
 QDoubleSpinBox:focus, QSpinBox:focus {{ border-color:{pal['accent']}; }}
 QDoubleSpinBox::up-button, QSpinBox::up-button {{
     subcontrol-origin:border; subcontrol-position:top right;
-    width:22px; border-left:1px solid {pal['border']};
+    width:16px; border-left:1px solid {pal['border']};
     border-bottom:1px solid {pal['border']};
     border-top-right-radius:4px; background:{pal['surface']}; }}
 QDoubleSpinBox::up-button:hover, QSpinBox::up-button:hover {{
@@ -276,7 +319,7 @@ QDoubleSpinBox::up-button:pressed, QSpinBox::up-button:pressed {{
     background:{pal['accent']}; }}
 QDoubleSpinBox::down-button, QSpinBox::down-button {{
     subcontrol-origin:border; subcontrol-position:bottom right;
-    width:22px; border-left:1px solid {pal['border']};
+    width:16px; border-left:1px solid {pal['border']};
     border-bottom-right-radius:4px; background:{pal['surface']}; }}
 QDoubleSpinBox::down-button:hover, QSpinBox::down-button:hover {{
     background:{pal['border_hover']}; }}
@@ -295,6 +338,8 @@ QLabel {{ background:transparent; }}
 QLabel#dim {{ color:{pal['text_dim']}; font-size:12px; font-weight:400; }}
 QLabel#value {{ color:{pal['accent']}; font-weight:600; font-size:15px; }}
 QLabel#readout {{ color:{pal['accent']}; font-weight:600; font-size:15px;
+    font-family:'Cascadia Mono','Consolas',monospace; }}
+QLabel#readout_sm {{ color:{pal['accent']}; font-weight:600; font-size:13px;
     font-family:'Cascadia Mono','Consolas',monospace; }}
 QLabel#moving {{ color:{pal['warn']}; font-weight:600; }}
 QLabel#hdr {{ color:{pal['text_dim']}; font-weight:700; }}
@@ -699,7 +744,7 @@ SAT_WARN_FRACTION = 0.90
 # steps in count map to equal steps in apparent brightness — a trace read off
 # a non-uniform map (jet and friends) shows structure the data does not have.
 # First entry is the default.
-TRACE_COLORMAPS = ["magma", "viridis", "inferno", "plasma", "cividis"]
+TRACE_COLORMAPS = ["jet", "magma", "viridis", "inferno", "plasma", "cividis"]
 
 
 class StatusLamp(QWidget):
@@ -956,6 +1001,59 @@ class AcquisitionSettingsDialog(QDialog):
             self.show(); self.raise_()
 
 
+class AlignmentDialog(QDialog):
+    """Settings for alignment mode — the Δ button over the spectrum panel.
+
+    Its own window rather than a side-panel row: the step is dialled in once
+    when the geometry changes and then left alone, so it was costing the panel
+    a permanent block for a control nobody touches during a measurement.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Tool)
+        self.setWindowTitle("Alignment")
+        self.setFixedWidth(300)
+        lay = QVBoxLayout(self); lay.setSpacing(10)
+        lay.setContentsMargins(14, 14, 14, 14)
+
+        lay.addWidget(self._hdr("Sweep"))
+        row = QGridLayout(); row.setSpacing(8)
+        row.addWidget(QLabel("Alignment step"), 0, 0)
+        # Half-width of the four-point sweep. Its own box rather than the stage
+        # jog step: that one switches to um, and an alignment offset is only
+        # ever a delay.
+        self.spin_align_step = DoubleSpinBox()
+        self.spin_align_step.setDecimals(0)
+        self.spin_align_step.setRange(1.0, 100000.0)
+        self.spin_align_step.setValue(100.0)
+        self.spin_align_step.setSuffix(" fs")
+        self.spin_align_step.setToolTip(
+            "Half-width x of the alignment sweep: spectra are taken at "
+            "−2x, −x, +x and +2x from the current position.")
+        row.addWidget(self.spin_align_step, 0, 1)
+        lay.addLayout(row)
+
+        hint = QLabel(
+            "Press Δ above the spectrum to run the sweep. It measures at −2x, "
+            "−x, +x and +2x from where the stage is now and overlays "
+            "S(+x)−S(−x) and S(+2x)−S(−2x): a symmetric pulse gives two flat "
+            "curves on zero. The stage is left where it started.")
+        hint.setObjectName("dim"); hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        btn = QPushButton("Close"); btn.clicked.connect(self.hide)
+        lay.addWidget(btn)
+
+    def _hdr(self, text):
+        l = QLabel(text); l.setObjectName("hdr")
+        return l
+
+    def toggle(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.show(); self.raise_()
+
+
 class HardwareDialog(QDialog):
     """Switch the stage and spectrometer INDEPENDENTLY (e.g. real stage +
     simulated spectrometer), with inline status."""
@@ -995,6 +1093,31 @@ class HardwareDialog(QDialog):
         b_pj.clicked.connect(lambda: self._do(self._connect_piezo))
         sgrid.addWidget(self.edit_piezo_port, 2, 0); sgrid.addWidget(b_pj, 2, 1)
         lay.addLayout(sgrid)
+
+        # Backlash approach margin. Every move undershoots by this much when it
+        # would otherwise arrive from above, so the zero you mark by jogging and
+        # the positions a scan sweeps through sit in the same frame. It lives
+        # here because it is a property OF THE CONNECTED STAGE — the connect
+        # buttons above seed it, and _sync_backlash_ui pushes the new stage's
+        # default into this box on every swap.
+        brow = QGridLayout(); brow.setSpacing(6)
+        brow.setColumnStretch(0, 0); brow.setColumnStretch(1, 1)
+        brow.addWidget(QLabel("Backlash"), 0, 0)
+        self.spin_backlash = DoubleSpinBox()
+        self.spin_backlash.setRange(0.0, 1000.0); self.spin_backlash.setDecimals(1)
+        self.spin_backlash.setSingleStep(10.0); self.spin_backlash.setSuffix(" um")
+        self.spin_backlash.setToolTip(
+            "Approach margin. Lead-screw stages land in a different place "
+            "depending on which way they arrived; undershooting by more than "
+            "the slack and coming back up makes every move repeatable.\n\n"
+            "0 disables it — correct for a Thorlabs controller (its firmware "
+            "already does this) or a piezo, wrong for a Zaber.")
+        self.spin_backlash.valueChanged.connect(self.main._on_backlash_changed)
+        brow.addWidget(self.spin_backlash, 0, 1)
+        lay.addLayout(brow)
+        self.lbl_backlash_fs = QLabel("—"); self.lbl_backlash_fs.setObjectName("dim")
+        self.lbl_backlash_fs.setWordWrap(True)
+        lay.addWidget(self.lbl_backlash_fs)
 
         lay.addWidget(_hline())
 
@@ -1990,7 +2113,12 @@ class GraphicsSettingsDialog(QDialog):
 # Margins are sized for the 9-pt plot fonts: LEFT holds the spectrum's y label
 # plus its tick labels, COLGAP the right column's y label, and BOT the bottom
 # row's tick labels and x label.
-_GEO_R, _GEO_TOP = 0.99, 0.95
+_GEO_R = 0.99
+# TOP is the header band: the panel title and that panel's overlay buttons share
+# one line above the axes. Sized in pixels for the same reason as LEFT below —
+# it holds a fixed-size Qt button, not a fraction of the figure.
+_GEO_TOP_PX  = 34    # HDR_BTN (24) + HDR_PAD (6) + 4 px above the button
+_GEO_TOP_MAX = 0.12  # …but never eat this much of a short window
 # The left margin and the column gap hold text at a FIXED point size, so they
 # are sized in logical pixels and only converted to a fraction at layout time:
 # one fraction that fits a small window wastes half of a large one (the old
@@ -2016,8 +2144,16 @@ _GEO_H_ROWGAP  = 0.0        # flush: the stacked pair shares one delay axis, so
 _AC_YLIM = (0.0, 1.05)
 
 # Title offsets in inches, so the gaps are DPI- and resize-independent.
-_TITLE_ABOVE_IN  = 5 / 72   # matches the original pad=5
+_TITLE_ABOVE_IN  = 6 / 72   # centres the 12 pt title in the header band
 _TITLE_INSET_IN  = (0.08, 0.06)   # (right, down) from the axes' top-left corner
+
+# ── Panel header band, in logical pixels ─────────────────────────────────────
+# The overlay buttons above each panel. Square and small enough that a row of
+# them reads as one line with the panel title beside it; HDR_PAD is the gap
+# between the row's bottom edge and the axes' top spine.
+HDR_BTN = 24
+HDR_GAP = 4
+HDR_PAD = 6
 
 
 class PlotSplitHandle(QWidget):
@@ -2134,6 +2270,15 @@ class FrogCanvas(FigureCanvasQTAgg):
 
         (self.line_spec,) = self.ax_spec.plot([], [], color=PALETTE["accent"], lw=1)
         (self.line_ac,)   = self.ax_ac.plot([], [], color=PALETTE["accent2"], lw=1)
+        # AC width readout, boxed inside the panel it describes rather than in
+        # the side panel. Top-RIGHT: horizontal mode puts the AC's own title
+        # inside the panel's top-left, and the curve's peak sits at the middle.
+        self.txt_fwhm = self.ax_ac.text(
+            0.985, 0.94, "", transform=self.ax_ac.transAxes,
+            ha="right", va="top", fontsize=9, color=PALETTE["accent2"],
+            zorder=5,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor=PALETTE["surface"],
+                      edgecolor=PALETTE["border"], alpha=0.85))
         # Multi-spectrometer overlay: one curve per member, shown INSTEAD of
         # line_spec. Separate artists rather than a re-coloured line_spec, so
         # the single-device path stays exactly as it was. line_m1 is SLOT 1
@@ -2167,9 +2312,15 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.diff_zero = self.ax_spec.axhline(
             0.0, color=PALETTE["text_dim"], lw=0.8, ls="--", zorder=0)
         self.diff_zero.set_visible(False)
-        self.im = self.ax_trace.imshow(np.zeros((2, 2)), origin="lower",
-                                       aspect="auto", cmap="magma",
-                                       extent=[-1, 1, 0, 1])
+        # NaN, not zeros: with no scan yet there is no data, and _apply_cmap
+        # paints 'bad' pixels in the plot background — so an empty panel reads
+        # as empty. Zeros would paint the colormap's bottom colour over the
+        # whole panel, which is invisible under magma but a solid blue field
+        # under jet. The clim is pinned because an all-NaN array gives the
+        # autoscale nothing to work with.
+        self.im = self.ax_trace.imshow(np.full((2, 2), np.nan), origin="lower",
+                                       aspect="auto", cmap="jet",
+                                       extent=[-1, 1, 0, 1], vmin=0.0, vmax=1.0)
         # Resample the DATA to screen resolution and colour the result, rather
         # than colouring every one of the trace's ~10^6 values and resampling
         # the RGBA. Both give the same picture under the linear norm this image
@@ -2203,7 +2354,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._trace_raw    = None    # last full trace, unmasked
         self._trace_peak   = None    # its max when the caller supplied one
         self._trace_thresh = 0.0     # display floor, fraction of peak (0 = off)
-        self._cmap_name    = "magma"
+        self._cmap_name    = "jet"
         self._cmap_rev     = False
         self._bg_static    = None    # defined before _apply_cmap touches it
         self._apply_cmap()           # installs the masked-pixel colour
@@ -2232,13 +2383,15 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_d1.set_animated(True)
         self.line_d2.set_animated(True)
         self.im.set_animated(True)
+        self.txt_fwhm.set_animated(True)
         self._animated = [(self.ax_spec, self.line_spec),
                           (self.ax_spec, self.line_m1),
                           (self.ax_spec, self.line_m2),
                           (self.ax_spec, self.line_d1),
                           (self.ax_spec, self.line_d2),
                           (self.ax_trace, self.im),
-                          (self.ax_ac, self.line_ac)]
+                          (self.ax_ac, self.line_ac),
+                          (self.ax_ac, self.txt_fwhm)]
         self._bg = None            # cached full-figure background (no animated)
         # Background with the trace image + AC line already composited, so a
         # live spectrum frame only has to draw the spectrum line on top.
@@ -2300,7 +2453,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         """
         # set_title returns the artist that actually carries the text, which for
         # loc="left" is ax._left_title and NOT ax.title — style the return value.
-        t = ax.set_title(text, color=PALETTE["accent"], fontsize=10.5,
+        t = ax.set_title(text, color=PALETTE["accent"], fontsize=12,
                          fontweight="bold", loc="left", y=1.0)
         t.set_va("top" if inside else "bottom")
         dx, dy = (_TITLE_INSET_IN[0], -_TITLE_INSET_IN[1]) if inside \
@@ -2333,7 +2486,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         explicitly instead of being left where the gridspec put them, so the
         proportion slider works in either mode (and before the first draw).
         """
-        L, R, TOP = self._left_margin(), _GEO_R, _GEO_TOP
+        L, R, TOP = self._left_margin(), _GEO_R, self._top_margin()
         horiz   = self._layout_mode == "horizontal"
         cgap    = self._col_gap()
         # Clamped, not rejected: the slider must never be a silent no-op.
@@ -2380,6 +2533,12 @@ class FrogCanvas(FigureCanvasQTAgg):
         """Left margin as a figure fraction — a fixed pixel width (see
         _GEO_L_PX), so a wide window spends it on plot instead of blank paper."""
         return min(_GEO_L_PX / max(self.width(), 1), _GEO_L_MAX)
+
+    def _top_margin(self):
+        """Top of the axes as a figure fraction: the header band reserved for
+        each panel's title and overlay buttons, in pixels (see _GEO_TOP_PX) so
+        the fixed-size buttons always clear the axes."""
+        return 1.0 - min(_GEO_TOP_PX / max(self.height(), 1), _GEO_TOP_MAX)
 
     def _col_gap(self):
         """Column gap as a figure fraction, floored at the pixels the right
@@ -2507,6 +2666,9 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.fig.set_facecolor(pal["plot_bg"])
         self.line_spec.set_color(pal["accent"])
         self.line_ac.set_color(pal["accent2"])
+        self.txt_fwhm.set_color(pal["accent2"])
+        self.txt_fwhm.get_bbox_patch().set_facecolor(pal["surface"])
+        self.txt_fwhm.get_bbox_patch().set_edgecolor(pal["border"])
         # line_m1/line_m2 keep MEMBER_COLORS in both themes — they are chosen
         # to work on either background, and re-theming them would cost the
         # colourblind separation that is the whole point. Same for the two
@@ -2568,6 +2730,9 @@ class FrogCanvas(FigureCanvasQTAgg):
                 self.restore_region(self._bg)
                 self.ax_trace.draw_artist(self.im)
                 self.ax_ac.draw_artist(self.line_ac)
+                # Static between scan columns, exactly like the AC line — so it
+                # belongs in the cached background, not in the per-frame draw.
+                self.ax_ac.draw_artist(self.txt_fwhm)
                 self._bg_static = self.copy_from_bbox(self.fig.bbox)
             self.restore_region(self._bg_static)
             self.ax_spec.draw_artist(self.line_spec)
@@ -3157,6 +3322,17 @@ class FrogCanvas(FigureCanvasQTAgg):
         else:
             self._request_blit()
 
+    def set_fwhm(self, fs=None):
+        """Autocorrelation width shown in the AC panel's top-right corner.
+        None (or a non-finite value) clears it — there is no width to report."""
+        text = ("" if fs is None or not np.isfinite(fs)
+                else f"AC FWHM  {fs:.1f} fs")
+        if text == self.txt_fwhm.get_text():
+            return                   # a scan re-reports the same width often
+        self.txt_fwhm.set_text(text)
+        self._bg_static = None       # it is baked into that cache
+        self._request_blit()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main window
@@ -3263,6 +3439,7 @@ class FrogWindow(QMainWindow):
         self._build_hardware_sim()
 
         self.dlg_settings = AcquisitionSettingsDialog(self)
+        self.dlg_align    = AlignmentDialog(self)
         self.dlg_hardware = HardwareDialog(self, self)
         # Vendor-specific controls, opened from a toolbar button that stays
         # hidden until an Avantes is actually connected.
@@ -3270,6 +3447,14 @@ class FrogWindow(QMainWindow):
         self.spin_avg  = self.dlg_settings.spin_avg
         self.spin_idle = self.dlg_settings.spin_idle
         self.spin_wait = self.dlg_settings.spin_wait
+        # Controls that moved into sub-windows but are still driven from here.
+        # Aliased rather than reached through the dialog at every call site, so
+        # _sync_backlash_ui, _on_backlash_changed, _set_stage_controls_enabled
+        # and the alignment sweep read exactly what they always did. Both
+        # dialogs are built above _build_ui(), which is what needs them.
+        self.spin_align_step = self.dlg_align.spin_align_step
+        self.spin_backlash   = self.dlg_hardware.spin_backlash
+        self.lbl_backlash_fs = self.dlg_hardware.lbl_backlash_fs
         # The threshold is applied live, not just at scan start, so the lamp
         # reflects the setting you are in the middle of tuning.
         self.dlg_settings.spin_sat.valueChanged.connect(self._on_sat_fraction)
@@ -3732,6 +3917,11 @@ class FrogWindow(QMainWindow):
         b_gfx = QPushButton("Graphics Settings")
         b_gfx.clicked.connect(lambda: self.dlg_graphics.toggle())
         tb.addWidget(b_gfx)
+        b_align = QPushButton("Alignment")
+        b_align.setToolTip("Alignment-mode sweep settings — the step the Δ "
+                           "button over the spectrum measures at")
+        b_align.clicked.connect(self.dlg_align.toggle)
+        tb.addWidget(b_align)
         tb.addWidget(self._build_export_button())
         tb.addWidget(self._build_calibration_button())
         tb.addWidget(self._build_multispec_button())
@@ -3770,7 +3960,7 @@ class FrogWindow(QMainWindow):
 
         ctrl = QWidget()
         ctrl.setMinimumWidth(280); ctrl.setMaximumWidth(320)
-        cl = QVBoxLayout(ctrl); cl.setSpacing(8); cl.setContentsMargins(0, 0, 4, 0)
+        cl = QVBoxLayout(ctrl); cl.setSpacing(6); cl.setContentsMargins(0, 0, 4, 0)
         cl.addWidget(self._build_spectrum_group())
         cl.addWidget(self._build_stage_group())
         cl.addWidget(self._build_scan_group())
@@ -3785,56 +3975,70 @@ class FrogWindow(QMainWindow):
         self.canvas = FrogCanvas()
         root.addWidget(self.canvas, stretch=1)
 
-        # Overlay auto-fit button: child of canvas so it floats in the margin area
+        # ── Panel header buttons ─────────────────────────────────────────────
+        # All children of the canvas so they float over the figure margin, and
+        # all positioned by _position_panel_buttons: each one belongs to the
+        # panel it acts on, and every panel edge moves with the split fraction,
+        # the window size and the layout mode.
         self.btn_autofit = QPushButton(self.canvas)
         self.btn_autofit.setObjectName("overlay")
         if RESCALE_ICON.exists():
             self.btn_autofit.setIcon(QIcon(str(RESCALE_ICON)))
-            self.btn_autofit.setIconSize(QSize(18, 18))
+            self.btn_autofit.setIconSize(QSize(15, 15))
         else:
             self.btn_autofit.setText("↔↕")
-        self.btn_autofit.setFixedSize(30, 30)
+        self.btn_autofit.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_autofit.setToolTip("Auto-fit spectrum X and Y axes to current data")
-        self.btn_autofit.move(6, 6)
         self.btn_autofit.show()
         self.btn_autofit.clicked.connect(self._autofit_spectrum)
 
-        # Per-spectrometer view toggle, beside the auto-fit button. Only
-        # meaningful for a stitched pair, so it stays hidden otherwise; its
-        # icon and tooltip are set by _refresh_overlay_button.
+        # Live-feed start/stop. In the spectrum header rather than the side
+        # panel: it is the control most often reached for while watching that
+        # panel, and it was costing the panel a full-width button. Icon and
+        # colour come from _refresh_feed_button.
+        self.btn_feed = QPushButton(self.canvas)
+        self.btn_feed.setCheckable(True); self.btn_feed.setChecked(True)
+        self.btn_feed.setFixedSize(HDR_BTN, HDR_BTN)
+        self.btn_feed.setIconSize(QSize(15, 15))
+        self.btn_feed.show()
+        self.btn_feed.toggled.connect(self._toggle_feed)
+        self._refresh_feed_button()
+
+        # Per-spectrometer view toggle. Only meaningful for a stitched pair, so
+        # it stays hidden otherwise; its icon and tooltip are set by
+        # _refresh_overlay_button.
         self.btn_overlay = QPushButton(self.canvas)
         self.btn_overlay.setObjectName("overlay")
         self.btn_overlay.setCheckable(True)
-        self.btn_overlay.setFixedSize(30, 30)
-        self.btn_overlay.setIconSize(QSize(18, 18))
-        self.btn_overlay.move(42, 6)        # 6 + 30 + 6, right of auto-fit
+        self.btn_overlay.setFixedSize(HDR_BTN, HDR_BTN)
+        self.btn_overlay.setIconSize(QSize(15, 15))
         self.btn_overlay.hide()
         self.btn_overlay.toggled.connect(self._on_overlay_toggled)
 
         # Alignment mode, spectrum side: step to +/-x and +/-2x and overlay the
-        # two differences. Pinned to the panel by _position_align_button.
+        # two differences.
         self.btn_align_spec = QPushButton("Δ", self.canvas)
         self.btn_align_spec.setObjectName("overlay")
         self.btn_align_spec.setCheckable(True)
-        self.btn_align_spec.setFixedSize(30, 30)
+        self.btn_align_spec.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_align_spec.setToolTip(
-            "Alignment mode — measure at −2x, −x, +x, +2x (Alignment Step) and "
-            "overlay S(+x)−S(−x) and S(+2x)−S(−2x).\nA symmetric pulse gives "
-            "two flat curves on zero. Press again to clear.")
+            "Alignment mode — measure at −2x, −x, +x, +2x (Alignment → "
+            "Alignment step) and overlay S(+x)−S(−x) and S(+2x)−S(−2x).\nA "
+            "symmetric pulse gives two flat curves on zero. Press again to "
+            "clear.")
         self.btn_align_spec.show()
         self.btn_align_spec.toggled.connect(self._on_align_spec_toggled)
 
-        # Alignment mode, trace side. Pinned to the trace panel rather than to
-        # the canvas corner, because that panel moves with the split fraction,
-        # the window width and the layout mode.
+        # Alignment mode, trace side — the trace panel's own header.
+        # Wider than the rest: it is the one button still carrying a word.
         self.btn_align_trace = QPushButton("RAW", self.canvas)
         self.btn_align_trace.setObjectName("overlay")
         self.btn_align_trace.setCheckable(True)
-        self.btn_align_trace.setFixedSize(46, 30)
+        self.btn_align_trace.setFixedSize(40, HDR_BTN)
         self.btn_align_trace.hide()
         self.btn_align_trace.toggled.connect(self._on_align_trace_toggled)
-        self.canvas.axes_relaid.connect(self._position_align_button)
-        self._position_align_button()
+        self.canvas.axes_relaid.connect(self._position_panel_buttons)
+        self._position_panel_buttons()
 
         self._refresh_layout_button()    # needs the canvas for the current mode
 
@@ -4472,12 +4676,8 @@ class FrogWindow(QMainWindow):
 
     def _build_spectrum_group(self):
         grp = QGroupBox("Spectrum")
-        lay = QVBoxLayout(grp); lay.setSpacing(6)
-        self.btn_feed = QPushButton("STOP FEED")
-        self.btn_feed.setObjectName("danger")
-        self.btn_feed.setCheckable(True); self.btn_feed.setChecked(True)
-        self.btn_feed.toggled.connect(self._toggle_feed)
-        lay.addWidget(self.btn_feed)
+        lay = QVBoxLayout(grp); lay.setSpacing(4)
+        # The feed toggle lives in the spectrum panel's header (see _build_ui).
         self.lbl_integration = QLabel("Integration Time")
         lay.addWidget(self.lbl_integration)
         # Floating point, because the range is the DEVICE's: an Avantes goes
@@ -4522,31 +4722,18 @@ class FrogWindow(QMainWindow):
         self.spin_integration2.setVisible(False)
         lay.addWidget(_hline())
         self.btn_dark = QPushButton("Record Dark")
-        self.btn_dark.setObjectName("accent")
+        self.btn_dark.setObjectName("accentcompact")
         self.btn_dark.clicked.connect(self._capture_dark)
         lay.addWidget(self.btn_dark)
         self.chk_dark = QCheckBox("Subtract Dark")
         self.chk_dark.setEnabled(False)
         lay.addWidget(self.chk_dark)
-        lay.addWidget(_hline())
-        # Half-width of the alignment mode's four-point sweep (the Δ button
-        # over the spectrum). Its own box rather than the stage jog step: that
-        # one switches to um, and an alignment offset is only ever a delay.
-        lay.addWidget(QLabel("Alignment Step"))
-        self.spin_align_step = DoubleSpinBox()
-        self.spin_align_step.setDecimals(0)
-        self.spin_align_step.setRange(1.0, 100000.0)
-        self.spin_align_step.setValue(100.0)
-        self.spin_align_step.setSuffix(" fs")
-        self.spin_align_step.setToolTip(
-            "Half-width x of the alignment sweep: spectra are taken at "
-            "−2x, −x, +x and +2x from the current position.")
-        lay.addWidget(self.spin_align_step)
+        # The alignment step lives in the Alignment dialog (toolbar).
         return grp
 
     def _build_stage_group(self):
         grp = QGroupBox("Stage")
-        lay = QVBoxLayout(grp); lay.setSpacing(6)
+        lay = QVBoxLayout(grp); lay.setSpacing(4)
 
         jog = QHBoxLayout()
         self.btn_minus = QPushButton("−"); self.btn_plus = QPushButton("+")
@@ -4582,48 +4769,37 @@ class FrogWindow(QMainWindow):
         zrow.addWidget(self.btn_home); zrow.addWidget(self.btn_goto_zero)
         lay.addLayout(zrow)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Stage"))
-        self.lbl_moving = QLabel("idle"); self.lbl_moving.setObjectName("dim")
-        self.lbl_moving.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        row.addWidget(self.lbl_moving)
-        lay.addLayout(row)
-
         lay.addWidget(_hline())
-        for label, attr in [("Current position", "lbl_pos"), ("Zero-delay pos", "lbl_zero")]:
-            r = QHBoxLayout()
-            t = QLabel(label); t.setObjectName("dim")
-            v = QLabel("— um"); v.setObjectName("readout")
-            v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            setattr(self, attr, v)
-            r.addWidget(t); r.addWidget(v)
-            lay.addLayout(r)
+        # Positions and stage state on one line, caption over value. They are
+        # read together (a delay is the difference between the first two, and
+        # neither means anything while the stage is still moving), and three
+        # stacked full-width rows cost the panel three lines for six short
+        # strings.
+        def _readout(caption, value, stretch):
+            col = QVBoxLayout(); col.setSpacing(1)
+            t = QLabel(caption); t.setObjectName("dim")
+            col.addWidget(t); col.addWidget(value)
+            prow.addLayout(col, stretch)
 
-        self.btn_set_zero = QPushButton("Set Current Position as 0 fs")
-        self.btn_set_zero.setObjectName("accent")
+        prow = QHBoxLayout(); prow.setSpacing(8)
+        self.lbl_pos  = QLabel("— um"); self.lbl_pos.setObjectName("readout_sm")
+        self.lbl_zero = QLabel("— um"); self.lbl_zero.setObjectName("readout_sm")
+        self.lbl_moving = QLabel("idle"); self.lbl_moving.setObjectName("dim")
+        _readout("Current", self.lbl_pos, 1)
+        _readout("Zero delay", self.lbl_zero, 1)
+        # No stretch: "idle"/"MOVING" is short, and the two positions need
+        # every pixel they can get at six significant figures.
+        _readout("Stage", self.lbl_moving, 0)
+        lay.addLayout(prow)
+
+        self.btn_set_zero = QPushButton("Set Position as 0 fs")
+        self.btn_set_zero.setObjectName("accentcompact")
         self.btn_set_zero.clicked.connect(self._mark_zero)
         lay.addWidget(self.btn_set_zero)
 
-        # Backlash approach margin. Every move undershoots by this much when it
-        # would otherwise arrive from above, so the zero you mark by jogging and
-        # the positions a scan sweeps through sit in the same frame.
-        brow = QHBoxLayout()
-        bl = QLabel("Backlash"); bl.setObjectName("dim")
-        self.spin_backlash = DoubleSpinBox()
-        self.spin_backlash.setRange(0.0, 1000.0); self.spin_backlash.setDecimals(1)
-        self.spin_backlash.setSingleStep(10.0); self.spin_backlash.setSuffix(" um")
-        self.spin_backlash.setToolTip(
-            "Approach margin. Lead-screw stages land in a different place "
-            "depending on which way they arrived; undershooting by more than "
-            "the slack and coming back up makes every move repeatable.\n\n"
-            "0 disables it — correct for a Thorlabs controller (its firmware "
-            "already does this) or a piezo, wrong for a Zaber.")
-        self.spin_backlash.valueChanged.connect(self._on_backlash_changed)
-        brow.addWidget(bl); brow.addWidget(self.spin_backlash)
-        lay.addLayout(brow)
-        self.lbl_backlash_fs = QLabel("—"); self.lbl_backlash_fs.setObjectName("dim")
-        self.lbl_backlash_fs.setWordWrap(True)
-        lay.addWidget(self.lbl_backlash_fs)
+        # Backlash lives in the Hardware dialog's Stage section — it is a
+        # property of the connected stage, and _sync_backlash_ui below still
+        # seeds it from here.
 
         self._update_stage_unit_ranges()   # stage + scan_cfg exist by now
         self.spin_step.setValue(100.0)     # after ranges: default 100 fs jog
@@ -4632,7 +4808,7 @@ class FrogWindow(QMainWindow):
 
     def _build_scan_group(self):
         grp = QGroupBox("FROG Scan")
-        lay = QVBoxLayout(grp); lay.setSpacing(6)
+        lay = QVBoxLayout(grp); lay.setSpacing(4)
         g = QGridLayout(); g.setSpacing(4)
 
         def row(r, label, spin, suffix, dec, lo, hi, val):
@@ -4665,13 +4841,11 @@ class FrogWindow(QMainWindow):
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100); self.progress.setValue(0)
+        self.progress.setFixedHeight(18)
         lay.addWidget(self.progress)
 
-        self.lbl_fwhm = QLabel("AC FWHM:  — fs")
-        self.lbl_fwhm.setObjectName("readout")
-        self.lbl_fwhm.setToolTip("Autocorrelation width, not pulse width "
-                                 "(differ by a shape-dependent factor).")
-        lay.addWidget(self.lbl_fwhm)
+        # The AC FWHM is reported inside the autocorrelation panel itself
+        # (FrogCanvas.set_fwhm), next to the curve it measures.
 
         self.btn_save = QPushButton(f"Save Scan ({EXPORT_FORMATS[self._export_fmt][1]})")
         self.btn_save.setEnabled(False)
@@ -4699,6 +4873,7 @@ class FrogWindow(QMainWindow):
             "Switch to dark mode" if name == "light" else "Switch to light mode")
         self._refresh_overlay_button()   # its icons are per-theme too
         self._refresh_layout_button()    # …and so are this one's
+        self._refresh_feed_button()      # …and its glyph is drawn from PALETTE
         self.status.showMessage(f"{name.capitalize()} mode.", 2000)
 
     # ── Plot layout ──────────────────────────────────────────────────────────
@@ -4873,6 +5048,9 @@ class FrogWindow(QMainWindow):
             "Show the combined stitched spectrum as one curve" if on else
             "Show each spectrometer as its own curve — compare the two across "
             "the overlap to judge the stitch factor")
+        # Its visibility just changed, and the header row is packed
+        # right-to-left around whatever is showing.
+        self._position_panel_buttons()
 
     def _on_overlay_toggled(self, on):
         if on and not (isinstance(self.spec, StitchedSpectrometer)
@@ -5284,27 +5462,67 @@ class FrogWindow(QMainWindow):
             self._feed.resume()
 
     # ── Alignment mode: raw stitched trace ───────────────────────────────────
-    def _position_align_button(self):
-        """Pin the two alignment buttons to the panels they act on.
+    def _position_panel_buttons(self):
+        """Lay out each panel's header row: the buttons that act on that panel,
+        right-aligned to its right edge, on the line the panel title occupies.
 
-        Δ goes to the spectrum panel's top-RIGHT and RAW to the trace panel's
-        top-LEFT. Not the canvas corner the auto-fit and per-spectrometer
-        buttons use: that corner already holds those two and the panel title,
-        and every one of these edges moves with the split fraction, the window
-        width and the layout mode.
+        Every edge here moves with the split fraction, the window size and the
+        layout mode, so this runs off canvas.axes_relaid — and off the two
+        refresh methods that show or hide a button, because the row is packed
+        right-to-left and its width depends on which buttons are visible.
         """
+        # getattr, not the attribute: the refresh methods that call this also
+        # run from _apply_spectrometer, which _build_hardware_sim reaches before
+        # _build_ui has created any of these buttons.
+        if getattr(self, "btn_align_trace", None) is None:
+            return
         c = self.canvas
-        _l, top, right = c.panel_edges_px(c.ax_spec)
-        self.btn_align_spec.move(round(right) - self.btn_align_spec.width() - 6,
-                                 round(top) + 6)
-        left, top, _r = c.panel_edges_px(c.ax_trace)
-        self.btn_align_trace.move(round(left) + 6, round(top) + 6)
+
+        def pack(ax, buttons):
+            _left, top, right = c.panel_edges_px(ax)
+            # The band sits ABOVE the axes: HDR_PAD of clear space between the
+            # buttons' bottom edge and the top spine.
+            y = round(top) - HDR_PAD - HDR_BTN
+            x = round(right) - 6
+            for b in reversed(buttons):
+                if not b.isVisible():
+                    continue      # hidden buttons take no room in the row
+                x -= b.width()
+                b.move(x, y)
+                x -= HDR_GAP
+
+        pack(c.ax_spec, [self.btn_autofit, self.btn_feed,
+                         self.btn_overlay, self.btn_align_spec])
+        pack(c.ax_trace, [self.btn_align_trace])
+
+    def _refresh_feed_button(self):
+        """Icon, colour and tooltip of the live-feed toggle.
+
+        Like the theme and layout buttons it advertises the CURRENT state, not
+        the state a click produces: a running feed is the red stop square, a
+        stopped one the accent play triangle. Both glyphs are drawn from the
+        live PALETTE, so a theme switch re-generates them.
+        """
+        running = self.btn_feed.isChecked()
+        self.btn_feed.setIcon(_glyph_icon(
+            "stop" if running else "play",
+            PALETTE["danger"] if running else PALETTE["accent"]))
+        self.btn_feed.setToolTip("Stop the live spectrum feed" if running
+                                 else "Start the live spectrum feed")
+        # Colour via objectName + repolish, not setStyleSheet, so a later theme
+        # switch restyles it along with everything else.
+        name = "overlaydanger" if running else "overlay"
+        if self.btn_feed.objectName() != name:
+            self.btn_feed.setObjectName(name)
+            self.btn_feed.style().unpolish(self.btn_feed)
+            self.btn_feed.style().polish(self.btn_feed)
 
     def _refresh_align_trace_button(self):
         """Show the RAW toggle only for a stitched pair, and only enable it
         once there is a scan whose raw member columns were recorded."""
         stitched = isinstance(self.spec, StitchedSpectrometer)
         self.btn_align_trace.setVisible(stitched)
+        self._position_panel_buttons()   # visibility drives the header row
         if not stitched:
             return
         ready = self._align_trace is not None
@@ -5419,11 +5637,9 @@ class FrogWindow(QMainWindow):
             # _reset_scan_ui start it once the scan hands the devices back.
             if not self._scan_running():
                 self._feed.resume()
-            self.btn_feed.setText("STOP FEED"); self.btn_feed.setObjectName("danger")
         else:
             self._feed.pause()
-            self.btn_feed.setText("START FEED"); self.btn_feed.setObjectName("accent")
-        self.btn_feed.style().unpolish(self.btn_feed); self.btn_feed.style().polish(self.btn_feed)
+        self._refresh_feed_button()
 
     def _apply_integration_time(self):
         """Push the (debounced) integration time(s) to the spectrometer.
@@ -5940,8 +6156,9 @@ class FrogWindow(QMainWindow):
             else:
                 self.canvas.update_trace(self._scan_trace, self._scan_peak)
             self.canvas.update_ac(self._scan_delays[:i + 1], ac)
-        f = fwhm(self._scan_delays[:i + 1], ac)
-        self.lbl_fwhm.setText(f"AC FWHM:  {f:.1f} fs" if np.isfinite(f) else "AC FWHM:  — fs")
+            # Inside the batch: the readout lives in the AC panel now, so its
+            # repaint is the same blit the three updates above share.
+            self.canvas.set_fwhm(fwhm(self._scan_delays[:i + 1], ac))
 
     def _scan_col_corrected(self):
         """The scan column to plot, with the dark removed.
@@ -6022,8 +6239,7 @@ class FrogWindow(QMainWindow):
             self.canvas.update_trace(result.trace)
         ac = result.autocorrelation()
         self.canvas.update_ac(result.delays_fs, ac)
-        f = result.fwhm_fs()
-        self.lbl_fwhm.setText(f"AC FWHM:  {f:.1f} fs" if np.isfinite(f) else "AC FWHM:  — fs")
+        self.canvas.set_fwhm(result.fwhm_fs())
         self.progress.setValue(100)
         n_bad = int(result.faulted_columns().size)
         if n_bad:
