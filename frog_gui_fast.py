@@ -304,13 +304,13 @@ QMenu::item:selected {{ background-color:{pal['border_hover']};
 QMenu::indicator {{ width:12px; height:12px; left:8px; }}
 QDoubleSpinBox, QSpinBox {{ background-color:{pal['surface']};
     border:1px solid {pal['border']}; border-radius:4px;
-    padding:2px 18px 2px 6px; color:{pal['text']}; font-weight:400;
-    min-height:20px; selection-background-color:{pal['accent']};
+    padding:1px 16px 1px 6px; color:{pal['text']}; font-weight:400;
+    min-height:18px; selection-background-color:{pal['accent']};
     selection-color:{pal['bg']}; }}
 QDoubleSpinBox:focus, QSpinBox:focus {{ border-color:{pal['accent']}; }}
 QDoubleSpinBox::up-button, QSpinBox::up-button {{
     subcontrol-origin:border; subcontrol-position:top right;
-    width:16px; border-left:1px solid {pal['border']};
+    width:14px; border-left:1px solid {pal['border']};
     border-bottom:1px solid {pal['border']};
     border-top-right-radius:4px; background:{pal['surface']}; }}
 QDoubleSpinBox::up-button:hover, QSpinBox::up-button:hover {{
@@ -319,7 +319,7 @@ QDoubleSpinBox::up-button:pressed, QSpinBox::up-button:pressed {{
     background:{pal['accent']}; }}
 QDoubleSpinBox::down-button, QSpinBox::down-button {{
     subcontrol-origin:border; subcontrol-position:bottom right;
-    width:16px; border-left:1px solid {pal['border']};
+    width:14px; border-left:1px solid {pal['border']};
     border-bottom-right-radius:4px; background:{pal['surface']}; }}
 QDoubleSpinBox::down-button:hover, QSpinBox::down-button:hover {{
     background:{pal['border_hover']}; }}
@@ -341,7 +341,11 @@ QLabel#readout {{ color:{pal['accent']}; font-weight:600; font-size:15px;
     font-family:'Cascadia Mono','Consolas',monospace; }}
 QLabel#readout_sm {{ color:{pal['accent']}; font-weight:600; font-size:13px;
     font-family:'Cascadia Mono','Consolas',monospace; }}
-QLabel#moving {{ color:{pal['warn']}; font-weight:600; }}
+/* The stage state, under its caption in the readout row. Bold in both states
+   so the column keeps one width and does not twitch as it flips; _moving()
+   swaps between the two object names. */
+QLabel#idle {{ color:{pal['text_dim']}; font-size:12px; font-weight:700; }}
+QLabel#moving {{ color:{pal['warn']}; font-size:12px; font-weight:700; }}
 QLabel#hdr {{ color:{pal['text_dim']}; font-weight:700; }}
 QLabel#sat {{ color:{pal['danger']}; font-size:12px; font-weight:600; }}
 QLabel#satok {{ color:{pal['text_dim']}; font-size:12px; font-weight:400; }}
@@ -4700,13 +4704,14 @@ class FrogWindow(QMainWindow):
         self._integration_timer.timeout.connect(self._apply_integration_time)
         self.spin_integration.valueChanged.connect(
             lambda _v: self._integration_timer.start())
-        lay.addWidget(self.spin_integration)
         # Second exposure, shown only for a stitched pair. The two devices see
         # very different signal levels, so one shared value always leaves one
         # of them either buried in read noise or clipped. S1/S2 are SLOT order
         # — the same numbering as the saturation lamps and the Multi-Spec menu.
-        self.lbl_integration2 = QLabel("Integration Time — S2")
-        lay.addWidget(self.lbl_integration2)
+        #
+        # Side by side under ONE caption rather than a second labelled row: a
+        # stitched pair is the tallest the panel ever gets, and a caption that
+        # reads "S1 / S2" over two boxes says the same thing in half the space.
         self.spin_integration2 = DoubleSpinBox()
         self.spin_integration2.setDecimals(0)
         self.spin_integration2.setRange(1.0, MAX_UI_EXPOSURE_MS)
@@ -4717,17 +4722,24 @@ class FrogWindow(QMainWindow):
         # in-flight acquire returns.
         self.spin_integration2.valueChanged.connect(
             lambda _v: self._integration_timer.start())
-        lay.addWidget(self.spin_integration2)
-        self.lbl_integration2.setVisible(False)
+        irow = QHBoxLayout(); irow.setSpacing(6)
+        irow.addWidget(self.spin_integration, 1)
+        irow.addWidget(self.spin_integration2, 1)
+        lay.addLayout(irow)
         self.spin_integration2.setVisible(False)
+
         lay.addWidget(_hline())
+        # Record and use on one line: the checkbox is what you reach for right
+        # after the button, and neither needs the panel's full width.
+        drow = QHBoxLayout(); drow.setSpacing(8)
         self.btn_dark = QPushButton("Record Dark")
         self.btn_dark.setObjectName("accentcompact")
         self.btn_dark.clicked.connect(self._capture_dark)
-        lay.addWidget(self.btn_dark)
         self.chk_dark = QCheckBox("Subtract Dark")
         self.chk_dark.setEnabled(False)
-        lay.addWidget(self.chk_dark)
+        drow.addWidget(self.btn_dark)
+        drow.addWidget(self.chk_dark, 1)
+        lay.addLayout(drow)
         # The alignment step lives in the Alignment dialog (toolbar).
         return grp
 
@@ -4775,21 +4787,24 @@ class FrogWindow(QMainWindow):
         # neither means anything while the stage is still moving), and three
         # stacked full-width rows cost the panel three lines for six short
         # strings.
-        def _readout(caption, value, stretch):
+        def _readout(caption, value, stretch, align=Qt.AlignLeft):
             col = QVBoxLayout(); col.setSpacing(1)
             t = QLabel(caption); t.setObjectName("dim")
+            t.setAlignment(align | Qt.AlignVCenter)
+            value.setAlignment(align | Qt.AlignVCenter)
             col.addWidget(t); col.addWidget(value)
             prow.addLayout(col, stretch)
 
         prow = QHBoxLayout(); prow.setSpacing(8)
         self.lbl_pos  = QLabel("— um"); self.lbl_pos.setObjectName("readout_sm")
         self.lbl_zero = QLabel("— um"); self.lbl_zero.setObjectName("readout_sm")
-        self.lbl_moving = QLabel("idle"); self.lbl_moving.setObjectName("dim")
+        self.lbl_moving = QLabel("IDLE"); self.lbl_moving.setObjectName("idle")
         _readout("Current", self.lbl_pos, 1)
         _readout("Zero delay", self.lbl_zero, 1)
-        # No stretch: "idle"/"MOVING" is short, and the two positions need
-        # every pixel they can get at six significant figures.
-        _readout("Stage", self.lbl_moving, 0)
+        # Centred, and bold in both states (see the #idle/#moving rules): it is
+        # a status lamp in text, not a number to read off. No stretch either —
+        # the two positions need every pixel at six significant figures.
+        _readout("Stage", self.lbl_moving, 0, Qt.AlignHCenter)
         lay.addLayout(prow)
 
         self.btn_set_zero = QPushButton("Set Position as 0 fs")
@@ -4809,48 +4824,61 @@ class FrogWindow(QMainWindow):
     def _build_scan_group(self):
         grp = QGroupBox("FROG Scan")
         lay = QVBoxLayout(grp); lay.setSpacing(4)
+        # Start beside Stop, then Step beside the background checkbox: the two
+        # ends of the sweep are read as a pair, and three label+spin+equivalent
+        # rows spent three lines on what fits in two.
         g = QGridLayout(); g.setSpacing(4)
+        g.setColumnStretch(1, 1); g.setColumnStretch(3, 1)
 
-        def row(r, label, spin, suffix, dec, lo, hi, val):
-            g.addWidget(QLabel(label), r, 0)
+        def cell(r, c, label, spin, suffix, dec, lo, hi, val):
+            g.addWidget(QLabel(label), r, c)
             spin.setRange(lo, hi); spin.setDecimals(dec)
             spin.setValue(val); spin.setSuffix(suffix)
-            g.addWidget(spin, r, 1)
-            eq = QLabel(""); eq.setObjectName("dim")
-            g.addWidget(eq, r, 2)
-            return eq
+            g.addWidget(spin, r, c + 1)
 
         self.spin_start = DoubleSpinBox()
         self.spin_stop  = DoubleSpinBox()
         self.spin_step_fs = DoubleSpinBox()
-        self.eq_start = row(0, "Start", self.spin_start, " fs", 1, -1e6, 1e6, -500.0)
-        self.eq_stop  = row(1, "Stop",  self.spin_stop,  " fs", 1, -1e6, 1e6,  500.0)
-        row(2, "Step", self.spin_step_fs, " fs", 1, 0.1, 1e5, 1.0)
+        cell(0, 0, "Start", self.spin_start, " fs", 1, -1e6, 1e6, -500.0)
+        cell(0, 2, "Stop",  self.spin_stop,  " fs", 1, -1e6, 1e6,  500.0)
+        # The um equivalents move under their own boxes — as a full-width pair
+        # they would push the group back out to three rows.
+        self.eq_start = QLabel(""); self.eq_start.setObjectName("dim")
+        self.eq_stop  = QLabel(""); self.eq_stop.setObjectName("dim")
+        g.addWidget(self.eq_start, 1, 1)
+        g.addWidget(self.eq_stop,  1, 3)
+        cell(2, 0, "Step", self.spin_step_fs, " fs", 1, 0.1, 1e5, 1.0)
+        self.chk_bg = QCheckBox("Background")
+        self.chk_bg.setChecked(True)
+        self.chk_bg.setToolTip("Record a background frame before and after the "
+                               "scan, with the beam blocked when prompted.")
+        g.addWidget(self.chk_bg, 2, 2, 1, 2)
         lay.addLayout(g)
         for s in (self.spin_start, self.spin_stop):
             s.valueChanged.connect(self._refresh_scan_um)
 
-        self.chk_bg = QCheckBox("Capture background (before/after)")
-        self.chk_bg.setChecked(True)
-        lay.addWidget(self.chk_bg)
-
+        # The scan and its export on one line, in the order they are used.
+        # btn_scan keeps the wider share: it also carries "Abort Scan" while a
+        # scan runs, and it is the button the whole panel exists for.
+        arow = QHBoxLayout(); arow.setSpacing(6)
         self.btn_scan = QPushButton("Measure FROG")
         self.btn_scan.setObjectName("accent")
         self.btn_scan.clicked.connect(self._start_scan)
-        lay.addWidget(self.btn_scan)
+        arow.addWidget(self.btn_scan, 3)
+
+        self.btn_save = QPushButton(f"Save ({EXPORT_FORMATS[self._export_fmt][1]})")
+        self.btn_save.setEnabled(False)
+        self.btn_save.clicked.connect(lambda: self._export_as(self._export_fmt))
+        arow.addWidget(self.btn_save, 2)
+        lay.addLayout(arow)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100); self.progress.setValue(0)
-        self.progress.setFixedHeight(18)
+        self.progress.setFixedHeight(16)
         lay.addWidget(self.progress)
 
         # The AC FWHM is reported inside the autocorrelation panel itself
         # (FrogCanvas.set_fwhm), next to the curve it measures.
-
-        self.btn_save = QPushButton(f"Save Scan ({EXPORT_FORMATS[self._export_fmt][1]})")
-        self.btn_save.setEnabled(False)
-        self.btn_save.clicked.connect(lambda: self._export_as(self._export_fmt))
-        lay.addWidget(self.btn_save)
 
         self._refresh_scan_um()
         return grp
@@ -4955,9 +4983,9 @@ class FrogWindow(QMainWindow):
         """
         stitched = isinstance(self.spec, StitchedSpectrometer)
         slots = self._slot_members() if stitched else []
-        self.lbl_integration.setText("Integration Time — S1" if stitched
+        # One caption over both boxes — S1 on the left, S2 on the right.
+        self.lbl_integration.setText("Integration Time — S1 / S2" if stitched
                                      else "Integration Time")
-        self.lbl_integration2.setVisible(stitched)
         self.spin_integration2.setVisible(stitched)
         if len(slots) != 2:
             # No live pair: the per-spectrometer view has nothing to show.
@@ -5788,8 +5816,8 @@ class FrogWindow(QMainWindow):
             w.setEnabled(on)
 
     def _moving(self, on):
-        self.lbl_moving.setText("MOVING" if on else "idle")
-        self.lbl_moving.setObjectName("moving" if on else "dim")
+        self.lbl_moving.setText("MOVING" if on else "IDLE")
+        self.lbl_moving.setObjectName("moving" if on else "idle")
         self.lbl_moving.style().unpolish(self.lbl_moving); self.lbl_moving.style().polish(self.lbl_moving)
         # repaint() paints synchronously WITHOUT spinning the event loop.
         # processEvents() here used to dispatch queued work — a spectrum_ready
@@ -6278,7 +6306,7 @@ class FrogWindow(QMainWindow):
         self._export_fmt = key
         _label, suffix, filt, writer = EXPORT_FORMATS[key]
         self._export_actions[key].setChecked(True)
-        self.btn_save.setText(f"Save Scan ({suffix})")
+        self.btn_save.setText(f"Save ({suffix})")
         if self.result is None:
             self.status.showMessage(f"Export format: {suffix} — no scan to save yet.", 4000)
             return
@@ -6410,7 +6438,10 @@ def main():
     seed_calibration_dir()
 
     win = FrogWindow()
-    win.show()
+    # Maximized, not fullscreen: the plots are the point and they scale with
+    # whatever room there is, but the operator still needs the title bar and
+    # the taskbar to get at the acquisition software beside this one.
+    win.showMaximized()
     # The startup graph — every widget, artist, stylesheet rule and Qt binding —
     # is permanent, but the live loop allocates numpy arrays continuously, so
     # gen-2 collections run regularly and would otherwise walk all of it every
