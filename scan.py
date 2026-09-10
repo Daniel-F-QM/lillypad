@@ -501,6 +501,10 @@ class FrogScanWorker(QThread):
         return self.spec.calibrate(acc / n), peak, n_sat, members
 
     def run(self):
+        # Cleared by anything that makes the position frame untrustworthy, so
+        # the park below is skipped rather than commanding a move to a "zero"
+        # that is no longer where zero is. See _park_at_zero.
+        park = True
         try:
             cfg     = self.cfg
             delays  = cfg.delays_fs()
@@ -608,6 +612,8 @@ class FrogScanWorker(QThread):
                     faults[idx] = reason
                 self.stage_fault.emit(idx, float(delay_fs), reason)
                 if cfg.abort_on_stage_fault:
+                    nonlocal park
+                    park = False       # this zero no longer means anything
                     where = ("the background frame" if idx < 0
                              else f"delay {delay_fs:+.1f} fs")
                     self.error.emit(
@@ -668,7 +674,41 @@ class FrogScanWorker(QThread):
                 stage_backlash_um=backlash_um,
             ))
         except Exception as e:
+            park = False       # unknown failure: do not drive the stage on it
             self.error.emit(str(e))
+        finally:
+            if park:
+                self._park_at_zero()
+
+    def _park_at_zero(self):
+        """Leave the stage on zero delay once the scan is over.
+
+        A scan ends wherever its last delay happened to be, which for a
+        one-sided range is a long way from the overlap — so the next thing the
+        operator does (a live spectrum, an alignment tweak) starts on a dark
+        frame. Parking on zero delay puts the pulses back on top of each other,
+        which is the only position that means anything between scans.
+
+        In a finally, so it happens on every ordinary way out: a completed
+        scan, a user abort, a saturation abort. On the WORKER's thread, because
+        that is the one that owns the stage for the whole scan — parking from
+        the GUI's finished handler would command a move while run() may still
+        be on its way out.
+
+        Skipped after a stage fault or an unexpected exception (see `park`):
+        both mean the position frame is no longer trustworthy, and "go to zero"
+        would then drive somewhere that is not zero.
+
+        Failures are swallowed. The measurement is already complete and emitted
+        by this point, and losing the park is not a reason to turn a good scan
+        into an error the operator has to interpret.
+        """
+        try:
+            self.stage.move_to(_um_to_stage(
+                delay_to_position_um(0.0, self.cfg.zero_pos_um,
+                                     self.cfg.pass_factor)))
+        except Exception:
+            pass
 
 
 # ===========================================================================

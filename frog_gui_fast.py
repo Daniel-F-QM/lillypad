@@ -654,18 +654,6 @@ def _as_bool(v):
     raise TypeError(v)
 
 
-def _restore_pair(lo_sb, hi_sb, value):
-    """Restore a (min, max) spinbox pair, low box first.
-
-    Order matters: each box's valueChanged handler pushes BOTH boxes at the
-    canvas, and the canvas setters ignore an inverted pair. Setting the low box
-    first guarantees the second call — the always-valid one — is what lands.
-    """
-    lo, hi = value
-    lo_sb.setValue(float(lo))
-    hi_sb.setValue(float(hi))
-
-
 def _on_a_screen(rect):
     """True if `rect` overlaps some connected screen enough to be grabbed.
 
@@ -2814,14 +2802,17 @@ class GraphicsSettingsDialog(QDialog):
 
         The counterpart of sync_limits, and what lets a settings restore leave
         the normal signal wiring to do the work: setValue/setChecked emit only
-        on a CHANGE, and the widget construction defaults are not the canvas
-        defaults — an empty spectrum panel sits nowhere near 0…5000 counts, so a
-        restored value that happens to match a spinbox's default would reach the
-        widget and never reach the plot.
+        on a CHANGE, so a restored value that happens to equal a widget's
+        construction default would reach the widget and never reach the plot.
 
-        Every setter below is idempotent and their draw_idle()s coalesce into
-        one frame, so re-asserting the lot is cheaper to reason about than
-        working out which ones stayed silent.
+        Every setter here is idempotent and their draw_idle()s coalesce into one
+        frame, so re-asserting the lot is cheaper to reason about than working
+        out which ones stayed silent.
+
+        Appearance only — no axis limits. Nothing restores those any more (see
+        _setting_specs), so the axes are on their own defaults at this point and
+        pushing the spinboxes at them would pin the panel to a range nobody
+        chose, purely because those boxes have to hold some number at startup.
         """
         c = self.canvas
         c.set_cmap(self.cmb_cmap.currentText())
@@ -2830,15 +2821,6 @@ class GraphicsSettingsDialog(QDialog):
         c.set_linewidth(self.spin_lw.value())
         c.set_log_scale(self.chk_log.isChecked())
         c.set_proportions(self.sld_prop.value() / 100.0)
-        # Manual bounds only mean anything with their auto-scale off; applying
-        # them anyway would fight the very next live frame.
-        if not c.autoscale_x:
-            c.set_xlim(self.spin_xmin.value(), self.spin_xmax.value())
-        if not c.autoscale_y:
-            c.set_ylim(self.spin_ymin.value(), self.spin_ymax.value())
-        if not c.autoscale_trace:
-            c.set_trace_xlim(self.spin_tmin.value(), self.spin_tmax.value())
-            c.set_trace_ylim(self.spin_twmin.value(), self.spin_twmax.value())
 
     def toggle(self):
         if self.isVisible():
@@ -3862,23 +3844,6 @@ class FrogCanvas(FigureCanvasQTAgg):
         lo, hi = sorted(self.ax_trace.get_xlim())
         self.fold_dragged.emit(float(min(max(x, lo), hi)))
 
-    def set_ac_xlim(self, xmin, xmax):
-        """Autocorrelation delay axis. No dialog row drives this — it exists so
-        a frozen AC view (right-click, or a rubber-band zoom) can be restored
-        between sessions together with autoscale_ac_x, which on its own would
-        pin the panel to a range it was never pinned to."""
-        if xmin < xmax:
-            self.ax_ac.set_xlim(xmin, xmax)
-            self._ac_xlim_cache = (xmin, xmax)
-            self.draw_idle()
-
-    def set_ac_ylim(self, ymin, ymax):
-        """Autocorrelation amplitude axis. See set_ac_xlim."""
-        if ymin < ymax:
-            self.ax_ac.set_ylim(ymin, ymax)
-            self._ac_ylim_cache = (ymin, ymax)
-            self.draw_idle()
-
     def set_cmap(self, name):
         self._cmap_name = name
         self._apply_cmap()
@@ -4428,6 +4393,9 @@ class FrogWindow(QMainWindow):
         self._fold_fs        = None   # hand-placed fold; None = the AC peak
         self._feed_was_on  = True
         self._pending_fit  = True
+        # Weaker cousin of _pending_fit: refit the spectrum to the next frame
+        # but leave the auto-scale flags exactly as the operator set them.
+        self._pending_rescale = False
         self._export_fmt   = "dwc"
         # Which beam the simulated spectrometer measures (see PULSE_SHAPES).
         # Kept on the window, not the simulator, so the choice survives a swap
@@ -6432,6 +6400,11 @@ class FrogWindow(QMainWindow):
         if self._pending_fit:
             self._pending_fit = False
             self._autofit_spectrum()
+        elif self._pending_rescale:
+            # elif: a device swap's full fit is the stronger action and already
+            # covers the rescale, so it must not be undone by one queued behind it.
+            self._pending_rescale = False
+            self._rescale_spectrum()
 
     def _render_overlay(self):
         """Draw one curve per stitched member. False = nothing to draw yet, so
@@ -6476,6 +6449,29 @@ class FrogWindow(QMainWindow):
     def _autofit_spectrum(self):
         """One-shot fit of spectrum X + Y; syncs Graphics Settings spinboxes."""
         self.canvas.fit_xy()
+        if hasattr(self, 'dlg_graphics'):
+            self.dlg_graphics.sync_limits()
+
+    def _rescale_spectrum(self):
+        """Refit the spectrum to the current frame, LEAVING auto-scale as it was.
+
+        fit_xy() freezes both flags — right for a device swap, where the new
+        spectrometer's range is a fresh start, but wrong for an exposure change:
+        turning the operator's auto-scale off as a side effect of typing in a
+        new integration time is not something they asked for. So the flags are
+        put back afterwards.
+
+        Auto-scale Y goes back on through set_autoscale_y, which also drops the
+        damping filter's state — otherwise the filter would still be converging
+        on the old exposure's levels and would spend its decay constant crawling
+        off the fit that was just made.
+        """
+        c = self.canvas
+        was_x, was_y = c.autoscale_x, c.autoscale_y
+        c.fit_xy()                     # fits both axes, freezes both flags
+        c.autoscale_x = was_x
+        if was_y:
+            c.set_autoscale_y(True)
         if hasattr(self, 'dlg_graphics'):
             self.dlg_graphics.sync_limits()
 
@@ -7074,6 +7070,16 @@ class FrogWindow(QMainWindow):
                 return
         if not changed:
             return
+        # Signal scales with exposure, so the counts axis is now the wrong size
+        # — dropping the exposure 10x leaves the trace in the bottom tenth of
+        # the panel. Refit once, on the next frame rather than now: the frame on
+        # screen was taken at the OLD exposure and fitting to it would just
+        # reproduce the range being escaped.
+        self._pending_rescale = True
+        # And drop the frame already in flight for the same reason — it was
+        # acquired before the device was rewritten, so the fit must not land on
+        # it. Latest-frame-wins means nothing else is waiting behind it.
+        self._live_frame = None
         # A dark holds the pedestal of the exposure it was taken at, so it is
         # now wrong — on a single device as much as on a pair, which used to go
         # unmentioned entirely.
@@ -7499,6 +7505,11 @@ class FrogWindow(QMainWindow):
         self._worker.stage_fault.connect(self._on_stage_fault)
         self._worker.finished_scan.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
+        # QThread.finished, not finished_scan: the worker parks the stage on
+        # zero delay in a finally, which runs AFTER finished_scan is emitted.
+        # Refreshing the readout from _on_finished would print the last delay's
+        # position and leave it there.
+        self._worker.finished.connect(self._refresh_positions)
         self._worker.start()
         # The worker only hands back combined columns, so the panel falls back
         # to the stitched curve on its own (update_spectrum owns the mode);
@@ -7800,32 +7811,14 @@ class FrogWindow(QMainWindow):
             ("spec_frac",   lambda: float(c._spec_frac),
                             lambda v: g.sld_prop.setValue(int(round(float(v) * 100)))),
 
-            ("autoscale_x",     lambda: bool(c.autoscale_x),
-                                lambda v: g.chk_auto_x.setChecked(_as_bool(v))),
-            ("autoscale_y",     lambda: bool(c.autoscale_y),
-                                lambda v: g.chk_auto_y.setChecked(_as_bool(v))),
-            ("autoscale_trace", lambda: bool(c.autoscale_trace),
-                                lambda v: g.chk_auto_trace.setChecked(_as_bool(v))),
-            ("autoscale_ac_x",  lambda: bool(c.autoscale_ac_x),
-                                lambda v: setattr(c, "autoscale_ac_x", _as_bool(v))),
-            ("autoscale_ac_y",  lambda: bool(c.autoscale_ac_y),
-                                lambda v: setattr(c, "autoscale_ac_y", _as_bool(v))),
-
-            ("spec_xlim",  lambda: [g.spin_xmin.value(), g.spin_xmax.value()],
-                           lambda v: _restore_pair(g.spin_xmin, g.spin_xmax, v)),
-            ("spec_ylim",  lambda: [g.spin_ymin.value(), g.spin_ymax.value()],
-                           lambda v: _restore_pair(g.spin_ymin, g.spin_ymax, v)),
-            ("trace_xlim", lambda: [g.spin_tmin.value(), g.spin_tmax.value()],
-                           lambda v: _restore_pair(g.spin_tmin, g.spin_tmax, v)),
-            ("trace_ylim", lambda: [g.spin_twmin.value(), g.spin_twmax.value()],
-                           lambda v: _restore_pair(g.spin_twmin, g.spin_twmax, v)),
-            # The autocorrelation has no dialog row, so a frozen view has to be
-            # carried by the limits themselves — see set_ac_xlim.
-            ("ac_xlim",    lambda: [float(x) for x in c.ax_ac.get_xlim()],
-                           lambda v: c.set_ac_xlim(float(v[0]), float(v[1]))),
-            ("ac_ylim",    lambda: [float(y) for y in c.ax_ac.get_ylim()],
-                           lambda v: c.set_ac_ylim(float(v[0]), float(v[1]))),
-
+            # NO axis state here — not the auto-scale flags, not the manual
+            # limits, not the autocorrelation's view. Where the axes are
+            # pointing is a property of the session, not a preference: a
+            # rubber-band zoom and a hand-typed range land in exactly the same
+            # place (auto-scale off, limits pinned), so persisting either meant
+            # a zoom taken to read one feature survived the restart and the
+            # program came back still zoomed into it, on data that had gone.
+            # Every launch starts on the normal view and fits to what is there.
             ("log_scale",  g.chk_log.isChecked,
                            lambda v: g.chk_log.setChecked(_as_bool(v))),
             # setCurrentText is a silent no-op on a non-editable combo for a name
