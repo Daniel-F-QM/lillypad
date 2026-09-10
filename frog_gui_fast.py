@@ -4308,7 +4308,7 @@ class FrogWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Lillypad — Fast")
+        self.setWindowTitle("Lillypad")
         self.setWindowIcon(app_icon())
         self.setMinimumSize(1180, 760)
         # load_settings() is cached, so this is the same dict main() already
