@@ -474,6 +474,9 @@ ALIGN_ICON = {"dark":  resource_path("icons", "alignment_dark.png"),
 # in their own theme's accent.
 STITCH_ICON = {"dark":  resource_path("icons", "autostitch_dark.png"),
                "light": resource_path("icons", "autostitch_light.png")}
+# Symmetry mode, on the FROG trace panel's header. ONE file for both themes —
+# the mark is a mirror line, which reads the same either way.
+SYMMETRY_ICON = resource_path("icons", "symmetry.png")
 # Watermark behind the "nothing connected" message. ONE file for both themes,
 # unlike the pairs above: it is drawn as an alpha mask and tinted from the live
 # PALETTE (see NoDeviceOverlay), so it follows a theme switch by itself.
@@ -4327,6 +4330,10 @@ class FrogWindow(QMainWindow):
         self._align_peak     = [0.0, 0.0]
         self._align_view     = None   # scratch buffer for the normalized view
         self._align_trace_on = False
+        # Symmetry mode: a display-only view of the finished trace folded about
+        # its autocorrelation peak. Mutually exclusive with the raw view above —
+        # both rewrite the same image.
+        self._symmetry_on    = False
         self._feed_was_on  = True
         self._pending_fit  = True
         self._export_fmt   = "dwc"
@@ -5023,6 +5030,22 @@ class FrogWindow(QMainWindow):
         self.btn_align_trace.setFixedSize(40, HDR_BTN)
         self.btn_align_trace.hide()
         self.btn_align_trace.toggled.connect(self._on_align_trace_toggled)
+
+        # Symmetry mode, trace panel. Always present — unlike RAW it does not
+        # depend on the pair — but only enabled once a finished scan gives it an
+        # autocorrelation to find the fold line in.
+        self.btn_symmetry = QPushButton(self.canvas)
+        self.btn_symmetry.setObjectName("overlay")
+        self.btn_symmetry.setCheckable(True)
+        if SYMMETRY_ICON.exists():
+            self.btn_symmetry.setIcon(QIcon(str(SYMMETRY_ICON)))
+            self.btn_symmetry.setIconSize(QSize(HDR_ICON, HDR_ICON))
+        else:
+            self.btn_symmetry.setText("|")
+        self.btn_symmetry.setFixedSize(HDR_BTN, HDR_BTN)
+        self.btn_symmetry.show()
+        self.btn_symmetry.toggled.connect(self._on_symmetry_toggled)
+        self._refresh_symmetry_button()
 
         # ── "No spectrometer connected" ──────────────────────────────────────
         # A Qt child of the canvas, not a matplotlib artist: the canvas blits,
@@ -6526,7 +6549,7 @@ class FrogWindow(QMainWindow):
 
         pack(c.ax_spec, [self.btn_autofit, self.btn_feed, self.btn_autostitch,
                          self.btn_overlay, self.btn_align_spec])
-        pack(c.ax_trace, [self.btn_align_trace])
+        pack(c.ax_trace, [self.btn_align_trace, self.btn_symmetry])
 
         # The "no spectrometer connected" panel, stretched over the whole
         # spectrum axes so it reads as the empty plot itself rather than a card
@@ -6601,6 +6624,8 @@ class FrogWindow(QMainWindow):
                 "No raw trace yet — run a scan in multi-spectrometer mode.", 4000)
             return
         self._align_trace_on = bool(on)
+        if self._align_trace_on and self.btn_symmetry.isChecked():
+            self._clear_symmetry()      # one trace-view mode at a time
         # Re-render at once rather than waiting for the next column, so the
         # toggle also works on a finished trace.
         if self._align_trace_on:
@@ -6610,6 +6635,131 @@ class FrogWindow(QMainWindow):
         self.status.showMessage(
             "FROG trace: raw counts, per-spectrometer normalised." if on else
             "FROG trace: calibrated, stitched.", 4000)
+
+    # ── Symmetry mode ────────────────────────────────────────────────────────
+    def _symmetry_center(self, ac):
+        """Column index the trace is folded about: the autocorrelation maximum.
+
+        The AC is the trace summed over wavelength, so its peak is where the two
+        pulses overlap best — the delay the trace SHOULD be symmetric about. Not
+        the middle column: a scan whose range was not centred on the overlap
+        would otherwise fold about the wrong place and report the offset as
+        asymmetry.
+        """
+        return int(np.nanargmax(np.asarray(ac, float)))
+
+    def _symmetry_view(self, trace, ac):
+        """|T(c+d) - T(c-d)| about column c: how far the trace is from being
+        symmetric in delay.
+
+        ABSOLUTE, and written over the full delay axis. The signed difference is
+        antisymmetric, so one half of it is always negative — and every colormap
+        here is sequential with clim (0, peak), which would render those columns
+        as a flat floor and hide exactly what the mode exists to show. Taking the
+        modulus makes both halves the same picture and puts a perfectly symmetric
+        trace at zero everywhere, i.e. uniformly dark whatever the colormap.
+
+        Columns with no counterpart on the other side of c — the tail of the
+        longer half, when the fold line is off-centre — are left NaN rather than
+        zeroed. Zero would claim perfect symmetry where there is simply nothing
+        to compare against; NaN renders in the plot background (see _apply_cmap's
+        'bad' colour), so unmeasured reads as unmeasured.
+        """
+        t = np.asarray(trace, float)
+        n = t.shape[1]
+        out = np.full(t.shape, np.nan)
+        c = self._symmetry_center(ac)
+        h = min(c, n - 1 - c)            # half-width both sides can cover
+        if h < 1:
+            return out, 0.0              # fold line on an edge: nothing overlaps
+        left  = t[:, c - h:c + 1]        # columns c-h … c
+        right = t[:, c:c + h + 1]        # columns c   … c+h
+        d = np.abs(right - left[:, ::-1])
+        out[:, c:c + h + 1]   = d
+        out[:, c - h:c + 1]   = d[:, ::-1]
+        peak = float(np.nanmax(d)) if d.size else 0.0
+        return out, peak
+
+    def _current_symmetry_view(self):
+        """The symmetry view of the finished scan, or None if there is none."""
+        if self.result is None:
+            return None
+        return self._symmetry_view(self.result.trace,
+                                   self.result.autocorrelation())
+
+    def _refresh_symmetry_button(self, running=None):
+        """Enable the symmetry toggle only when there is a finished scan to fold.
+
+        A scan in progress is excluded even though self.result may still hold the
+        PREVIOUS one: the panel is showing the new trace being filled in, and a
+        symmetry view of the old result over the top of it would be a picture of
+        something the operator is no longer looking at.
+
+        `running` overrides the inferred state at the two moments _scan_running()
+        cannot answer for it. A scan about to start has not created its worker
+        yet, so the flag still describes the PREVIOUS scan and reads False; and
+        _reset_scan_ui runs from the worker's own finished signal, by which point
+        the QThread has not necessarily left run() and it reads True. Inferring
+        at either would leave the button in the wrong state until some unrelated
+        refresh happened along.
+        """
+        if running is None:
+            running = self._scan_running()
+        ready = self.result is not None and not running
+        self.btn_symmetry.setEnabled(ready)
+        self.btn_symmetry.setToolTip(
+            "Symmetry mode — fold the trace about its autocorrelation peak and "
+            "show |T(+d) − T(−d)|, the difference between the two temporal "
+            "halves.\nA symmetric trace goes dark; whatever stays bright is the "
+            "asymmetry. Display only: the recorded trace and every export are "
+            "unaffected."
+            if ready else
+            "Run a scan first — symmetry mode folds a finished trace about its "
+            "autocorrelation peak.")
+
+    def _on_symmetry_toggled(self, on):
+        view = self._current_symmetry_view() if on else None
+        if on and view is None:
+            self.btn_symmetry.blockSignals(True)
+            self.btn_symmetry.setChecked(False)
+            self.btn_symmetry.blockSignals(False)
+            self.status.showMessage("No finished scan to fold yet.", 4000)
+            return
+        self._symmetry_on = bool(on)
+        if self._symmetry_on and self.btn_align_trace.isChecked():
+            # One trace-view mode at a time: both write the same image, so the
+            # last one switched on would silently win on the next re-render.
+            self.btn_align_trace.blockSignals(True)
+            self.btn_align_trace.setChecked(False)
+            self.btn_align_trace.blockSignals(False)
+            self._align_trace_on = False
+            self._refresh_align_trace_button()
+        if self._symmetry_on:
+            data, peak = view
+            self.canvas.update_trace(data, peak)
+        else:
+            self._restore_trace_view()
+        self.status.showMessage(
+            "FROG trace: symmetry — |T(+d) − T(−d)| about the AC peak." if on
+            else "FROG trace: measured counts.", 4000)
+
+    def _restore_trace_view(self):
+        """Put the ordinary trace back after a display mode is switched off."""
+        if self.result is not None:
+            self.canvas.update_trace(self.result.trace)
+        elif self._scan_trace is not None:
+            self.canvas.update_trace(self._scan_trace, self._scan_peak)
+
+    def _clear_symmetry(self, running=None):
+        """Drop out of symmetry mode. Called when a scan starts: the fold line
+        belongs to the result it was computed from, and the panel is about to
+        start showing a different trace entirely."""
+        if self.btn_symmetry.isChecked():
+            self.btn_symmetry.blockSignals(True)
+            self.btn_symmetry.setChecked(False)
+            self.btn_symmetry.blockSignals(False)
+        self._symmetry_on = False
+        self._refresh_symmetry_button(running)
 
     def _init_align_trace(self, wl, n_delays):
         """Allocate the raw trace for a scan about to start, or drop it.
@@ -7133,6 +7283,11 @@ class FrogWindow(QMainWindow):
         # everything that could swap or drive them underneath it.
         self._set_hardware_buttons_enabled(False)
         self._set_stage_controls_enabled(False)
+        # The fold line belongs to the result it came from, and the panel is
+        # about to start showing a different trace. running=True is asserted:
+        # the worker for THIS scan does not exist yet, so _scan_running() would
+        # still be answering for the previous one.
+        self._clear_symmetry(running=True)
 
         self._scan_trace  = np.zeros((wl.size, delays.size))
         self._scan_delays = delays
@@ -7351,6 +7506,7 @@ class FrogWindow(QMainWindow):
         self._refresh_overlay_button()
         self._refresh_autostitch_button()
         self._refresh_align_trace_button()
+        self._refresh_symmetry_button(running=False)   # a finished scan folds
         if self._feed_was_on and self.btn_feed.isChecked():
             self._feed.resume()
 
