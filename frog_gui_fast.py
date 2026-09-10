@@ -221,7 +221,21 @@ def _make_check_icon(color, tag):
     return fp.as_posix()
 
 
-def _glyph_icon(kind, color, px=15):
+# ── Panel header band, in logical pixels ─────────────────────────────────────
+# The overlay buttons above each plot panel (see FrogWindow._position_panel_
+# buttons). Square and small enough that a row of them reads as one line with
+# the panel title beside it; HDR_PAD is the gap between the row's bottom edge
+# and the axes' top spine.
+HDR_BTN = 24
+HDR_GAP = 4
+HDR_PAD = 6
+# Icon side inside a header button. EVEN, and even after the 1 px border is
+# taken off both sides of HDR_BTN: (24 - 2 - 14) / 2 = 4 exactly, so Qt centres
+# the icon on a whole pixel instead of rounding half a pixel one way.
+HDR_ICON = 14
+
+
+def _glyph_icon(kind, color, px=HDR_ICON):
     """A play/stop glyph as a QIcon, drawn in `color`.
 
     Generated rather than loaded from icons/ because this one button has to
@@ -229,23 +243,36 @@ def _glyph_icon(kind, color, px=15):
     danger while running) and once for the theme. A PNG can do neither, and the
     four files it would otherwise take would still be wrong the moment either
     palette changes. Same QPainter approach as the spinbox arrows above.
+
+    Rendered at the screen's device pixel ratio: at 150% Windows scaling a
+    logical-size pixmap is upscaled by the compositor, which both softens the
+    edges and shifts them by a fraction of a pixel.
     """
-    pm = QPixmap(px, px)
+    app = QApplication.instance()
+    dpr = app.devicePixelRatio() if app is not None else 1.0
+    n = max(1, round(px * dpr))
+    pm = QPixmap(n, n)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
     p.setPen(Qt.NoPen)
     p.setBrush(QColor(color))
+    c = n / 2.0
     if kind == "play":
-        # Inset asymmetrically: a triangle's visual centre sits left of its
-        # bounding box centre, so an even inset reads as shifted left.
-        p.drawPolygon(QPolygonF([QPointF(px * 0.26, px * 0.16),
-                                 QPointF(px * 0.26, px * 0.84),
-                                 QPointF(px * 0.84, px * 0.50)]))
+        # Centred on the triangle's CENTROID, not its bounding box: a
+        # right-pointing triangle whose box is centred reads as sitting too far
+        # right, because most of its area is on the left. The centroid of
+        # (x0,·) (x0,·) (x0+w,·) is at x0 + w/3, so x0 = c - w/3 puts the mass
+        # in the middle of the button.
+        w, h = 0.52 * n, 0.62 * n
+        x0 = c - w / 3.0
+        p.drawPolygon(QPolygonF([QPointF(x0, c - h / 2), QPointF(x0, c + h / 2),
+                                 QPointF(x0 + w, c)]))
     else:
-        p.drawRoundedRect(QRectF(px * 0.20, px * 0.20, px * 0.60, px * 0.60),
-                          px * 0.10, px * 0.10)
+        s = 0.56 * n
+        p.drawRoundedRect(QRectF(c - s / 2, c - s / 2, s, s), 0.10 * n, 0.10 * n)
     p.end()
+    pm.setDevicePixelRatio(dpr)
     return QIcon(pm)
 
 
@@ -428,6 +455,11 @@ HORIZ_ICON = {"dark":  resource_path("icons", "horizontal_dark.png"),
               "light": resource_path("icons", "horizontal_light.png")}
 VERT_ICON  = {"dark":  resource_path("icons", "vertical_dark.png"),
               "light": resource_path("icons", "vertical_light.png")}
+# Alignment-mode sweep, on the spectrum panel's header. A crosshair: unlike the
+# two pairs above this one depicts a MODE rather than an action, so both files
+# show the same mark and differ only in the accent each theme draws it in.
+ALIGN_ICON = {"dark":  resource_path("icons", "alignment_dark.png"),
+              "light": resource_path("icons", "alignment_light.png")}
 
 
 _APP_ICON = None
@@ -2151,13 +2183,8 @@ _AC_YLIM = (0.0, 1.05)
 _TITLE_ABOVE_IN  = 6 / 72   # centres the 12 pt title in the header band
 _TITLE_INSET_IN  = (0.08, 0.06)   # (right, down) from the axes' top-left corner
 
-# ── Panel header band, in logical pixels ─────────────────────────────────────
-# The overlay buttons above each panel. Square and small enough that a row of
-# them reads as one line with the panel title beside it; HDR_PAD is the gap
-# between the row's bottom edge and the axes' top spine.
-HDR_BTN = 24
-HDR_GAP = 4
-HDR_PAD = 6
+# The rest of the panel header band (HDR_BTN and friends) is defined up with
+# the other Qt chrome constants — _glyph_icon needs HDR_ICON at import time.
 
 
 class PlotSplitHandle(QWidget):
@@ -3988,7 +4015,7 @@ class FrogWindow(QMainWindow):
         self.btn_autofit.setObjectName("overlay")
         if RESCALE_ICON.exists():
             self.btn_autofit.setIcon(QIcon(str(RESCALE_ICON)))
-            self.btn_autofit.setIconSize(QSize(15, 15))
+            self.btn_autofit.setIconSize(QSize(HDR_ICON, HDR_ICON))
         else:
             self.btn_autofit.setText("↔↕")
         self.btn_autofit.setFixedSize(HDR_BTN, HDR_BTN)
@@ -4003,7 +4030,7 @@ class FrogWindow(QMainWindow):
         self.btn_feed = QPushButton(self.canvas)
         self.btn_feed.setCheckable(True); self.btn_feed.setChecked(True)
         self.btn_feed.setFixedSize(HDR_BTN, HDR_BTN)
-        self.btn_feed.setIconSize(QSize(15, 15))
+        self.btn_feed.setIconSize(QSize(HDR_ICON, HDR_ICON))
         self.btn_feed.show()
         self.btn_feed.toggled.connect(self._toggle_feed)
         self._refresh_feed_button()
@@ -4015,16 +4042,18 @@ class FrogWindow(QMainWindow):
         self.btn_overlay.setObjectName("overlay")
         self.btn_overlay.setCheckable(True)
         self.btn_overlay.setFixedSize(HDR_BTN, HDR_BTN)
-        self.btn_overlay.setIconSize(QSize(15, 15))
+        self.btn_overlay.setIconSize(QSize(HDR_ICON, HDR_ICON))
         self.btn_overlay.hide()
         self.btn_overlay.toggled.connect(self._on_overlay_toggled)
 
         # Alignment mode, spectrum side: step to +/-x and +/-2x and overlay the
         # two differences.
-        self.btn_align_spec = QPushButton("Δ", self.canvas)
+        self.btn_align_spec = QPushButton(self.canvas)
         self.btn_align_spec.setObjectName("overlay")
         self.btn_align_spec.setCheckable(True)
         self.btn_align_spec.setFixedSize(HDR_BTN, HDR_BTN)
+        self.btn_align_spec.setIconSize(QSize(HDR_ICON, HDR_ICON))
+        self._refresh_align_button()
         self.btn_align_spec.setToolTip(
             "Alignment mode — measure at −2x, −x, +x, +2x (Alignment → "
             "Alignment step) and overlay S(+x)−S(−x) and S(+2x)−S(−2x).\nA "
@@ -4823,11 +4852,19 @@ class FrogWindow(QMainWindow):
 
     def _build_scan_group(self):
         grp = QGroupBox("FROG Scan")
-        lay = QVBoxLayout(grp); lay.setSpacing(4)
+        # Roomier than the two groups above it: this one is three short rows
+        # rather than a stack, so the space bought by pairing them is better
+        # spent making the pairs legible than left at the bottom of the panel.
+        lay = QVBoxLayout(grp); lay.setSpacing(8)
         # Start beside Stop, then Step beside the background checkbox: the two
         # ends of the sweep are read as a pair, and three label+spin+equivalent
         # rows spent three lines on what fits in two.
-        g = QGridLayout(); g.setSpacing(4)
+        #
+        # Four columns, twice over: [label][control]. Everything in column 3
+        # therefore lines up under the Stop box — including the checkbox, which
+        # used to start back at the label column and sat under nothing.
+        g = QGridLayout()
+        g.setHorizontalSpacing(8); g.setVerticalSpacing(6)
         g.setColumnStretch(1, 1); g.setColumnStretch(3, 1)
 
         def cell(r, c, label, spin, suffix, dec, lo, hi, val):
@@ -4852,7 +4889,7 @@ class FrogWindow(QMainWindow):
         self.chk_bg.setChecked(True)
         self.chk_bg.setToolTip("Record a background frame before and after the "
                                "scan, with the beam blocked when prompted.")
-        g.addWidget(self.chk_bg, 2, 2, 1, 2)
+        g.addWidget(self.chk_bg, 2, 3, Qt.AlignLeft | Qt.AlignVCenter)
         lay.addLayout(g)
         for s in (self.spin_start, self.spin_stop):
             s.valueChanged.connect(self._refresh_scan_um)
@@ -4860,21 +4897,23 @@ class FrogWindow(QMainWindow):
         # The scan and its export on one line, in the order they are used.
         # btn_scan keeps the wider share: it also carries "Abort Scan" while a
         # scan runs, and it is the button the whole panel exists for.
-        arow = QHBoxLayout(); arow.setSpacing(6)
+        arow = QHBoxLayout(); arow.setSpacing(8)
         self.btn_scan = QPushButton("Measure FROG")
         self.btn_scan.setObjectName("accent")
+        self.btn_scan.setMinimumHeight(30)
         self.btn_scan.clicked.connect(self._start_scan)
         arow.addWidget(self.btn_scan, 3)
 
         self.btn_save = QPushButton(f"Save ({EXPORT_FORMATS[self._export_fmt][1]})")
         self.btn_save.setEnabled(False)
+        self.btn_save.setMinimumHeight(30)
         self.btn_save.clicked.connect(lambda: self._export_as(self._export_fmt))
         arow.addWidget(self.btn_save, 2)
         lay.addLayout(arow)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100); self.progress.setValue(0)
-        self.progress.setFixedHeight(16)
+        self.progress.setFixedHeight(18)
         lay.addWidget(self.progress)
 
         # The AC FWHM is reported inside the autocorrelation panel itself
@@ -4902,6 +4941,7 @@ class FrogWindow(QMainWindow):
         self._refresh_overlay_button()   # its icons are per-theme too
         self._refresh_layout_button()    # …and so are this one's
         self._refresh_feed_button()      # …and its glyph is drawn from PALETTE
+        self._refresh_align_button()     # …and it has one file per theme
         self.status.showMessage(f"{name.capitalize()} mode.", 2000)
 
     # ── Plot layout ──────────────────────────────────────────────────────────
@@ -5522,6 +5562,22 @@ class FrogWindow(QMainWindow):
         pack(c.ax_spec, [self.btn_autofit, self.btn_feed,
                          self.btn_overlay, self.btn_align_spec])
         pack(c.ax_trace, [self.btn_align_trace])
+
+    def _refresh_align_button(self):
+        """Per-theme crosshair on the alignment-sweep toggle.
+
+        Unlike the overlay and layout buttons this one depicts a MODE, so the
+        mark does not change with the button's state — only with the theme,
+        each file carrying that theme's accent. Falls back to the Δ it used to
+        show if the icons are missing from the bundle.
+        """
+        icon = ALIGN_ICON[self._theme]
+        if icon.exists():
+            self.btn_align_spec.setIcon(QIcon(str(icon)))
+            self.btn_align_spec.setText("")
+        else:
+            self.btn_align_spec.setIcon(QIcon())
+            self.btn_align_spec.setText("Δ")
 
     def _refresh_feed_button(self):
         """Icon, colour and tooltip of the live-feed toggle.
