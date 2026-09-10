@@ -2991,6 +2991,8 @@ class FrogCanvas(FigureCanvasQTAgg):
     log_toggle_requested = Signal()  # click on spectrum y-axis strip
     proportions_changed = Signal(int)  # split handle dragged → dialog follows
     axes_relaid = Signal()           # axes repositioned → overlay buttons follow
+    fold_dragged = Signal(float)     # symmetry fold line moved to this delay
+    fold_reset_requested = Signal()  # double-click on it → back to the AC peak
 
     def __init__(self):
         self.fig = Figure(facecolor=PALETTE["plot_bg"])
@@ -3021,6 +3023,18 @@ class FrogCanvas(FigureCanvasQTAgg):
             0.985, 0.94, "", transform=self.ax_ac.transAxes,
             ha="right", va="top", fontsize=9, color=PALETTE["accent2"],
             zorder=5,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor=PALETTE["surface"],
+                      edgecolor=PALETTE["border"], alpha=0.85))
+        # Symmetry mode: the fold line and the asymmetry readout, both on the
+        # trace panel and both hidden until the mode is on. The readout mirrors
+        # txt_fwhm above — same corner, same box, in the panel it describes.
+        self.line_fold = self.ax_trace.axvline(
+            0.0, color=PALETTE["accent2"], lw=1.2, ls="--", zorder=6)
+        self.line_fold.set_visible(False)
+        self.txt_sym = self.ax_trace.text(
+            0.985, 0.94, "", transform=self.ax_trace.transAxes,
+            ha="right", va="top", fontsize=9, color=PALETTE["accent2"],
+            zorder=6,
             bbox=dict(boxstyle="round,pad=0.3", facecolor=PALETTE["surface"],
                       edgecolor=PALETTE["border"], alpha=0.85))
         # Multi-spectrometer overlay: one curve per member, shown INSTEAD of
@@ -3108,6 +3122,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         # the blit background cache never contains it.
         self._drag_ax = None
         self._drag_start = None      # (x, y) in mpl display coords
+        self._fold_drag = False      # dragging the symmetry fold line
         self._rubber = QRubberBand(QRubberBand.Rectangle, self)
         self.mpl_connect('button_press_event', self._on_press)
         self.mpl_connect('motion_notify_event', self._on_motion)
@@ -3128,12 +3143,19 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_d2.set_animated(True)
         self.im.set_animated(True)
         self.txt_fwhm.set_animated(True)
+        # Animated even while hidden, like the member lines above: draw()
+        # returns immediately on an invisible artist, and leaving them out
+        # would make them appear on a blit and vanish on the next full redraw.
+        self.line_fold.set_animated(True)
+        self.txt_sym.set_animated(True)
         self._animated = [(self.ax_spec, self.line_spec),
                           (self.ax_spec, self.line_m1),
                           (self.ax_spec, self.line_m2),
                           (self.ax_spec, self.line_d1),
                           (self.ax_spec, self.line_d2),
                           (self.ax_trace, self.im),
+                          (self.ax_trace, self.line_fold),
+                          (self.ax_trace, self.txt_sym),
                           (self.ax_ac, self.line_ac),
                           (self.ax_ac, self.txt_fwhm)]
         self._bg = None            # cached full-figure background (no animated)
@@ -3432,6 +3454,10 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.txt_fwhm.set_color(pal["accent2"])
         self.txt_fwhm.get_bbox_patch().set_facecolor(pal["surface"])
         self.txt_fwhm.get_bbox_patch().set_edgecolor(pal["border"])
+        self.line_fold.set_color(pal["accent2"])
+        self.txt_sym.set_color(pal["accent2"])
+        self.txt_sym.get_bbox_patch().set_facecolor(pal["surface"])
+        self.txt_sym.get_bbox_patch().set_edgecolor(pal["border"])
         # line_m1/line_m2 keep MEMBER_COLORS in both themes — they are chosen
         # to work on either background, and re-theming them would cost the
         # colourblind separation that is the whole point. Same for the two
@@ -3492,6 +3518,11 @@ class FrogCanvas(FigureCanvasQTAgg):
             if self._bg_static is None:
                 self.restore_region(self._bg)
                 self.ax_trace.draw_artist(self.im)
+                # Static between live frames exactly like the image they sit
+                # on: symmetry mode only runs on a finished trace, while the
+                # feed underneath goes on driving this path.
+                self.ax_trace.draw_artist(self.line_fold)
+                self.ax_trace.draw_artist(self.txt_sym)
                 self.ax_ac.draw_artist(self.line_ac)
                 # Static between scan columns, exactly like the AC line — so it
                 # belongs in the cached background, not in the per-frame draw.
@@ -3566,6 +3597,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._rubber.hide()
         self._drag_ax = None
         self._drag_start = None
+        self._fold_drag = False
 
     def _clamped_point(self, event):
         """Current cursor position clamped to the drag axes' live bbox, so a
@@ -3584,6 +3616,15 @@ class FrogCanvas(FigureCanvasQTAgg):
             return
         if event.button != 1:
             return
+        # The fold line gets first refusal on a press in the trace panel, but
+        # only within FOLD_GRAB_PX of itself — anywhere else the panel keeps
+        # the rubber-band zoom it has always had.
+        if event.inaxes is self.ax_trace and self._hit_fold(event):
+            if event.dblclick:
+                self.fold_reset_requested.emit()
+            else:
+                self._fold_drag = True
+            return
         if event.inaxes in axes:
             self._drag_ax = event.inaxes
             self._drag_start = (event.x, event.y)
@@ -3591,6 +3632,9 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.log_toggle_requested.emit()
 
     def _on_motion(self, event):
+        if self._fold_drag:
+            self._emit_fold(event)
+            return
         if self._drag_ax is None:
             return
         x0, y0 = self._drag_start
@@ -3605,6 +3649,9 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._rubber.show()
 
     def _on_release(self, event):
+        if self._fold_drag:
+            self._fold_drag = False
+            return
         if event.button != 1 or self._drag_ax is None:
             return
         ax = self._drag_ax
@@ -3770,6 +3817,50 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.ax_trace.set_ylim(ymin, ymax)
             self._trace_ylim_cache = (ymin, ymax)
             self.draw_idle()
+
+    # ── Symmetry mode: fold line + score readout ──────────────────────────
+    def set_fold_line(self, x_fs):
+        """Put the symmetry fold line at `x_fs` (delay, data coords), or hide
+        it with None. Drawing it is what makes it draggable — _hit_fold reads
+        the position back off the artist rather than keeping a second copy."""
+        visible = x_fs is not None
+        changed = visible != self.line_fold.get_visible()
+        if visible:
+            if float(self.line_fold.get_xdata()[0]) != float(x_fs):
+                changed = True
+            self.line_fold.set_xdata([x_fs, x_fs])
+        self.line_fold.set_visible(visible)
+        if changed:
+            self._bg_static = None     # composited trace panel is now stale
+            self._request_blit()
+
+    def set_symmetry_score(self, text=""):
+        """Asymmetry readout in the trace panel's corner. '' clears it."""
+        if text == self.txt_sym.get_text():
+            return                     # a drag re-reports the same number often
+        self.txt_sym.set_text(text)
+        self._bg_static = None
+        self._request_blit()
+
+    def _hit_fold(self, event):
+        """Did this press land on the fold line? Within FOLD_GRAB_PX of it, so
+        the line can be caught without pixel-perfect aim — and so every press
+        further away still starts a rubber-band zoom as it always did."""
+        if not self.line_fold.get_visible():
+            return False
+        x = float(self.line_fold.get_xdata()[0])
+        xd, _ = self.ax_trace.transData.transform((x, 0.0))
+        return abs(event.x - xd) <= self.FOLD_GRAB_PX * self.devicePixelRatioF()
+
+    FOLD_GRAB_PX = 6
+
+    def _emit_fold(self, event):
+        """Report the cursor's delay, clamped to the trace's own x range so a
+        drag off the edge parks the line at the edge instead of somewhere with
+        no data behind it."""
+        x, _ = self.ax_trace.transData.inverted().transform((event.x, event.y))
+        lo, hi = sorted(self.ax_trace.get_xlim())
+        self.fold_dragged.emit(float(min(max(x, lo), hi)))
 
     def set_ac_xlim(self, xmin, xmax):
         """Autocorrelation delay axis. No dialog row drives this — it exists so
@@ -4334,6 +4425,7 @@ class FrogWindow(QMainWindow):
         # its autocorrelation peak. Mutually exclusive with the raw view above —
         # both rewrite the same image.
         self._symmetry_on    = False
+        self._fold_fs        = None   # hand-placed fold; None = the AC peak
         self._feed_was_on  = True
         self._pending_fit  = True
         self._export_fmt   = "dwc"
@@ -5070,6 +5162,8 @@ class FrogWindow(QMainWindow):
         self.canvas.limits_changed.connect(self.dlg_graphics.sync_limits)
         self.canvas.log_toggle_requested.connect(self.dlg_graphics.chk_log.toggle)
         self.canvas.proportions_changed.connect(self.dlg_graphics.sync_proportions)
+        self.canvas.fold_dragged.connect(self._on_fold_dragged)
+        self.canvas.fold_reset_requested.connect(self._on_fold_reset)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -6637,55 +6731,127 @@ class FrogWindow(QMainWindow):
             "FROG trace: calibrated, stitched.", 4000)
 
     # ── Symmetry mode ────────────────────────────────────────────────────────
-    def _symmetry_center(self, ac):
-        """Column index the trace is folded about: the autocorrelation maximum.
+    def _symmetry_center(self, ac, delays):
+        """Column index the trace is folded about.
 
-        The AC is the trace summed over wavelength, so its peak is where the two
-        pulses overlap best — the delay the trace SHOULD be symmetric about. Not
-        the middle column: a scan whose range was not centred on the overlap
-        would otherwise fold about the wrong place and report the offset as
-        asymmetry.
+        The autocorrelation maximum by default: the AC is the trace summed over
+        wavelength, so its peak is where the two pulses overlap best — the delay
+        the trace SHOULD be symmetric about. Not the middle column, which would
+        make a scan range that was not centred on the overlap report its own
+        offset as asymmetry.
+
+        A hand-placed line (dragged on the plot) overrides it, snapped to the
+        nearest measured column: the fold is an index into the trace, so there
+        is no sub-column position it could honour without resampling.
         """
-        return int(np.nanargmax(np.asarray(ac, float)))
+        if self._fold_fs is None:
+            return int(np.nanargmax(np.asarray(ac, float)))
+        d = np.asarray(delays, float)
+        return int(np.argmin(np.abs(d - float(self._fold_fs))))
 
-    def _symmetry_view(self, trace, ac):
-        """|T(c+d) - T(c-d)| about column c: how far the trace is from being
-        symmetric in delay.
+    def _symmetry_view(self, trace, ac, delays):
+        """Measured trace on the left of the fold, |T(+d) - T(-d)| on the right.
 
-        ABSOLUTE, and written over the full delay axis. The signed difference is
-        antisymmetric, so one half of it is always negative — and every colormap
-        here is sequential with clim (0, peak), which would render those columns
-        as a flat floor and hide exactly what the mode exists to show. Taking the
-        modulus makes both halves the same picture and puts a perfectly symmetric
-        trace at zero everywhere, i.e. uniformly dark whatever the colormap.
+        Returns (image, peak, score, fold_delay_fs).
 
-        Columns with no counterpart on the other side of c — the tail of the
-        longer half, when the fold line is off-centre — are left NaN rather than
-        zeroed. Zero would claim perfect symmetry where there is simply nothing
-        to compare against; NaN renders in the plot background (see _apply_cmap's
-        'bad' colour), so unmeasured reads as unmeasured.
+        Half and half rather than the difference everywhere: keeping one side as
+        it was measured gives the eye something to judge the other against, and
+        the two are directly comparable because they share one colour scale —
+        taken from the MEASURED peak, so the left half looks exactly as it does
+        in the ordinary view and "nearly black on the right" genuinely means
+        "nearly symmetric" rather than "rescaled until it looks that way".
+
+        ABSOLUTE difference. The signed one is antisymmetric, so folding it onto
+        a single side would put half the pixels below zero, and every colormap
+        here is sequential with clim (0, peak) — those would flatten onto the
+        floor and hide exactly what the mode exists to show.
+
+        Columns past the fold with no counterpart behind it — the tail of the
+        longer half, whenever the fold sits off-centre — are left NaN rather
+        than zeroed. Zero would claim perfect symmetry where there is simply
+        nothing to compare against; NaN takes _apply_cmap's 'bad' colour, the
+        plot background, so unmeasured reads as unmeasured.
         """
         t = np.asarray(trace, float)
         n = t.shape[1]
-        out = np.full(t.shape, np.nan)
-        c = self._symmetry_center(ac)
-        h = min(c, n - 1 - c)            # half-width both sides can cover
+        c = self._symmetry_center(ac, delays)
+        fold = float(np.asarray(delays, float)[c])
+        out = t.copy()                   # left of the fold: measured, untouched
+        h = min(c, n - 1 - c)            # columns both sides can cover
+        peak = float(np.nanmax(t)) if t.size else 0.0
         if h < 1:
-            return out, 0.0              # fold line on an edge: nothing overlaps
+            out[:, c + 1:] = np.nan      # fold on an edge: nothing to compare
+            return out, peak, 0.0, fold
         left  = t[:, c - h:c + 1]        # columns c-h … c
         right = t[:, c:c + h + 1]        # columns c   … c+h
         d = np.abs(right - left[:, ::-1])
-        out[:, c:c + h + 1]   = d
-        out[:, c - h:c + 1]   = d[:, ::-1]
-        peak = float(np.nanmax(d)) if d.size else 0.0
-        return out, peak
+        out[:, c:c + h + 1] = d
+        out[:, c + h + 1:]  = np.nan     # beyond the overlap: no counterpart
+        # Score: sum of the absolute difference over the sum of the whole
+        # trace — but with the sum over WAVELENGTH taken first, i.e. on the
+        # autocorrelation rather than pixel by pixel.
+        #
+        # This is not cosmetic. Per pixel, |noise - noise| never cancels: the
+        # modulus turns every one of the ~30k near-zero background pixels into
+        # a positive contribution, and their sum swamps the signal. Measured on
+        # the simulator, a PERFECTLY symmetric beam scored 13.8% at 460 peak
+        # counts, 2.7% at 4000 and 0.9% at 20000 — a floor that moves with
+        # exposure and, at realistic levels, is not far off the 26.7% a badly
+        # misaligned trace scored. Collapsing the wavelength axis first averages
+        # that noise down instead of rectifying it: the same two traces score
+        # 0.6% and 20.6%, near enough exposure-independent.
+        #
+        # The blind spot is an asymmetry that cancels in the wavelength sum. The
+        # IMAGE is per-pixel and still shows it — the picture says where, the
+        # number says how much.
+        a = np.asarray(ac, float)
+        total = float(np.nansum(a))
+        score = (float(np.nansum(np.abs(a[c:c + h + 1] - a[c - h:c + 1][::-1])))
+                 / total) if total > 0 else 0.0
+        return out, peak, score, fold
 
     def _current_symmetry_view(self):
         """The symmetry view of the finished scan, or None if there is none."""
         if self.result is None:
             return None
         return self._symmetry_view(self.result.trace,
-                                   self.result.autocorrelation())
+                                   self.result.autocorrelation(),
+                                   self.result.delays_fs)
+
+    def _show_symmetry(self):
+        """Push the symmetry view, its fold line and its score to the canvas."""
+        view = self._current_symmetry_view()
+        if view is None:
+            return
+        data, peak, score, fold = view
+        with self.canvas.batch():
+            self.canvas.update_trace(data, peak)
+            self.canvas.set_fold_line(fold)
+            self.canvas.set_symmetry_score(
+                f"Asymmetry  {100 * score:.2f} %   @ {fold:+.0f} fs")
+
+    def _on_fold_dragged(self, x_fs):
+        """The fold line was dragged. Re-render only when it has actually
+        changed COLUMN: a drag reports every pixel it crosses, and recomputing
+        a trace-sized difference for a move that lands on the same column would
+        be work with nothing to show for it."""
+        if self.result is None or not self._symmetry_on:
+            return
+        before = self._symmetry_center(self.result.autocorrelation(),
+                                       self.result.delays_fs)
+        self._fold_fs = float(x_fs)
+        after = self._symmetry_center(self.result.autocorrelation(),
+                                      self.result.delays_fs)
+        if after != before:
+            self._show_symmetry()
+
+    def _on_fold_reset(self):
+        """Double-click on the line: back to the autocorrelation peak."""
+        if self._fold_fs is None or not self._symmetry_on:
+            return
+        self._fold_fs = None
+        self._show_symmetry()
+        self.status.showMessage("Fold line back on the autocorrelation peak.", 3000)
 
     def _refresh_symmetry_button(self, running=None):
         """Enable the symmetry toggle only when there is a finished scan to fold.
@@ -6708,11 +6874,14 @@ class FrogWindow(QMainWindow):
         ready = self.result is not None and not running
         self.btn_symmetry.setEnabled(ready)
         self.btn_symmetry.setToolTip(
-            "Symmetry mode — fold the trace about its autocorrelation peak and "
-            "show |T(+d) − T(−d)|, the difference between the two temporal "
-            "halves.\nA symmetric trace goes dark; whatever stays bright is the "
-            "asymmetry. Display only: the recorded trace and every export are "
-            "unaffected."
+            "Symmetry mode — the measured trace left of the fold line, and "
+            "|T(+d) − T(−d)| right of it: how far the two temporal halves are "
+            "from being each other's mirror image.\nBoth halves share one "
+            "colour scale, so a dark right half genuinely means a symmetric "
+            "trace. The corner readout is the asymmetry as a fraction of the "
+            "whole trace.\nThe line starts on the autocorrelation peak — drag "
+            "it to fold somewhere else, double-click it to put it back.\n"
+            "Display only: the recorded trace and every export are unaffected."
             if ready else
             "Run a scan first — symmetry mode folds a finished trace about its "
             "autocorrelation peak.")
@@ -6735,13 +6904,15 @@ class FrogWindow(QMainWindow):
             self._align_trace_on = False
             self._refresh_align_trace_button()
         if self._symmetry_on:
-            data, peak = view
-            self.canvas.update_trace(data, peak)
+            self._show_symmetry()
         else:
+            self.canvas.set_fold_line(None)
+            self.canvas.set_symmetry_score("")
             self._restore_trace_view()
         self.status.showMessage(
-            "FROG trace: symmetry — |T(+d) − T(−d)| about the AC peak." if on
-            else "FROG trace: measured counts.", 4000)
+            "Symmetry — measured trace left of the fold, |T(+d) − T(−d)| "
+            "right of it. Drag the line to move it, double-click to re-centre."
+            if on else "FROG trace: measured counts.", 6000)
 
     def _restore_trace_view(self):
         """Put the ordinary trace back after a display mode is switched off."""
@@ -6759,6 +6930,11 @@ class FrogWindow(QMainWindow):
             self.btn_symmetry.setChecked(False)
             self.btn_symmetry.blockSignals(False)
         self._symmetry_on = False
+        # A hand-placed fold belongs to the trace it was placed on, so a new
+        # scan starts back on the autocorrelation peak.
+        self._fold_fs = None
+        self.canvas.set_fold_line(None)
+        self.canvas.set_symmetry_score("")
         self._refresh_symmetry_button(running)
 
     def _init_align_trace(self, wl, n_delays):

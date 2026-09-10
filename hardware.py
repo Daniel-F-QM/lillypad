@@ -2082,6 +2082,32 @@ def _build_two_color(t, tau0):
             + _fourier_shift(A, t, +0.5 * sep) * np.exp(-1j * dw * t))
 
 
+def _misaligned_efficiency(tau, tau0):
+    """Delay-dependent conversion efficiency of a MISALIGNED correlator.
+
+    Nothing is wrong with the pulse here — the field stays a clean sech. What
+    is wrong is the geometry, so this is a property of the MEASUREMENT, like
+    "saturated"'s exposure rather than like a build function. With the two arms
+    not properly overlapped, moving the delay stage walks one beam across the
+    other at the crystal, so the signal is progressively vignetted as the stage
+    travels one way and the trace loses that wing while the other stays put.
+    That one-sided fall-off is what a FROG in need of realignment looks like,
+    and it is what symmetry mode exists to catch.
+
+    A sigmoid rather than a hard edge, because a beam clips off gradually as
+    the overlap shrinks; placed and scaled in units of the pulse's own duration
+    so the same misalignment reads the same on any tau0.
+
+    The edge sits just inside the correlation rather than out in the wings.
+    Further out it only nibbles at tails that are already dark and the trace
+    still looks symmetric (7% by the score below); here it takes about a fifth
+    of the signal off one side — bad enough to see at a glance, mild enough to
+    still be a usable trace, which is the point of a preset for exercising
+    symmetry mode.
+    """
+    return 1.0 / (1.0 + np.exp((tau - 0.4 * tau0) / (0.5 * tau0)))
+
+
 # Ordered simple -> structured; the GUI builds its picker straight from this.
 PULSE_SHAPES: dict[str, dict] = {
     "tl_sech": {
@@ -2133,6 +2159,19 @@ PULSE_SHAPES: dict[str, dict] = {
         "build": _build_two_color,
         "desc":  "Two sub-pulses at different colours and different times. SHG "
                  "mixes them into three off-diagonal bands.",
+    },
+    "misaligned": {
+        "label": "Misaligned correlator (asymmetric)",
+        "build": _build_tl_sech,
+        # Like "saturated" below, this describes the MEASUREMENT and not the
+        # field: the same clean sech pulse, seen through a correlator whose
+        # beams walk apart as the stage moves.
+        "efficiency": _misaligned_efficiency,
+        "desc":  "A clean sech pulse measured through a misaligned "
+                 "correlator: the beams walk apart as the delay stage travels, "
+                 "so one wing of the trace is vignetted away while the other "
+                 "is untouched. The pulse is fine — the trace is lopsided "
+                 "because the setup is. Exercises symmetry mode.",
     },
     "saturated": {
         "label": "Over-exposed sech² (clips)",
@@ -2190,11 +2229,15 @@ class SimulatedSpectrometer(SpectrometerBase):
         self.background_counts = background_counts
         self.integration_ms    = 100.0
 
+        # Kept because the measurement-side hooks below are scaled in units of
+        # the pulse's own duration.
+        self.tau0_fs = float(tau0_fs)
         if callable(pulse):
             self.pulse, build   = "custom", pulse
             self.pulse_label    = getattr(pulse, "__name__", "custom pulse")
             self.pulse_desc     = ""
             self.exposure       = 1.0
+            self._efficiency    = None
         else:
             if pulse not in PULSE_SHAPES:
                 raise KeyError(f"Unknown pulse {pulse!r}. "
@@ -2204,6 +2247,10 @@ class SimulatedSpectrometer(SpectrometerBase):
             self.pulse_label    = shape["label"]
             self.pulse_desc     = shape["desc"]
             self.exposure       = float(shape.get("exposure", 1.0))
+            # Optional delay-dependent efficiency (see _misaligned_efficiency).
+            # Read before _norm is computed below, so the normalisation is of
+            # the trace as actually measured rather than of an ideal one.
+            self._efficiency    = shape.get("efficiency")
         # Presets may ask to be driven harder than full scale (see "saturated").
         self.peak_counts = peak_counts * self.exposure
         self.name = f"simulated {gate}-FROG — {self.pulse_label}"
@@ -2278,8 +2325,13 @@ class SimulatedSpectrometer(SpectrometerBase):
         return mid - half, mid + half
 
     def _raw_column(self, tau: float) -> np.ndarray:
-        return np.interp(self._wl, self._lam_sorted, self._signal_spectrum(tau),
-                         left=0.0, right=0.0)
+        col = np.interp(self._wl, self._lam_sorted, self._signal_spectrum(tau),
+                        left=0.0, right=0.0)
+        if self._efficiency is not None:
+            # Scales the whole column, never its shape: a geometric overlap
+            # loss costs signal at every wavelength equally.
+            col = col * float(self._efficiency(tau, self.tau0_fs))
+        return col
 
     def acquire(self) -> np.ndarray:
         # `stage` may be None — the app lets a simulated spectrometer run with
