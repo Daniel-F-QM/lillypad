@@ -110,9 +110,14 @@ python frog_gui_fast.py
 > PyInstaller builds here before. `pip check` will warn that pylablib is
 > missing pyqt5; that warning is expected and safe to ignore.
 
-The app starts on simulated hardware, so this works with nothing plugged in.
-Press **START FEED** for a live spectrum, then **Measure FROG** to run a scan.
-Pick a pulse shape under **Hardware** to change what the simulator produces.
+The app starts with **nothing connected** — the spectrum panel says so, and the
+Spectrum and Stage panels carry a **Connect Spectrometer** / **Connect Stage**
+button instead of their controls.
+
+To run with nothing plugged in, open **Simulation** in the toolbar and press
+*Spectrometer* and *Stage* (or *Stitched pair* for two). The panels swap over to
+their controls, the live feed starts, and **Measure FROG** runs a scan. The
+pulse shape and gate the simulator produces are picked in that same window.
 
 ### Self-tests
 
@@ -126,9 +131,14 @@ python avantes.py     # ctypes struct layout + error table; DLL and device optio
 
 ## Real hardware
 
-Open the **Hardware** dialog and pick a device. Vendor libraries load only when
-you actually select their device, so a missing SDK costs you that one adapter
-rather than the whole app.
+Press **Connect Spectrometer** or **Connect Stage** on the side panel — or the
+**Spectrometer** / **Stage** buttons in the toolbar, which open the same two
+windows. Each scans for what is attached and lists it. Vendor libraries load
+only when you actually select their device, so a missing SDK costs you that one
+adapter rather than the whole app.
+
+Either window's **Disconnect** releases the device and puts the app back in its
+disconnected state.
 
 | Device | Adapter | Backend |
 | --- | --- | --- |
@@ -185,7 +195,7 @@ source, not speed. The live feed is capped at ~33 fps regardless
 faster; a scan is not capped and takes frames as fast as the device yields them.
 
 **Spectrometer backends.** python-seabreeze has two backends and the box beside
-*Real (seabreeze)* in the Hardware dialog switches between them (applied on the
+The **Backend** box in the Spectrometer window switches between them (applied on the
 next connect). It sits on the seabreeze row for the same reason the port fields
 sit on the Zaber and Piezo Jena rows — it applies to that adapter only, and
 nothing else. The default is **pyseabreeze**, the pure-Python backend — it is
@@ -221,10 +231,11 @@ path), next to the program (or the `.exe`), `C:\AvaSpec*DLL*\`,
 `C:\Program Files\Avantes\…`, then `PATH`. With several versions installed the
 newest wins.
 
-Press **Real (Avantes)** in the Hardware dialog to connect. Everything
+An attached Avantes appears in the Spectrometer window's scan alongside every
+other vendor's devices; pick it in a slot to connect it. Everything
 Avantes-specific then lives behind an **Avantes** button that appears in the
-toolbar only while such a device is connected, so the Hardware panel stays the
-same size it always was. That dialog covers on-board averaging, the ADC
+toolbar only while such a device is connected, so the Spectrometer window stays
+the same size it always was. That dialog covers on-board averaging, the ADC
 resolution, dark and prescan correction, smoothing, triggering and sync, the
 board temperature, and a device-info block. Three couplings are worth knowing:
 
@@ -364,57 +375,59 @@ status message — but a file that cannot be read at all pops a dialog and the
 device keeps whatever it had, so a menu label can never claim a calibration
 the spectrometer is not actually carrying.
 
-**Multi-spectrometer mode.** Either slot takes a device from either vendor, so
-an Avantes and an Ocean spectrometer stitch together like two of a kind.
-*Enable multi-spectrometer mode* in the
-toolbar's **Multi-Spec** menu opens two slots, each with its own spectrometer
-and calibration submenu; once both slots are filled the pair connects
-automatically as one stitched device (`StitchedSpectrometer`): spectra are
-interpolated onto a common grid, each device's own calibration file is
-applied first, and the two are crossfaded across the overlap band (the ranges
-must overlap). *Auto-stitch* least-squares-matches the bluer spectrometer to
-the redder one over that band (do this with light spanning the overlap);
-*Manual stitch…* enters the factor by hand. Entering the mode adds a second
-saturation lamp to the status bar: each device's RAW frames are judged
-against that device's own full scale, both live and during scans, so either
-detector clipping trips its own alarm. *Disable multi-spectrometer mode*
-keeps the slot-1 spectrometer connected as a normal single device.
+**Multi-spectrometer mode.** There is no mode to enable: the **Spectrometer**
+window offers two slots from the start. Slot 1 alone is an ordinary single
+spectrometer. Fill slot 2 as well and the pair connects immediately as one
+stitched device (`StitchedSpectrometer`): spectra are interpolated onto a
+common grid, each device's own calibration file is applied first, and the two
+are crossfaded across the overlap band (the ranges must overlap). Set slot 2
+back to *(none)* and slot 1 stays connected on its own.
+
+Either slot takes a device from either vendor, so an Avantes and an Ocean
+spectrometer stitch together like two of a kind. *Auto-stitch*
+least-squares-matches the bluer spectrometer to the redder one over the band
+(do this with light spanning the overlap) — it is in the Spectrometer window
+and also as a **⇌** button in the row over the Spectrum panel, next to the
+curve you are judging it by. *Manual…* enters the factor by hand. A live pair
+adds a second saturation lamp to the status bar: each device's RAW frames are
+judged against that device's own full scale, both live and during scans, so
+either detector clipping trips its own alarm.
 
 **The overlap band.** The range the two devices geometrically share always
 includes both detectors' dead edges — where the bluer one's sensitivity has
 fallen away and the redder one's has not yet risen. Those samples are at the
 noise floor and each calibration factor is at its steepest there, so they feed
-the fit maximum noise and no information. *Overlap band…* in the Multi-Spec
-menu sets the sub-range actually used: the stitch factor is fitted over it, and
+the fit maximum noise and no information. *Overlap band…* in the Spectrometer
+window sets the sub-range actually used: the stitch factor is fitted over it, and
 the two spectra are crossfaded across it with a raised cosine — the bluer
 device alone below, the redder alone above — so there is no seam and the dead
 edges never reach the merged curve. It defaults to the central 90% of the
 shared range and is shaded **green** in the per-spectrometer view, so you can
 see what the fit is using. *Auto-stitch* reports a **residual mismatch**
-alongside the factor (also shown in the menu): that number is the answer to
+alongside the factor: that number is the answer to
 "is one scalar enough for this pair?" — a few percent means the two calibrated
 curves genuinely agree across the band; a large one means a calibration is
-wrong or the band is too wide. *Auto-stitch* subtracts the recorded dark from
+wrong or the band is too wide. The factor, its mismatch and the current band
+are all shown in the Spectrometer window's *Stitching* block. *Auto-stitch* subtracts the recorded dark from
 both members before fitting, so a long-exposure member's pedestal cannot be
 matched instead of the light.
 
-Each slot also offers a **simulated** member — *Simulated — blue half* and
-*Simulated — red half*, listed above the real devices and available even with
-no spectrometer attached — so the whole mode can be exercised offline. The two
-cover overlapping halves of the simulated signal band (roughly 65% each, so
-there is a genuine blue-only / shared / red-only geometry for *Auto-stitch* to
-work on) rather than two identical full-band copies, which would make the
-entire spectrum "overlap" and test nothing. Entering the mode while the
-simulator is connected pre-fills slot 1, so picking the red half in slot 2 is
-all it takes. Leaving the mode restores the normal full-band simulator.
+**Simulated pair.** *Stitched pair* in the **Simulation** window fills both
+slots with simulated members and connects them, so the whole mode can be
+exercised offline. The two cover overlapping halves of the simulated signal
+band (roughly 65% each, so there is a genuine blue-only / shared / red-only
+geometry for *Auto-stitch* to work on) rather than two identical full-band
+copies, which would make the entire spectrum "overlap" and test nothing.
+Simulated devices are offered only there — never in the Spectrometer window —
+so nothing that reads as a hardware control can hand back synthetic data.
 
 While a pair is connected the Spectrum panel offers **one integration time per
 spectrometer** (*S1* / *S2*, in slot order — the same numbering as the lamps),
 so an arm that sees little light can be exposed longer than a bright one.
 Frames stay in raw counts, so the exposure ratio ends up inside the stitch
 factor: after changing either time, re-run *Auto-stitch*, or the seam
-reappears. The Multi-Spec menu marks the factor *stale* until you do, and the
-dark is exposure-specific too, so re-record it.
+reappears. The Spectrometer window marks the factor *stale* until you do, and
+the dark is exposure-specific too, so re-record it.
 
 The button beside the auto-fit control on the plot switches the Spectrum panel
 between the combined stitched curve and **one curve per spectrometer** (S1 sky

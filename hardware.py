@@ -2282,7 +2282,12 @@ class SimulatedSpectrometer(SpectrometerBase):
                          left=0.0, right=0.0)
 
     def acquire(self) -> np.ndarray:
-        tau    = self._pos_to_delay(self.stage.get_position())   # read-back!
+        # `stage` may be None — the app lets a simulated spectrometer run with
+        # no stage connected at all. Zero delay is the honest answer then: it
+        # is the one delay that needs no axis to define it, and it gives the
+        # brightest column, so an unattended simulator still shows a spectrum.
+        tau    = (self._pos_to_delay(self.stage.get_position())   # read-back!
+                  if self.stage is not None else 0.0)
         scale  = self.integration_ms / 100.0                     # signal ∝ integ. time
         counts = self._raw_column(tau) / self._norm * self.peak_counts * scale
         counts = counts + self.background_counts * scale

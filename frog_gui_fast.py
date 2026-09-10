@@ -90,7 +90,8 @@ from hardware import (SimulatedStage, SimulatedSpectrometer,
                       SeabreezeSpectrometer, AvantesSpectrometer,
                       StitchedSpectrometer,
                       list_kinesis_stages, list_spectrometers,
-                      list_avantes_spectrometers, open_spectrometer,
+                      list_avantes_spectrometers, list_seabreeze_spectrometers,
+                      open_spectrometer,
                       avantes_trigger_options,
                       load_calibration_file, SEABREEZE_BACKENDS,
                       PULSE_SHAPES, DEFAULT_PULSE)
@@ -313,6 +314,13 @@ QPushButton#overlay {{ border-color:{pal['accent']}; color:{pal['accent']};
     padding:0px; font-size:12px; border-radius:4px; }}
 QPushButton#overlay:hover {{ background-color:{pal['accent']}; color:{pal['bg']}; }}
 QPushButton#overlay:pressed {{ background-color:{pal['accent']}; color:{pal['bg']}; }}
+/* The "no spectrometer connected" message centred on an empty spectrum panel.
+   Accent, not danger: nothing is wrong, there is simply nothing connected yet
+   — and the accent is what carries against the plot background it sits on,
+   which the dim text colour was never meant to be read over. Transparent, so
+   NoDeviceOverlay's own painted background (and its watermark) shows through. */
+QLabel#nodev {{ color:{pal['accent']}; background:transparent; font-size:22px;
+    font-weight:600; letter-spacing:0.5px; }}
 /* Same header button, in the stop colour — the live feed's running state. */
 QPushButton#overlaydanger {{ border-color:{pal['danger']}; color:{pal['danger']};
     padding:0px; font-size:12px; border-radius:4px; }}
@@ -460,6 +468,15 @@ VERT_ICON  = {"dark":  resource_path("icons", "vertical_dark.png"),
 # show the same mark and differ only in the accent each theme draws it in.
 ALIGN_ICON = {"dark":  resource_path("icons", "alignment_dark.png"),
               "light": resource_path("icons", "alignment_light.png")}
+# Auto-stitch, on the spectrum panel's header. Depicts the ACTION — matching
+# the two halves of a pair — so like ALIGN_ICON both files carry the same mark
+# in their own theme's accent.
+STITCH_ICON = {"dark":  resource_path("icons", "autostitch_dark.png"),
+               "light": resource_path("icons", "autostitch_light.png")}
+# Watermark behind the "nothing connected" message. ONE file for both themes,
+# unlike the pairs above: it is drawn as an alpha mask and tinted from the live
+# PALETTE (see NoDeviceOverlay), so it follows a theme switch by itself.
+DISCONNECTED_ICON = resource_path("icons", "disconnected.png")
 
 
 _APP_ICON = None
@@ -512,6 +529,13 @@ def seed_calibration_dir():
         pass   # e.g. read-only install dir — the menu just shows no files
 
 
+
+
+# Said in three places (the auto-scale checkboxes) about one gesture, so it is
+# written once — FrogCanvas.reset_axes is what implements it.
+RIGHT_CLICK_HINT = ("Right-click the plot to toggle this: off fits the full "
+                    "range and follows it live, on freezes the view where it "
+                    "is.")
 
 
 def _hline():
@@ -1090,159 +1114,276 @@ class AlignmentDialog(QDialog):
             self.show(); self.raise_()
 
 
-class HardwareDialog(QDialog):
-    """Switch the stage and spectrometer INDEPENDENTLY (e.g. real stage +
-    simulated spectrometer), with inline status."""
-    def __init__(self, main, parent=None):
+# ─────────────────────────────────────────────────────────────────────────────
+# Connection dialogs
+# ─────────────────────────────────────────────────────────────────────────────
+class _ConnectDialog(QDialog):
+    """Shared plumbing for the three connection windows.
+
+    They all do the same three things: run an (ok, msg) action and colour the
+    result inline, draw a small section header, and refresh themselves whenever
+    they are shown. Only `_refresh` differs, so only `_refresh` is overridden.
+    """
+    def __init__(self, main, parent=None, title="", width=380):
         super().__init__(parent, Qt.Tool)
         self.main = main
-        self.setWindowTitle("Hardware")
-        self.setFixedWidth(360)
-        lay = QVBoxLayout(self); lay.setSpacing(8); lay.setContentsMargins(14, 14, 14, 14)
+        self.setWindowTitle(title)
+        self.setFixedWidth(width)
+        # Created here rather than in each subclass: _do() writes to it, and
+        # every subclass has to place it somewhere in its own layout.
+        self.lbl_msg = QLabel("")
+        self.lbl_msg.setObjectName("dim")
+        self.lbl_msg.setWordWrap(True)
 
-        lay.addWidget(self._header("Stage"))
-        self.lbl_stage = QLabel(); self.lbl_stage.setObjectName("value")
-        self.lbl_stage.setWordWrap(True)
-        lay.addWidget(self.lbl_stage)
-        # Two equal-width columns shared by both stage rows, so "Real (Zaber)"
-        # lines up with (and matches the width of) "Real (Kinesis)" and the
-        # port field shrinks to the "Simulated" column.
-        sgrid = QGridLayout(); sgrid.setSpacing(6)
-        sgrid.setColumnStretch(0, 1); sgrid.setColumnStretch(1, 1)
-        b_ss = QPushButton("Simulated")
-        b_ss.clicked.connect(lambda: self._do(self.main._use_sim_stage))
-        b_sr = QPushButton("Real (Kinesis)"); b_sr.setObjectName("accent")
-        b_sr.clicked.connect(lambda: self._do(self.main._connect_real_stage))
-        sgrid.addWidget(b_ss, 0, 0); sgrid.addWidget(b_sr, 0, 1)
+    @staticmethod
+    def _header(text):
+        l = QLabel(text)
+        l.setObjectName("hdr")
+        return l
 
-        # Zaber: optional serial port (blank = auto-scan the machine's ports).
-        self.edit_zaber_port = QLineEdit()
-        self.edit_zaber_port.setPlaceholderText("COM (auto)")
-        b_zr = QPushButton("Real (Zaber)"); b_zr.setObjectName("accent")
-        b_zr.clicked.connect(lambda: self._do(self._connect_zaber))
-        sgrid.addWidget(self.edit_zaber_port, 1, 0); sgrid.addWidget(b_zr, 1, 1)
+    def _do(self, fn):
+        """Run an (ok, msg) action and report it in lbl_msg."""
+        ok, msg = fn()
+        # Color via objectName + repolish (not setStyleSheet) so a later theme
+        # switch restyles the label along with everything else.
+        self.lbl_msg.setObjectName("ok" if ok else "err")
+        self.lbl_msg.style().unpolish(self.lbl_msg)
+        self.lbl_msg.style().polish(self.lbl_msg)
+        self.lbl_msg.setText(msg)
+        self._refresh()
+        self._refit()
 
-        # Piezo Jena: optional serial port (blank = auto-scan), like Zaber.
-        self.edit_piezo_port = QLineEdit()
-        self.edit_piezo_port.setPlaceholderText("COM (auto)")
-        b_pj = QPushButton("Real (Piezo Jena)"); b_pj.setObjectName("accent")
-        b_pj.clicked.connect(lambda: self._do(self._connect_piezo))
-        sgrid.addWidget(self.edit_piezo_port, 2, 0); sgrid.addWidget(b_pj, 2, 1)
-        lay.addLayout(sgrid)
+    def _refit(self):
+        """Grow the window to whatever the contents now need.
 
-        # Backlash approach margin. Every move undershoots by this much when it
-        # would otherwise arrive from above, so the zero you mark by jogging and
-        # the positions a scan sweeps through sit in the same frame. It lives
-        # here because it is a property OF THE CONNECTED STAGE — the connect
-        # buttons above seed it, and _sync_backlash_ui pushes the new stage's
-        # default into this box on every swap.
-        brow = QGridLayout(); brow.setSpacing(6)
-        brow.setColumnStretch(0, 0); brow.setColumnStretch(1, 1)
-        brow.addWidget(QLabel("Backlash"), 0, 0)
-        self.spin_backlash = DoubleSpinBox()
-        self.spin_backlash.setRange(0.0, 1000.0); self.spin_backlash.setDecimals(1)
-        self.spin_backlash.setSingleStep(10.0); self.spin_backlash.setSuffix(" um")
-        self.spin_backlash.setToolTip(
-            "Approach margin. Lead-screw stages land in a different place "
-            "depending on which way they arrived; undershooting by more than "
-            "the slack and coming back up makes every move repeatable.\n\n"
-            "0 disables it — correct for a Thorlabs controller (its firmware "
-            "already does this) or a piezo, wrong for a Zaber.")
-        self.spin_backlash.valueChanged.connect(self.main._on_backlash_changed)
-        brow.addWidget(self.spin_backlash, 0, 1)
-        lay.addLayout(brow)
-        self.lbl_backlash_fs = QLabel("—"); self.lbl_backlash_fs.setObjectName("dim")
-        self.lbl_backlash_fs.setWordWrap(True)
-        lay.addWidget(self.lbl_backlash_fs)
+        These dialogs are full of word-wrapped labels — a device name, a status
+        line, a stitch summary — that go from one line to four as devices come
+        and go, and Qt will not re-grow an already-shown window for a wrapped
+        label on its own. The width is fixed, so this only ever changes height.
+        """
+        self.layout().activate()
+        self.resize(self.width(), self.sizeHint().height())
 
-        lay.addWidget(_hline())
+    def toggle(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.open_fresh()
 
-        lay.addWidget(self._header("Spectrometer"))
+    def open_fresh(self):
+        """Show the dialog with a clean status line and current contents.
+
+        This — not toggle() — is what the panel Connect buttons call: pressing
+        "Connect Spectrometer" must always open the window, never close one
+        that happens to be up already.
+        """
+        self.lbl_msg.setText("")
+        self._refresh()
+        self._refit()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _refresh(self):
+        pass
+
+
+class SpectrometerDialog(_ConnectDialog):
+    """Connect one or two spectrometers, and manage the stitch between them.
+
+    Two slots are offered from the start, because a pair is not a separate mode
+    to be enabled — it is just the second slot being filled. Slot 1 alone is
+    single-spectrometer mode; filling slot 2 reopens both as one stitched
+    device; emptying it drops back to slot 1. The old Multi-Spec menu's entire
+    contents (per-slot device and calibration, auto/manual stitch, overlap
+    band) live here, next to the connection they describe.
+
+    Simulated devices are deliberately absent: they belong to the Simulation
+    window, so nothing on a bench-hardware dialog can quietly hand back fake
+    data.
+    """
+    NONE_LABEL = "(none)"
+
+    def __init__(self, main, parent=None):
+        super().__init__(main, parent, "Spectrometer", width=430)
+        lay = QVBoxLayout(self); lay.setSpacing(8)
+        lay.setContentsMargins(14, 14, 14, 14)
+
+        hrow = QHBoxLayout(); hrow.setSpacing(6)
+        hrow.addWidget(self._header("Spectrometer"), 1)
+        self.btn_scan = QPushButton("Rescan")
+        self.btn_scan.setObjectName("compact")
+        self.btn_scan.setToolTip("Re-enumerate every attached spectrometer")
+        self.btn_scan.clicked.connect(self._rescan)
+        hrow.addWidget(self.btn_scan, 0)
+        lay.addLayout(hrow)
+
         self.lbl_spec = QLabel(); self.lbl_spec.setObjectName("value")
         self.lbl_spec.setWordWrap(True)
         lay.addWidget(self.lbl_spec)
-        # Same two-column shape as the stage grid above: column 1 is the
-        # connect button, column 0 that row's parameter. Putting the seabreeze
-        # backend combo on the seabreeze row is what stops it reading as a
-        # global setting — the same trick that keeps edit_zaber_port from
-        # looking like a Kinesis field.
-        pgrid = QGridLayout(); pgrid.setSpacing(6)
-        pgrid.setColumnStretch(0, 1); pgrid.setColumnStretch(1, 1)
-        b_ps = QPushButton("Simulated")
-        b_ps.clicked.connect(lambda: self._do(self.main._use_sim_spectrometer))
-        b_pa = QPushButton("Real (Avantes)"); b_pa.setObjectName("accent")
-        b_pa.clicked.connect(
-            lambda: self._do(self.main._connect_avantes_spectrometer))
-        pgrid.addWidget(b_ps, 0, 0); pgrid.addWidget(b_pa, 0, 1)
+
+        # Slot rows. Device on the left, that slot's calibration on the right:
+        # a calibration file belongs to ONE physical spectrometer, so putting
+        # it on any other row would invite assigning it to the pair.
+        grid = QGridLayout(); grid.setSpacing(6)
+        grid.setColumnStretch(1, 3); grid.setColumnStretch(2, 2)
+        self.cmb_dev = []
+        self.cmb_cal = []
+        for slot in (0, 1):
+            grid.addWidget(QLabel(f"Slot {slot + 1}"), slot, 0)
+            dev = ComboBox()
+            dev.setToolTip("Which spectrometer this slot holds")
+            dev.activated.connect(
+                lambda _i, s=slot: self._on_device_picked(s))
+            grid.addWidget(dev, slot, 1)
+            self.cmb_dev.append(dev)
+            cal = ComboBox()
+            cal.setToolTip("Intensity calibration applied to this slot's "
+                           "device — raw counts when none")
+            cal.activated.connect(
+                lambda _i, s=slot: self._on_cal_picked(s))
+            grid.addWidget(cal, slot, 2)
+            self.cmb_cal.append(cal)
+        lay.addLayout(grid)
+        hint = QLabel("Leave slot 2 empty for single-spectrometer mode. "
+                      "Filling it reopens both devices as one stitched "
+                      "spectrometer.")
+        hint.setObjectName("dim"); hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        lay.addWidget(_hline())
+
+        # ── Stitching ────────────────────────────────────────────────────────
+        # Only meaningful while a pair is live, so the whole block greys out
+        # rather than disappearing: it is where you look to find out WHY the
+        # seam is wrong, and a block that vanishes gives nowhere to look.
+        lay.addWidget(self._header("Stitching"))
+        self.lbl_stitch = QLabel("—")
+        self.lbl_stitch.setObjectName("dim"); self.lbl_stitch.setWordWrap(True)
+        lay.addWidget(self.lbl_stitch)
+        srow = QHBoxLayout(); srow.setSpacing(6)
+        self.btn_fit = QPushButton("Auto-stitch")
+        self.btn_fit.setObjectName("accentcompact")
+        self.btn_fit.setToolTip("Fit the stitch factor from one frame — needs "
+                                "light across the overlap region")
+        self.btn_fit.clicked.connect(
+            lambda: self._do(self.main._fit_stitch_factor))
+        self.btn_manual = QPushButton("Manual…")
+        self.btn_manual.setObjectName("compact")
+        self.btn_manual.clicked.connect(self._manual_stitch)
+        self.btn_band = QPushButton("Overlap band…")
+        self.btn_band.setObjectName("compact")
+        self.btn_band.setToolTip(
+            "The part of the overlap the stitch factor is fitted over and the "
+            "two spectra are crossfaded across — shown shaded green in the "
+            "per-spectrometer view")
+        self.btn_band.clicked.connect(self._set_band)
+        srow.addWidget(self.btn_fit); srow.addWidget(self.btn_manual)
+        srow.addWidget(self.btn_band)
+        lay.addLayout(srow)
+
+        lay.addWidget(_hline())
 
         # seabreeze backend switch. pyseabreeze is the default because it is
-        # the only backend that knows the newer Ocean Insight models; cseabreeze
-        # stays available for devices that only enumerate through the vendor
-        # C library. Applied on the next connect. No label: its own items say
-        # what it is, exactly as the port fields use a placeholder instead.
+        # the only backend that knows the newer Ocean Insight models;
+        # cseabreeze stays available for devices that only enumerate through
+        # the vendor C library. Applied on the next connect.
+        brow = QGridLayout(); brow.setSpacing(6)
+        brow.setColumnStretch(1, 1)
+        brow.addWidget(QLabel("Backend"), 0, 0)
         self.cmb_backend = ComboBox()
         for name in SEABREEZE_BACKENDS:
             self.cmb_backend.addItem(name, name)
         self.cmb_backend.setCurrentIndex(
             max(0, self.cmb_backend.findData(self.main.seabreeze_backend)))
         self.cmb_backend.currentIndexChanged.connect(self._on_backend)
-        b_pr = QPushButton("Real (seabreeze)"); b_pr.setObjectName("accent")
-        b_pr.clicked.connect(lambda: self._do(self.main._connect_real_spectrometer))
-        pgrid.addWidget(self.cmb_backend, 1, 0); pgrid.addWidget(b_pr, 1, 1)
-        lay.addLayout(pgrid)
-
+        brow.addWidget(self.cmb_backend, 0, 1)
         # Full-scale override. Without this, a spectrometer that does not
         # report `max_intensity` leaves saturation unchecked with no way out
         # from the UI. Blank = trust the device.
-        fsrow = QGridLayout(); fsrow.setSpacing(6)
-        fsrow.setColumnStretch(0, 0); fsrow.setColumnStretch(1, 1)
-        fsrow.addWidget(QLabel("Full scale"), 0, 0)
+        brow.addWidget(QLabel("Full scale"), 1, 0)
         self.edit_full_scale = QLineEdit()
         self.edit_full_scale.setPlaceholderText("auto (from device)")
         self.edit_full_scale.editingFinished.connect(self._on_full_scale)
-        fsrow.addWidget(self.edit_full_scale, 0, 1)
-        lay.addLayout(fsrow)
-
-        lay.addWidget(_hline())
-
-        # ── Simulated beam ───────────────────────────────────────────────────
-        # Which pulse the simulated spectrometer is measuring. Changing either
-        # box re-makes the simulator on the spot (its wavelength window is
-        # derived from the beam, so it cannot just be mutated in place).
-        lay.addWidget(self._header("Simulated beam"))
-        brow = QGridLayout(); brow.setSpacing(6)
-        brow.setColumnStretch(0, 1); brow.setColumnStretch(1, 0)
-        self.cmb_pulse = ComboBox()
-        for key, shape in PULSE_SHAPES.items():
-            self.cmb_pulse.addItem(shape["label"], key)
-        self.cmb_pulse.setCurrentIndex(
-            max(0, self.cmb_pulse.findData(self.main.sim_pulse)))
-        self.cmb_pulse.currentIndexChanged.connect(self._on_beam)
-        self.cmb_gate = ComboBox()
-        self.cmb_gate.addItem("SHG", "shg")
-        self.cmb_gate.addItem("PG", "pg")
-        self.cmb_gate.setCurrentIndex(
-            max(0, self.cmb_gate.findData(self.main.sim_gate)))
-        self.cmb_gate.currentIndexChanged.connect(self._on_beam)
-        brow.addWidget(self.cmb_pulse, 0, 0); brow.addWidget(self.cmb_gate, 0, 1)
+        brow.addWidget(self.edit_full_scale, 1, 1)
         lay.addLayout(brow)
-        self.lbl_beam = QLabel(); self.lbl_beam.setObjectName("dim")
-        self.lbl_beam.setWordWrap(True)
-        lay.addWidget(self.lbl_beam)
 
-        self.lbl_msg = QLabel(""); self.lbl_msg.setObjectName("dim"); self.lbl_msg.setWordWrap(True)
         lay.addWidget(self.lbl_msg)
-        btn = QPushButton("Close"); btn.clicked.connect(self.hide)
-        lay.addWidget(btn)
+        frow = QHBoxLayout(); frow.setSpacing(6)
+        self.btn_disconnect = QPushButton("Disconnect")
+        self.btn_disconnect.setObjectName("danger")
+        self.btn_disconnect.clicked.connect(self._disconnect)
+        btn_close = QPushButton("Close"); btn_close.clicked.connect(self.hide)
+        frow.addWidget(self.btn_disconnect); frow.addWidget(btn_close)
+        lay.addLayout(frow)
 
-    def _connect_zaber(self):
-        port = self.edit_zaber_port.text().strip() or None
-        return self.main._connect_zaber_stage(port)
+        self._devices = []      # last enumeration: [(label, ident), ...]
 
-    def _connect_piezo(self):
-        port = self.edit_piezo_port.text().strip() or None
-        return self.main._connect_piezo_jena_stage(port)
+    # ── Enumeration ──────────────────────────────────────────────────────────
+    def open_fresh(self):
+        """Opening the window IS the request to scan — that is what the panel's
+        Connect button means. Scanned AFTER the base clears the status line, so
+        the result of this scan is what stays on it."""
+        super().open_fresh()
+        self._rescan()
 
+    def _rescan(self):
+        self._do(self._scan)
+
+    def _scan(self):
+        """Re-enumerate every vendor. (ok, msg), for _do.
+
+        list_spectrometers already merges seabreeze and Avantes into one
+        tagged-id list, so one call covers the bench.
+        """
+        try:
+            self._devices = list(self.main._list_spectrometers())
+        except Exception as e:
+            self._devices = []
+            return False, f"Scan failed: {e}"
+        n = len(self._devices)
+        if n:
+            return True, (f"{n} spectrometer{'' if n == 1 else 's'} found — "
+                          f"pick one for slot 1.")
+        # Nothing found. list_spectrometers hides a vendor whose SDK failed, so
+        # say WHICH one failed and why — otherwise a missing AvaSpec driver and
+        # an unplugged cable look identical from here.
+        msg = ("No spectrometers found. Check the USB cables and the vendor "
+               "drivers, then press Rescan.")
+        notes = self.main._spectrometer_scan_notes()
+        if notes:
+            msg += "\n\n" + "\n".join(notes)
+        return False, msg
+
+    # ── Slot handlers ────────────────────────────────────────────────────────
+    def _on_device_picked(self, slot):
+        ident = self.cmb_dev[slot].currentData()
+        label = self.cmb_dev[slot].currentText()
+        if ident == self.main._multi["serials"][slot]:
+            return                       # re-picked what is already there
+        if ident is None:
+            self._do(lambda: self.main._clear_slot(slot))
+        else:
+            self._do(lambda: self.main._set_slot(slot, ident, label))
+
+    def _on_cal_picked(self, slot):
+        path = self.cmb_cal[slot].currentData()
+        self.main._select_slot_calibration(slot, path)
+        self._refresh()
+
+    def _disconnect(self):
+        self._do(self.main._disconnect_spectrometer)
+
+    # ── Stitching handlers ───────────────────────────────────────────────────
+    def _manual_stitch(self):
+        self.main._set_stitch_factor()
+        self._refresh()
+
+    def _set_band(self):
+        self.main._set_overlap_band()
+        self._refresh()
+
+    # ── Device-wide settings ─────────────────────────────────────────────────
     def _on_full_scale(self):
         """Apply the typed full-scale override (blank clears it back to auto)."""
         text = self.edit_full_scale.text().strip()
@@ -1274,8 +1415,7 @@ class HardwareDialog(QDialog):
         # release it now rather than severing it mid-use on the next connect.
         live = self.main._live_seabreeze_backend()
         if live is not None and live != backend:
-            ok, err = self.main._apply_spectrometer(
-                self.main._make_sim_spectrometer())
+            ok, err = self.main._disconnect_spectrometer()
             if not ok:
                 # Refused (scan running / feed busy) — keep the old choice.
                 self.cmb_backend.setCurrentIndex(
@@ -1284,53 +1424,337 @@ class HardwareDialog(QDialog):
                 self._do(lambda: (False, err))
                 return
             self.main.seabreeze_backend = backend
+            self._scan()      # the new backend enumerates its own devices
             self._do(lambda: (True, f"Backend: {backend}. The spectrometer "
-                                    f"was released — press Real (seabreeze) "
+                                    f"was released — pick it again in slot 1 "
                                     f"to reconnect through it."))
         else:
             self.main.seabreeze_backend = backend
+            self._scan()
             self._do(lambda: (True, f"Backend: {backend} — used on the next "
                                     f"connect."))
+
+    # ── Display ──────────────────────────────────────────────────────────────
+    def _refresh(self):
+        spec = self.main.spec
+        self.lbl_spec.setText(spec.name if spec is not None
+                              else "Not connected.")
+        self.btn_disconnect.setEnabled(spec is not None)
+        for slot in (0, 1):
+            self._fill_device_combo(slot)
+            self._fill_cal_combo(slot)
+        reported = getattr(spec, "max_counts", None)
+        self.edit_full_scale.setPlaceholderText(
+            f"auto — device reports {reported:.0f}" if reported
+            else "device reports none — saturation unchecked")
+        self._refresh_stitch()
+
+    def _fill_device_combo(self, slot):
+        """Rebuild one slot's device list: (none), whatever the slot currently
+        holds, and every enumerated device not claimed by the other slot.
+
+        The current choice is re-added even when the last scan missed it — a
+        simulated half assigned from the Simulation window never appears in an
+        enumeration, and dropping it here would make the combo claim the slot
+        was empty while the device was live.
+        """
+        cmb = self.cmb_dev[slot]
+        ident = self.main._multi["serials"][slot]
+        label = self.main._multi["labels"][slot]
+        other = self.main._multi["serials"][1 - slot]
+        with QSignalBlocker(cmb):
+            cmb.clear()
+            cmb.addItem(self.NONE_LABEL, None)
+            known = set()
+            if ident is not None:
+                cmb.addItem(label or str(ident), ident)
+                known.add(ident)
+            for model, dev_id in self._devices:
+                if dev_id == other or dev_id in known:
+                    continue
+                # Bare serial in the label: the model name already says which
+                # vendor it is, so repeating the tag would only make the combo
+                # wider. The full tagged id is what gets stored in the slot.
+                cmb.addItem(f"{model} [{dev_id.split(':', 1)[-1]}]", dev_id)
+            cmb.setCurrentIndex(max(0, cmb.findData(ident)))
+
+    def _fill_cal_combo(self, slot):
+        cmb = self.cmb_cal[slot]
+        cal = self.main._multi["cals"][slot]
+        with QSignalBlocker(cmb):
+            cmb.clear()
+            cmb.addItem("No calibration", None)
+            current = 0
+            for i, f in enumerate(self.main._calibration_files(), start=1):
+                cmb.addItem(f.stem, f)
+                if cal is not None and f.stem == cal.stem:
+                    current = i
+            cmb.setCurrentIndex(current)
+
+    def _refresh_stitch(self):
+        """The stitch factor, its fit quality and whether it has gone stale.
+
+        The residual is the honest answer to "is one scalar enough for this
+        pair?", so it belongs next to the factor rather than in a status
+        message that has already scrolled away.
+        """
+        spec = self.main.spec
+        live = isinstance(spec, StitchedSpectrometer)
+        for b in (self.btn_fit, self.btn_manual, self.btn_band):
+            b.setEnabled(live)
+        if not live:
+            self.lbl_stitch.setText(
+                "Fill both slots to stitch two spectrometers into one.")
+            return
+        res = spec.stitch_residual
+        quality = ("not fitted yet" if res is None
+                   else f"mismatch {res * 100:.1f}%")
+        stale = ("  ·  STALE — integration times changed"
+                 if self.main._stitch_stale else "")
+        lo, hi = spec.overlap_band
+        glo, ghi = spec.geometric_overlap
+        self.lbl_stitch.setText(
+            f"Factor {spec.stitch_factor:.4g}  ({quality}){stale}\n"
+            f"Overlap band {lo:.1f}–{hi:.1f} nm of {glo:.1f}–{ghi:.1f} nm.")
+
+
+class StageDialog(_ConnectDialog):
+    """Connect a delay stage, and hold the one setting that belongs to it.
+
+    Kinesis controllers enumerate, so they get a scanned list. Zaber and Piezo
+    Jena do not — their adapters auto-scan the serial ports themselves on
+    connect — so they keep a Connect button each, with an optional port
+    override for a bench where the auto-scan picks the wrong one.
+    """
+    def __init__(self, main, parent=None):
+        super().__init__(main, parent, "Stage", width=400)
+        lay = QVBoxLayout(self); lay.setSpacing(8)
+        lay.setContentsMargins(14, 14, 14, 14)
+
+        hrow = QHBoxLayout(); hrow.setSpacing(6)
+        hrow.addWidget(self._header("Stage"), 1)
+        self.btn_scan = QPushButton("Rescan")
+        self.btn_scan.setObjectName("compact")
+        self.btn_scan.setToolTip("Re-enumerate the attached Kinesis controllers")
+        self.btn_scan.clicked.connect(self._rescan)
+        hrow.addWidget(self.btn_scan, 0)
+        lay.addLayout(hrow)
+
+        self.lbl_stage = QLabel(); self.lbl_stage.setObjectName("value")
+        self.lbl_stage.setWordWrap(True)
+        lay.addWidget(self.lbl_stage)
+
+        # Two equal columns: the parameter of a row on the left, that row's
+        # connect button on the right. Putting each port field on its OWN
+        # vendor's row is what stops it reading as a global setting.
+        grid = QGridLayout(); grid.setSpacing(6)
+        grid.setColumnStretch(0, 1); grid.setColumnStretch(1, 1)
+        self.cmb_kinesis = ComboBox()
+        self.cmb_kinesis.setToolTip("Kinesis controllers found by the last scan")
+        b_kin = QPushButton("Connect Kinesis"); b_kin.setObjectName("accent")
+        b_kin.clicked.connect(self._connect_kinesis)
+        grid.addWidget(self.cmb_kinesis, 0, 0); grid.addWidget(b_kin, 0, 1)
+
+        # Zaber: optional serial port (blank = auto-scan the machine's ports).
+        self.edit_zaber_port = QLineEdit()
+        self.edit_zaber_port.setPlaceholderText("COM (auto)")
+        b_zab = QPushButton("Connect Zaber"); b_zab.setObjectName("accent")
+        b_zab.clicked.connect(lambda: self._do(self._connect_zaber))
+        grid.addWidget(self.edit_zaber_port, 1, 0); grid.addWidget(b_zab, 1, 1)
+
+        # Piezo Jena: optional serial port (blank = auto-scan), like Zaber.
+        self.edit_piezo_port = QLineEdit()
+        self.edit_piezo_port.setPlaceholderText("COM (auto)")
+        b_pj = QPushButton("Connect Piezo Jena"); b_pj.setObjectName("accent")
+        b_pj.clicked.connect(lambda: self._do(self._connect_piezo))
+        grid.addWidget(self.edit_piezo_port, 2, 0); grid.addWidget(b_pj, 2, 1)
+        lay.addLayout(grid)
+
+        lay.addWidget(_hline())
+
+        # Backlash approach margin. Every move undershoots by this much when it
+        # would otherwise arrive from above, so the zero you mark by jogging and
+        # the positions a scan sweeps through sit in the same frame. It lives
+        # here because it is a property OF THE CONNECTED STAGE — the connect
+        # buttons above seed it, and _sync_backlash_ui pushes the new stage's
+        # default into this box on every swap.
+        brow = QGridLayout(); brow.setSpacing(6)
+        brow.setColumnStretch(1, 1)
+        brow.addWidget(QLabel("Backlash"), 0, 0)
+        self.spin_backlash = DoubleSpinBox()
+        self.spin_backlash.setRange(0.0, 1000.0); self.spin_backlash.setDecimals(1)
+        self.spin_backlash.setSingleStep(10.0); self.spin_backlash.setSuffix(" um")
+        self.spin_backlash.setToolTip(
+            "Approach margin. Lead-screw stages land in a different place "
+            "depending on which way they arrived; undershooting by more than "
+            "the slack and coming back up makes every move repeatable.\n\n"
+            "0 disables it — correct for a Thorlabs controller (its firmware "
+            "already does this) or a piezo, wrong for a Zaber.")
+        self.spin_backlash.valueChanged.connect(self.main._on_backlash_changed)
+        brow.addWidget(self.spin_backlash, 0, 1)
+        lay.addLayout(brow)
+        self.lbl_backlash_fs = QLabel("—"); self.lbl_backlash_fs.setObjectName("dim")
+        self.lbl_backlash_fs.setWordWrap(True)
+        lay.addWidget(self.lbl_backlash_fs)
+
+        lay.addWidget(self.lbl_msg)
+        frow = QHBoxLayout(); frow.setSpacing(6)
+        self.btn_disconnect = QPushButton("Disconnect")
+        self.btn_disconnect.setObjectName("danger")
+        self.btn_disconnect.clicked.connect(
+            lambda: self._do(self.main._disconnect_stage))
+        btn_close = QPushButton("Close"); btn_close.clicked.connect(self.hide)
+        frow.addWidget(self.btn_disconnect); frow.addWidget(btn_close)
+        lay.addLayout(frow)
+
+        self._devices = []      # last Kinesis enumeration: [(model, conn), ...]
+
+    def open_fresh(self):
+        """Scanned AFTER the base clears the status line, so what the scan
+        found is what the window opens showing."""
+        super().open_fresh()
+        self._rescan()
+
+    def _rescan(self):
+        self._do(self._scan)
+
+    def _scan(self):
+        """Enumerate the Kinesis controllers. (ok, msg), for _do.
+
+        Each controller is briefly opened to read its model number, so this is
+        a real device query, not a list of ports — hence a button rather than
+        something done continuously.
+        """
+        try:
+            self._devices = list(list_kinesis_stages())
+        except Exception as e:
+            self._devices = []
+            self._fill_kinesis_combo()
+            return False, f"Kinesis scan failed: {e}"
+        self._fill_kinesis_combo()
+        n = len(self._devices)
+        return bool(n), (
+            f"{n} Kinesis controller{'' if n == 1 else 's'} found." if n else
+            "No Kinesis controllers found. Zaber and Piezo Jena stages cannot "
+            "be enumerated — use their own Connect buttons, which scan the "
+            "serial ports themselves.")
+
+    def _fill_kinesis_combo(self):
+        with QSignalBlocker(self.cmb_kinesis):
+            self.cmb_kinesis.clear()
+            for model, conn in self._devices:
+                self.cmb_kinesis.addItem(f"{model} [{conn}]", conn)
+            if not self._devices:
+                self.cmb_kinesis.addItem("(none found)", None)
+        self.cmb_kinesis.setEnabled(bool(self._devices))
+
+    def _connect_kinesis(self):
+        conn = self.cmb_kinesis.currentData()
+        if conn is None:
+            self._do(lambda: (False, "No Kinesis controller selected — press "
+                                     "Rescan."))
+            return
+        self._do(lambda: self.main._connect_real_stage(conn))
+
+    def _connect_zaber(self):
+        port = self.edit_zaber_port.text().strip() or None
+        return self.main._connect_zaber_stage(port)
+
+    def _connect_piezo(self):
+        port = self.edit_piezo_port.text().strip() or None
+        return self.main._connect_piezo_jena_stage(port)
+
+    def _refresh(self):
+        stage = self.main.stage
+        self.lbl_stage.setText(stage.name if stage is not None
+                               else "Not connected.")
+        self.btn_disconnect.setEnabled(stage is not None)
+        self.spin_backlash.setEnabled(stage is not None)
+
+
+class SimulationDialog(_ConnectDialog):
+    """Run the app against simulated hardware, on purpose.
+
+    Simulation used to be the startup default, which meant a fake spectrum
+    could be mistaken for a measurement. It is now only ever reached from here,
+    and the choices are the same ones the Hardware dialog used to make
+    silently: which beam the simulator is measuring, and whether to stand in
+    for the spectrometer, the stage, or a stitched pair.
+    """
+    def __init__(self, main, parent=None):
+        super().__init__(main, parent, "Simulation", width=380)
+        lay = QVBoxLayout(self); lay.setSpacing(8)
+        lay.setContentsMargins(14, 14, 14, 14)
+
+        # ── Simulated beam ───────────────────────────────────────────────────
+        # Which pulse the simulated spectrometer is measuring. Changing either
+        # box re-makes the simulator on the spot (its wavelength window is
+        # derived from the beam, so it cannot just be mutated in place).
+        lay.addWidget(self._header("Simulated beam"))
+        brow = QGridLayout(); brow.setSpacing(6)
+        brow.setColumnStretch(0, 1); brow.setColumnStretch(1, 0)
+        self.cmb_pulse = ComboBox()
+        for key, shape in PULSE_SHAPES.items():
+            self.cmb_pulse.addItem(shape["label"], key)
+        self.cmb_pulse.setCurrentIndex(
+            max(0, self.cmb_pulse.findData(self.main.sim_pulse)))
+        self.cmb_pulse.currentIndexChanged.connect(self._on_beam)
+        self.cmb_gate = ComboBox()
+        self.cmb_gate.addItem("SHG", "shg")
+        self.cmb_gate.addItem("PG", "pg")
+        self.cmb_gate.setCurrentIndex(
+            max(0, self.cmb_gate.findData(self.main.sim_gate)))
+        self.cmb_gate.currentIndexChanged.connect(self._on_beam)
+        brow.addWidget(self.cmb_pulse, 0, 0); brow.addWidget(self.cmb_gate, 0, 1)
+        lay.addLayout(brow)
+        self.lbl_beam = QLabel(); self.lbl_beam.setObjectName("dim")
+        self.lbl_beam.setWordWrap(True)
+        lay.addWidget(self.lbl_beam)
+
+        lay.addWidget(_hline())
+
+        lay.addWidget(self._header("Stand in for"))
+        grid = QGridLayout(); grid.setSpacing(6)
+        grid.setColumnStretch(0, 1); grid.setColumnStretch(1, 1)
+        b_spec = QPushButton("Spectrometer"); b_spec.setObjectName("accent")
+        b_spec.setToolTip("One simulated spectrometer covering the whole "
+                          "simulated signal band")
+        b_spec.clicked.connect(lambda: self._do(self.main._use_sim_spectrometer))
+        b_stage = QPushButton("Stage"); b_stage.setObjectName("accent")
+        b_stage.setToolTip("A 300 mm simulated delay stage")
+        b_stage.clicked.connect(lambda: self._do(self.main._use_sim_stage))
+        grid.addWidget(b_spec, 0, 0); grid.addWidget(b_stage, 0, 1)
+        b_pair = QPushButton("Stitched pair"); b_pair.setObjectName("accent")
+        b_pair.setToolTip(
+            "Two simulated spectrometers covering overlapping halves of the "
+            "band, connected as one stitched device — the only way to "
+            "exercise multi-spectrometer mode without two on the bench")
+        b_pair.clicked.connect(lambda: self._do(self.main._use_sim_pair))
+        grid.addWidget(b_pair, 1, 0, 1, 2)
+        lay.addLayout(grid)
+
+        lay.addWidget(self.lbl_msg)
+        btn_close = QPushButton("Close"); btn_close.clicked.connect(self.hide)
+        lay.addWidget(btn_close)
 
     def _on_beam(self):
         self.main.sim_pulse = self.cmb_pulse.currentData()
         self.main.sim_gate  = self.cmb_gate.currentData()
-        if isinstance(self.main.spec, SimulatedSpectrometer):
+        spec = self.main.spec
+        if isinstance(spec, SimulatedSpectrometer):
             self._do(self.main._use_sim_spectrometer)
+        elif (isinstance(spec, StitchedSpectrometer)
+              and all(isinstance(m, SimulatedSpectrometer)
+                      for m in spec.members)):
+            self._do(self.main._use_sim_pair)
         else:
-            # A real spectrometer is connected — remember the choice for the
-            # next time "Simulated" is pressed rather than swapping it out.
+            # Real hardware (or nothing) is connected — remember the choice for
+            # the next time a simulator is asked for, rather than swapping the
+            # device out from under the operator.
             self._refresh()
-            self.lbl_msg.setText("Beam saved — press Simulated to use it.")
-
-    def _header(self, text):
-        l = QLabel(text)
-        l.setObjectName("hdr")
-        return l
-
-    def _do(self, fn):
-        ok, msg = fn()
-        # Color via objectName + repolish (not setStyleSheet) so a later theme
-        # switch restyles the label along with everything else.
-        self.lbl_msg.setObjectName("ok" if ok else "err")
-        self.lbl_msg.style().unpolish(self.lbl_msg)
-        self.lbl_msg.style().polish(self.lbl_msg)
-        self.lbl_msg.setText(msg)
-        self._refresh()
-
-    def toggle(self):
-        if self.isVisible():
-            self.hide()
-        else:
-            self._refresh(); self.lbl_msg.setText(""); self.show(); self.raise_()
+            self.lbl_msg.setText("Beam saved — press Spectrometer to use it.")
 
     def _refresh(self):
-        self.lbl_stage.setText(self.main.stage.name)
-        self.lbl_spec.setText(self.main.spec.name)
-        reported = getattr(self.main.spec, "max_counts", None)
-        self.edit_full_scale.setPlaceholderText(
-            f"auto — device reports {reported:.0f}" if reported
-            else "device reports none — saturation unchecked")
         desc = PULSE_SHAPES[self.main.sim_pulse]["desc"]
         spec = self.main.spec
         if isinstance(spec, SimulatedSpectrometer):
@@ -1624,7 +2048,7 @@ class AvantesSettingsDialog(QDialog):
     def _on_hires(self, on):
         """ADC resolution moves full scale (16383 <-> 65535), so the saturation
         alarm has to be re-armed against the new ceiling — the same pairing
-        HardwareDialog._on_full_scale does. Without it the lamp and the scan's
+        SpectrometerDialog._on_full_scale does. Without it the lamp and the scan's
         clip test keep judging against the old one."""
         if self._loading:
             return
@@ -1635,8 +2059,8 @@ class AvantesSettingsDialog(QDialog):
 
         self._write("ADC resolution", apply, refresh=False, voids_dark=True)
         self.main._reset_saturation()
-        if self.main.dlg_hardware.isVisible():
-            self.main.dlg_hardware._refresh()   # its full-scale placeholder moved
+        if self.main.dlg_spec.isVisible():
+            self.main.dlg_spec._refresh()   # its full-scale placeholder moved
         if result.get("on") is False and on:
             self._do(False, "This device has no 16-bit ADC — staying at 14-bit.")
         self._refresh()
@@ -1827,6 +2251,100 @@ class DevicePickerDialog(QDialog):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# "Nothing connected" plot overlay
+# ─────────────────────────────────────────────────────────────────────────────
+class NoDeviceOverlay(QWidget):
+    """Covers an empty plot panel with a message and a Connect button.
+
+    Sized to the whole panel and painted in the plot's own background colour,
+    so it reads as an empty plot carrying a note rather than a card dropped on
+    top of one — the axes frame and labels still show around it.
+
+    The plug is painted as a WATERMARK rather than stacked in the layout: a
+    third row would push the message and button off the panel's centre, and the
+    mark is meant to be read as background, not as content. It is drawn from
+    the icon's alpha channel and tinted from the live PALETTE, so one file
+    serves both themes and a theme switch needs no new asset — the same trick
+    _glyph_icon uses for the feed button.
+    """
+    ICON_FRAC  = 0.45     # of the panel's shorter side
+    ICON_ALPHA = 0.14     # faint enough to read the message over
+
+    def __init__(self, canvas, message, button_text, on_click):
+        super().__init__(canvas)
+        self._src = (QPixmap(str(DISCONNECTED_ICON))
+                     if DISCONNECTED_ICON.exists() else QPixmap())
+        self._cache = None          # (side, tint) -> tinted pixmap
+        lay = QVBoxLayout(self)
+        lay.setSpacing(14)
+        lay.setContentsMargins(16, 16, 16, 16)
+        lay.addStretch()
+        self.lbl = QLabel(message)
+        self.lbl.setObjectName("nodev")
+        self.lbl.setAlignment(Qt.AlignCenter)
+        self.lbl.setWordWrap(True)
+        lay.addWidget(self.lbl)
+        self.btn = QPushButton(button_text)
+        self.btn.setObjectName("accent")
+        self.btn.clicked.connect(on_click)
+        lay.addWidget(self.btn, 0, Qt.AlignCenter)
+        lay.addStretch()
+
+    def _watermark(self, side):
+        """The plug scaled to `side` px and tinted for the current theme."""
+        tint = PALETTE["text_dim"]
+        if self._cache is not None and self._cache[0] == (side, tint):
+            return self._cache[1]
+        scaled = self._src.scaled(side, side, Qt.KeepAspectRatio,
+                                  Qt.SmoothTransformation)
+        out = QPixmap(scaled.size())
+        out.fill(Qt.transparent)
+        p = QPainter(out)
+        p.drawPixmap(0, 0, scaled)
+        # SourceIn keeps the destination's alpha and replaces its colour, so
+        # this repaints the glyph in the palette colour and leaves the
+        # transparent surround alone.
+        p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        p.fillRect(out.rect(), QColor(tint))
+        p.end()
+        self._cache = ((side, tint), out)
+        return out
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        # The plot's own background, not the window's: blending in is the point.
+        p.fillRect(self.rect(), QColor(PALETTE["plot_bg"]))
+        # Redraw the axes frame this widget is standing on. Covering the panel
+        # rect exactly still eats the spine whenever the screen's device pixel
+        # ratio is above 1: matplotlib centres the spine ON the axes boundary,
+        # so half its width falls on physical rows INSIDE the logical rect and
+        # the border came out thinned at the sides and missing along the
+        # bottom. Drawing it here in the same colour puts a continuous frame
+        # back, at any ratio, without insetting the overlay (which would leave
+        # grid stubs poking out around the edges).
+        pen = QPen(QColor(PALETTE["border"]))
+        pen.setWidth(1)
+        p.setPen(pen)
+        # adjusted: a 1px pen straddles the path, so an un-inset rect would
+        # draw half of each edge outside the widget and get clipped away.
+        p.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        if self._src.isNull():
+            return
+        side = int(min(self.width(), self.height()) * self.ICON_FRAC)
+        if side < 16:
+            return          # a panel this small has no room for a watermark
+        pm = self._watermark(side)
+        p.setOpacity(self.ICON_ALPHA)
+        p.drawPixmap((self.width() - pm.width()) // 2,
+                     (self.height() - pm.height()) // 2, pm)
+
+    def refresh_theme(self):
+        """Repaint against the new PALETTE — the tint is baked into the cache."""
+        self._cache = None
+        self.update()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Graphics settings dialog
 # ─────────────────────────────────────────────────────────────────────────────
 class GraphicsSettingsDialog(QDialog):
@@ -1849,6 +2367,7 @@ class GraphicsSettingsDialog(QDialog):
         # ── Spectrum Y-axis ──────────────────────────────────────────────────
         lay.addWidget(self._hdr("Spectrum Y-axis"))
         self.chk_auto_y = QCheckBox("Auto-scale Y (follows live data)")
+        self.chk_auto_y.setToolTip(RIGHT_CLICK_HINT)
         self.chk_auto_y.setChecked(canvas.autoscale_y)
         self.chk_auto_y.toggled.connect(self._on_autoscale_y)
         lay.addWidget(self.chk_auto_y)
@@ -1879,6 +2398,7 @@ class GraphicsSettingsDialog(QDialog):
         # ── Spectrum X-axis ──────────────────────────────────────────────────
         lay.addWidget(self._hdr("Spectrum X-axis"))
         self.chk_auto_x = QCheckBox("Auto-scale X (follows spectrometer range)")
+        self.chk_auto_x.setToolTip(RIGHT_CLICK_HINT)
         self.chk_auto_x.setChecked(canvas.autoscale_x)
         self.chk_auto_x.toggled.connect(self._on_autoscale_x)
         lay.addWidget(self.chk_auto_x)
@@ -1907,6 +2427,7 @@ class GraphicsSettingsDialog(QDialog):
         # ── FROG trace axes ──────────────────────────────────────────────────
         lay.addWidget(self._hdr("FROG Trace Axes"))
         self.chk_auto_trace = QCheckBox("Auto-scale to scan range")
+        self.chk_auto_trace.setToolTip(RIGHT_CLICK_HINT)
         self.chk_auto_trace.setChecked(canvas.autoscale_trace)
         self.chk_auto_trace.toggled.connect(self._on_autoscale_trace)
         lay.addWidget(self.chk_auto_trace)
@@ -2590,6 +3111,22 @@ class FrogCanvas(FigureCanvasQTAgg):
         w, h = float(self.width()), float(self.height())
         return pos.x0 * w, (1.0 - pos.y1) * h, pos.x1 * w
 
+    def panel_rect_px(self, ax):
+        """`ax` as a QRect in canvas widget pixels — what an overlay widget
+        covering that whole panel is resized to. Same fractions, same y flip,
+        and the same "works before the first draw" property as panel_edges_px.
+
+        All four EDGES are rounded and the size derived from them, rather than
+        the offset and the size rounded separately: round(top) + round(height)
+        need not equal round(bottom), so the latter can put the right and
+        bottom edges a pixel off the axes they are supposed to trace.
+        """
+        pos = ax.get_position()
+        w, h = float(self.width()), float(self.height())
+        left, right = round(pos.x0 * w), round(pos.x1 * w)
+        top, bottom = round((1.0 - pos.y1) * h), round((1.0 - pos.y0) * h)
+        return QRect(left, top, right - left, bottom - top)
+
     def _position_split_handle(self, renderer=None):
         """Put the separator over the band the split governs, in the clear strip
         between the two panels. Figure fractions have their origin at the bottom
@@ -2848,7 +3385,7 @@ class FrogCanvas(FigureCanvasQTAgg):
             if self._drag_ax is not None:      # right-click aborts a drag
                 self._cancel_drag()
             elif event.inaxes in axes:
-                self.reset_axes(event.inaxes)
+                self.reset_axes(event.inaxes)  # …otherwise toggles auto-scale
             return
         if event.button != 1:
             return
@@ -2921,37 +3458,72 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.limits_changed.emit()
 
     def reset_axes(self, ax):
-        """Right-click: restore the full data range and resume autoscaling."""
+        """Right-click: TOGGLE this panel's auto-scale.
+
+        Off -> on fits the full data range and then follows it live. On -> off
+        freezes the view exactly where it is, so a right-click is also how you
+        stop the axes moving under you without opening Graphics Settings. It
+        used to only ever switch autoscale on, which left the mouse with no way
+        back off it.
+
+        Freezing writes the current limits into the caches: they are what the
+        Graphics Settings spinboxes and the blit paths read, and a stale cache
+        would snap the view back on the next frame.
+        """
         if ax is self.ax_spec:
-            self.fit_xy()                      # fits, but freezes autoscale…
-            self.autoscale_x = True            # …so re-enable live follow
-            self.autoscale_y = True
+            self._set_spec_autoscale(not (self.autoscale_x or self.autoscale_y))
         elif ax is self.ax_trace:
-            self.autoscale_trace = True        # resume following the scan range
+            self._set_trace_autoscale(not self.autoscale_trace)
+        elif ax is self.ax_ac:
+            on = not (self.autoscale_ac_x or self.autoscale_ac_y)
+            self._set_ac_autoscale(on)
+            if self._layout_mode == "horizontal":
+                # Shared delay axis: the trace owns it, so it has to go the
+                # SAME way rather than toggle off its own flag. (_sync_ac_x in
+                # there then pulls the AC's x back onto the scan range.)
+                self._set_trace_autoscale(on)
+        self.draw_idle()
+        self.limits_changed.emit()
+
+    def _set_spec_autoscale(self, on):
+        """Spectrum panel auto-scale, both axes together. On fits first."""
+        if not on:
+            self.autoscale_x = False           # freeze wherever it sits now
+            self.autoscale_y = False
+            self._xlim_cache = self.ax_spec.get_xlim()
+            self._ylim_cache = self.ax_spec.get_ylim()
+            return
+        self.fit_xy()                          # fits, but freezes autoscale…
+        self.autoscale_x = True                # …so re-enable live follow
+        self.autoscale_y = True
+
+    def _set_trace_autoscale(self, on):
+        """FROG-trace auto-scale. On restores the scan's full extent."""
+        self.autoscale_trace = bool(on)
+        if on:
             x0, x1, y0, y1 = self.im.get_extent()
             self.ax_trace.set_xlim(x0, x1)
             self.ax_trace.set_ylim(y0, y1)
-            self._trace_xlim_cache = self.ax_trace.get_xlim()
-            self._trace_ylim_cache = self.ax_trace.get_ylim()
-            self._sync_ac_x()
-        elif ax is self.ax_ac:
-            self.autoscale_ac_x = True
-            self.autoscale_ac_y = True
-            # The curve is normalized, so y has one canonical view to go back to.
-            self.ax_ac.set_ylim(*_AC_YLIM)
-            self._ac_ylim_cache = _AC_YLIM
-            if len(self.line_ac.get_xdata()) > 1:
-                self.ax_ac.set_autoscalex_on(True)
-                self.ax_ac.relim()
-                self.ax_ac.autoscale_view(scaley=False)
-                self._ac_xlim_cache = self.ax_ac.get_xlim()
-            if self._layout_mode == "horizontal":
-                # Shared delay axis: resetting either plot resets both, via the
-                # trace's own reset (which re-syncs the AC to the scan range).
-                self.reset_axes(self.ax_trace)
-                return
-        self.draw_idle()
-        self.limits_changed.emit()
+        self._trace_xlim_cache = self.ax_trace.get_xlim()
+        self._trace_ylim_cache = self.ax_trace.get_ylim()
+        self._sync_ac_x()
+
+    def _set_ac_autoscale(self, on):
+        """Autocorrelation auto-scale, both axes together."""
+        self.autoscale_ac_x = bool(on)
+        self.autoscale_ac_y = bool(on)
+        if not on:
+            self._ac_xlim_cache = self.ax_ac.get_xlim()
+            self._ac_ylim_cache = self.ax_ac.get_ylim()
+            return
+        # The curve is normalized, so y has one canonical view to go back to.
+        self.ax_ac.set_ylim(*_AC_YLIM)
+        self._ac_ylim_cache = _AC_YLIM
+        if len(self.line_ac.get_xdata()) > 1:
+            self.ax_ac.set_autoscalex_on(True)
+            self.ax_ac.relim()
+            self.ax_ac.autoscale_view(scaley=False)
+            self._ac_xlim_cache = self.ax_ac.get_xlim()
 
     def fit_y(self):
         """One-shot Y auto-fit; returns new (ymin, ymax)."""
@@ -3096,6 +3668,20 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_m1.set_data([], [])
         self.line_m2.set_data([], [])
         self.set_overlap_band(None, None)
+
+    def clear_spectrum(self):
+        """Empty the spectrum panel entirely — no device is connected.
+
+        Data cleared, not just hidden, for the reason in _set_spec_mode: a line
+        still holding a frame keeps driving relim(), so the axes would go on
+        describing a spectrometer that is no longer there. A full redraw, not a
+        blit: the "no spectrometer" overlay sits on top of this, and a stale
+        blit background underneath it would show the old curve again the moment
+        anything else animated.
+        """
+        self.clear_members()
+        self.line_spec.set_data([], [])
+        self._request_full()
 
     def show_diff(self, wl, d1, d2):
         """Overlay the two alignment symmetry differences on the spectrum.
@@ -3422,13 +4008,18 @@ class FrogWindow(QMainWindow):
         self.result        = None
         self._worker       = None
         self._export_worker = None
-        # Multi-spectrometer mode: two slots, each holding a device choice and
-        # a calibration choice; _multi_members are the live spectrometer
-        # objects in SLOT order once the stitched pair is connected.
+        # The two spectrometer slots, each holding a device choice and a
+        # calibration choice; _multi_members are the live spectrometer objects
+        # in SLOT order once a stitched pair is connected.
         # "serials" holds tagged ids ("vendor:serial", see hardware.spec_ident)
         # or one of the SIM_SLOT_DEVICES sentinels — the two slots may hold
         # devices from different vendors.
-        self._multi = {"on": False, "serials": [None, None],
+        #
+        # There is no "multi-spectrometer mode" flag: both slots exist from the
+        # start, slot 1 alone IS single-spectrometer mode, and "is a pair live"
+        # is answered by _pair_live() off the connected device rather than by a
+        # second piece of state that could disagree with it.
+        self._multi = {"serials": [None, None],
                        "labels": [None, None], "cals": [None, None]}
         self._multi_members = [None, None]
         self._scan_trace   = None
@@ -3467,11 +4058,21 @@ class FrogWindow(QMainWindow):
         # Insight models that cseabreeze does not know about.
         self.seabreeze_backend = SEABREEZE_BACKENDS[0]
 
-        self._build_hardware_sim()
+        # NOTHING is connected at startup. The app used to open on a simulated
+        # stage and spectrometer, which meant a fake spectrum was on screen
+        # before anyone had chosen anything and looked exactly like a
+        # measurement. Both stay None until the operator connects a device (or
+        # asks for a simulator by name, in the Simulation window), and
+        # _sync_connection_ui puts a "no spectrometer connected" panel up in
+        # the meantime.
+        self.spec  = None
+        self.stage = None
 
         self.dlg_settings = AcquisitionSettingsDialog(self)
         self.dlg_align    = AlignmentDialog(self)
-        self.dlg_hardware = HardwareDialog(self, self)
+        self.dlg_spec     = SpectrometerDialog(self, self)
+        self.dlg_stage    = StageDialog(self, self)
+        self.dlg_sim      = SimulationDialog(self, self)
         # Vendor-specific controls, opened from a toolbar button that stays
         # hidden until an Avantes is actually connected.
         self.dlg_avantes  = AvantesSettingsDialog(self, self)
@@ -3484,27 +4085,20 @@ class FrogWindow(QMainWindow):
         # and the alignment sweep read exactly what they always did. Both
         # dialogs are built above _build_ui(), which is what needs them.
         self.spin_align_step = self.dlg_align.spin_align_step
-        self.spin_backlash   = self.dlg_hardware.spin_backlash
-        self.lbl_backlash_fs = self.dlg_hardware.lbl_backlash_fs
+        self.spin_backlash   = self.dlg_stage.spin_backlash
+        self.lbl_backlash_fs = self.dlg_stage.lbl_backlash_fs
         # The threshold is applied live, not just at scan start, so the lamp
         # reflects the setting you are in the middle of tuning.
         self.dlg_settings.spin_sat.valueChanged.connect(self._on_sat_fraction)
 
         self._build_ui()
 
-        # The device default (100 ms) and the spinbox default differ; push the
-        # spinbox value so the display matches reality. Safe without the
-        # device lock — the feed thread doesn't exist yet.
-        self.spec.set_integration_time(self.spin_integration.value())
-
-        self.stage.move_to(_um_to_stage(self.scan_cfg.zero_pos_um))
-        self._refresh_positions()
-
-        # Wired up AFTER the parking move above: that one is a long move on the
-        # simulated stage and would open the app on a "split into N steps"
-        # message about a move the operator never asked for.
+        # No parking move and no integration push here any more: there is no
+        # device to make them to. Both happen on connect instead —
+        # _apply_spectrometer clamps the exposure into the new device's range,
+        # and _apply_stage parks or adopts the position.
         self.stage_warning.connect(self._on_stage_warning)
-        self._attach_stage_warnings(self.stage)
+        self._sync_connection_ui()
 
         # FIX 2/3 — acquisition runs on a worker thread, paced to integration.
         self._feed = LiveFeedWorker(lambda: self.spec)
@@ -3541,6 +4135,22 @@ class FrogWindow(QMainWindow):
             self._perf_timer.setInterval(10_000)
             self._perf_timer.timeout.connect(_perf.report)
             self._perf_timer.start()
+
+    # ── Connection state ─────────────────────────────────────────────────────
+    # self.spec and self.stage are None when nothing is connected — a real
+    # absence rather than a stand-in device, so nothing can quietly return
+    # plausible-looking counts or positions for hardware that is not there.
+    # Everything that reaches a device goes through one of these three.
+    def _have_spec(self):
+        return self.spec is not None
+
+    def _have_stage(self):
+        return self.stage is not None
+
+    def _pair_live(self):
+        """True while two spectrometers are connected as one stitched device.
+        This is the ONLY definition of multi-spectrometer mode."""
+        return isinstance(self.spec, StitchedSpectrometer)
 
     # ── Shared-device access ─────────────────────────────────────────────────
     def _scan_running(self):
@@ -3624,10 +4234,6 @@ class FrogWindow(QMainWindow):
                 return self._make_sim_member(half)
         return open_spectrometer(ident, self.seabreeze_backend)
 
-    def _build_hardware_sim(self):
-        self.stage = SimulatedStage(travel_mm=300.0)
-        self.spec  = self._make_sim_spectrometer()
-
     def _attach_stage_warnings(self, stage):
         """Route a stage's warnings into the status bar. Safe from any thread —
         emit() is what crosses back to the GUI one."""
@@ -3639,6 +4245,9 @@ class FrogWindow(QMainWindow):
     def _apply_stage(self, new_stage):
         """Swap in a new stage. Returns (ok, error) — on failure NOTHING has
         changed and `new_stage` is still the caller's to dispose of.
+
+        `new_stage` may be None: that is the disconnect path, and it takes the
+        same lock and the same teardown as any other swap.
 
         Refused outright while a scan is running: FrogScanWorker captured the
         old stage at construction, so disconnecting it here would pull the
@@ -3658,13 +4267,16 @@ class FrogWindow(QMainWindow):
                 except Exception:
                     pass
             self.stage = new_stage
-            self._attach_stage_warnings(new_stage)
+            if new_stage is not None:
+                self._attach_stage_warnings(new_stage)
             # A simulated spectrometer reads the live stage, so re-point it.
+            # None is allowed: SimulatedSpectrometer.acquire falls back to zero
+            # delay, so the simulator keeps working with no stage attached.
             if isinstance(self.spec, SimulatedSpectrometer):
                 self.spec.stage = self.stage
             if isinstance(new_stage, SimulatedStage):
                 new_stage.move_to(_um_to_stage(self.scan_cfg.zero_pos_um))
-            else:
+            elif new_stage is not None:
                 # Real stage: adopt its ACTUAL position as zero-delay so
                 # "Move to 0 fs" can never slam it into a travel limit.
                 # Except when the axis has no reference — that readback is an
@@ -3676,10 +4288,12 @@ class FrogWindow(QMainWindow):
             self._refresh_positions()   # inside the lock — we still own the stage
         self._sync_backlash_ui()        # the new stage brings its own default
         self._refresh_scan_um()         # zero may have moved: fs→um previews
+        self._sync_connection_ui()      # panel swaps between controls/Connect
         return True, ""
 
     def _apply_spectrometer(self, new_spec):
-        """Swap in a new spectrometer. Returns (ok, error); see _apply_stage."""
+        """Swap in a new spectrometer, or None to disconnect. (ok, error);
+        see _apply_stage."""
         if self._scan_running():
             return False, "A scan is running — stop it before changing hardware."
         with self._device_lock() as ok:
@@ -3696,13 +4310,14 @@ class FrogWindow(QMainWindow):
                 # Any single device replaces a stitched pair wholesale — the
                 # slot->member mapping is only meaningful while the pair lives.
                 self._multi_members = [None, None]
-            # Clamped to the INCOMING device's range: the box still carries the
-            # outgoing device's value, and 0.05 ms from an Avantes is a hard
-            # error on an Ocean unit with a 1 ms floor. _sync_multi_ui below
-            # reseeds the box from whatever the new device ended up with.
-            lo, hi = _exposure_bounds(new_spec)
-            self.spec.set_integration_time(
-                min(hi, max(lo, float(self.spin_integration.value()))))
+            if new_spec is not None:
+                # Clamped to the INCOMING device's range: the box still carries
+                # the outgoing device's value, and 0.05 ms from an Avantes is a
+                # hard error on an Ocean unit with a 1 ms floor. _sync_multi_ui
+                # below reseeds the box from whatever the device ended up with.
+                lo, hi = _exposure_bounds(new_spec)
+                new_spec.set_integration_time(
+                    min(hi, max(lo, float(self.spin_integration.value()))))
             # The old device's frames and dark are meaningless for the new one
             # — and a different pixel count (certain with a stitched grid)
             # would crash the dark subtraction outright.
@@ -3710,7 +4325,12 @@ class FrogWindow(QMainWindow):
             self.background_members = None
             self.background_exposures = None
             self._dark_member_warned = False
-            self.canvas.clear_members()   # a dead pair's curves must not linger
+            if new_spec is None:
+                # Disconnecting: take the curve off the panel too, or the last
+                # frame would sit frozen under the "no spectrometer" message.
+                self.canvas.clear_spectrum()
+            else:
+                self.canvas.clear_members()  # a dead pair's curves can't linger
             # Same for both halves of alignment mode: a difference and a raw
             # trace describe the device that measured them, right down to the
             # pixel grid they sit on.
@@ -3741,21 +4361,32 @@ class FrogWindow(QMainWindow):
         self.status.showMessage("Stage: simulated.", 4000)
         return True, "Stage set to simulated."
 
-    def _connect_real_stage(self):
-        try:
-            devices = list_kinesis_stages()   # brief per-device model query
-        except Exception as e:
-            return False, f"Stage connect failed: {e}"
-        if not devices:
-            return False, "Stage connect failed: No Kinesis devices found."
-        if len(devices) > 1:
-            conn = DevicePickerDialog.pick(
-                self.dlg_hardware, devices, "Select Kinesis Stage",
-                f"{len(devices)} Kinesis devices found — choose one:")
-            if conn is None:
-                return False, "Cancelled — stage unchanged."
-        else:
-            conn = devices[0][1]
+    def _disconnect_stage(self):
+        ok, err = self._apply_stage(None)
+        if not ok:
+            return False, err
+        self.status.showMessage("Stage disconnected.", 4000)
+        return True, "Stage disconnected."
+
+    def _connect_real_stage(self, conn=None):
+        """Connect a Kinesis stage. `conn` names one the caller already chose
+        (the Stage dialog's scan list); without it this enumerates and picks or
+        asks, which is what any other caller needs."""
+        if conn is None:
+            try:
+                devices = list_kinesis_stages()   # brief per-device model query
+            except Exception as e:
+                return False, f"Stage connect failed: {e}"
+            if not devices:
+                return False, "Stage connect failed: No Kinesis devices found."
+            if len(devices) > 1:
+                conn = DevicePickerDialog.pick(
+                    self.dlg_stage, devices, "Select Kinesis Stage",
+                    f"{len(devices)} Kinesis devices found — choose one:")
+                if conn is None:
+                    return False, "Cancelled — stage unchanged."
+            else:
+                conn = devices[0][1]
         try:
             # Identifies the stage and refuses anything it can't calibrate in mm.
             stage = KinesisStage(serial=conn)
@@ -3815,8 +4446,36 @@ class FrogWindow(QMainWindow):
         ok, err = self._apply_spectrometer(self._make_sim_spectrometer())
         if not ok:
             return False, err
+        # The full-band simulator is not reachable by id, so no slot can name
+        # it — empty them rather than leave them pointing at whatever was
+        # connected before.
+        self._multi["serials"] = [None, None]
+        self._multi["labels"]  = [None, None]
         self.status.showMessage(f"Spectrometer: {self.spec.name}.", 4000)
         return True, f"Simulated: {self.spec.pulse_label}."
+
+    def _use_sim_pair(self):
+        """Both slots on simulated halves, connected as a stitched pair.
+
+        The only way to exercise multi-spectrometer mode without two devices on
+        the bench — _open_slot_device matches the SIM_SLOT_DEVICES sentinels to
+        the half-band simulators, so this is the ordinary pair path with the
+        slots filled in for you.
+        """
+        for slot, (ident, label) in enumerate(SIM_SLOT_DEVICES):
+            self._multi["serials"][slot] = ident
+            self._multi["labels"][slot]  = label
+        return self._connect_multi_pair()
+
+    def _disconnect_spectrometer(self):
+        """Release whatever is connected and empty both slots. (ok, msg)."""
+        ok, err = self._apply_spectrometer(None)
+        if not ok:
+            return False, err
+        self._multi["serials"] = [None, None]
+        self._multi["labels"]  = [None, None]
+        self.status.showMessage("Spectrometer disconnected.", 4000)
+        return True, "Spectrometer disconnected."
 
     def _live_seabreeze_backend(self):
         """Backend name of the currently connected seabreeze device, or None
@@ -3829,6 +4488,8 @@ class FrogWindow(QMainWindow):
         calibration_targets() is the existing "physical devices behind the
         facade" accessor — [self] for a single device, both members for a pair.
         """
+        if not self._have_spec():
+            return None
         for spec in self.spec.calibration_targets():
             if isinstance(spec, SeabreezeSpectrometer):
                 return getattr(spec, "backend", None)
@@ -3838,92 +4499,42 @@ class FrogWindow(QMainWindow):
         """Enumerate every vendor's attached spectrometers as tagged ids.
         Selecting a seabreeze backend tears the previous backend's API down,
         which would sever a device still open through it — so any such device
-        is released (swapped for the simulator) first. Raises RuntimeError when
-        that release is refused (scan running / feed busy)."""
+        is released first. Raises RuntimeError when that release is refused
+        (scan running / feed busy)."""
         live = self._live_seabreeze_backend()
         if live is not None and live != self.seabreeze_backend:
-            ok, err = self._apply_spectrometer(self._make_sim_spectrometer())
+            ok, err = self._apply_spectrometer(None)
             if not ok:
                 raise RuntimeError(err)
         return list_spectrometers(self.seabreeze_backend)
 
-    def _connect_real_spectrometer(self):
-        """Connect an Ocean Optics / Ocean Insight device. (ok, msg).
+    def _spectrometer_scan_notes(self):
+        """Why a vendor contributed nothing to the last enumeration.
 
-        Filtered to seabreeze even though the enumeration covers every vendor:
-        this is what the *Real (seabreeze)* button does, and a picker that
-        offered an Avantes under that label — or silently connected one when it
-        was the only device attached — would be lying about which adapter and
-        which backend setting apply. Avantes has its own button.
+        list_spectrometers deliberately swallows a vendor whose SDK is missing,
+        so one absent driver cannot hide the other vendor's devices. That is
+        right for the list and wrong for the operator staring at an empty one,
+        so the same two calls are made again here purely for their errors —
+        this is what the old per-vendor connect buttons used to surface.
         """
+        notes = []
         try:
-            devices = [(m, i) for m, i in self._list_spectrometers()
-                       if i.startswith("seabreeze:")]
+            list_seabreeze_spectrometers(self.seabreeze_backend)
         except Exception as e:
-            return False, f"Spectrometer connect failed: {e}"
-        if not devices:
-            return False, (f"Spectrometer connect failed: No Ocean Optics "
-                           f"spectrometers found (backend: "
-                           f"{self.seabreeze_backend}).")
-        if len(devices) > 1:
-            ident = DevicePickerDialog.pick(
-                self.dlg_hardware, devices, "Select Spectrometer",
-                f"{len(devices)} spectrometers found — choose one:")
-            if ident is None:
-                return False, "Cancelled — spectrometer unchanged."
-        else:
-            ident = devices[0][1]
+            notes.append(f"seabreeze ({self.seabreeze_backend}): {e}")
         try:
-            spec = open_spectrometer(ident, self.seabreeze_backend)
+            list_avantes_spectrometers()
         except Exception as e:
-            return False, f"Spectrometer connect failed: {e}"
-        ok, err = self._apply_spectrometer(spec)
-        if not ok:
-            self._drop(spec)
-            return False, err
-        self.status.showMessage(f"Spectrometer: {spec.name}", 5000)
-        return True, f"Spectrometer connected: {spec.name}"
-
-    def _connect_avantes_spectrometer(self):
-        """Connect an Avantes device. (ok, msg).
-
-        Enumerates through list_avantes_spectrometers rather than the merged
-        list_spectrometers: the operator pressed the *Avantes* button, so a
-        missing DLL or driver must be reported with the message that names what
-        to install, not silently swallowed into "no spectrometers found".
-        """
-        try:
-            devices = list_avantes_spectrometers()
-        except Exception as e:
-            return False, f"Avantes connect failed: {e}"
-        if not devices:
-            return False, ("Avantes connect failed: No Avantes spectrometers "
-                           "found. Check the USB cable and that the AvaSpec "
-                           "USB driver is installed.")
-        if len(devices) > 1:
-            serial = DevicePickerDialog.pick(
-                self.dlg_hardware, devices, "Select Avantes Spectrometer",
-                f"{len(devices)} Avantes spectrometers found — choose one:")
-            if serial is None:
-                return False, "Cancelled — spectrometer unchanged."
-        else:
-            serial = devices[0][1]
-        try:
-            spec = AvantesSpectrometer(serial=serial or None)
-        except Exception as e:
-            return False, f"Avantes connect failed: {e}"
-        ok, err = self._apply_spectrometer(spec)
-        if not ok:
-            self._drop(spec)
-            return False, err
-        self.status.showMessage(f"Spectrometer: {spec.name}", 5000)
-        return True, f"Avantes connected: {spec.name}"
+            notes.append(f"Avantes: {e}")
+        return notes
 
     def _avantes_devices(self):
         """Every live Avantes device — [], [one], or both members of a mixed
         stitched pair. calibration_targets() is the existing accessor for
         "the physical devices behind whatever facade is connected", so this
         keeps working for any future composite."""
+        if not self._have_spec():
+            return []
         return [s for s in self.spec.calibration_targets()
                 if isinstance(s, AvantesSpectrometer)]
 
@@ -3942,9 +4553,30 @@ class FrogWindow(QMainWindow):
         b_set = QPushButton("Acquisition Settings")
         b_set.clicked.connect(self.dlg_settings.toggle)
         tb.addWidget(b_set)
-        self.btn_hw = QPushButton("Hardware")
-        self.btn_hw.clicked.connect(self.dlg_hardware.toggle)
-        tb.addWidget(self.btn_hw)
+        # One button per device, replacing the old combined Hardware button.
+        # They are the same dialogs the panel Connect buttons open — this row is
+        # the way back to them once something IS connected and the panels have
+        # swapped over to their controls.
+        self.btn_spec_dlg = QPushButton("Spectrometer")
+        self.btn_spec_dlg.setToolTip(
+            "Connect one or two spectrometers, assign calibrations, and manage "
+            "the stitch between a pair")
+        self.btn_spec_dlg.clicked.connect(self.dlg_spec.toggle)
+        tb.addWidget(self.btn_spec_dlg)
+        self.btn_stage_dlg = QPushButton("Stage")
+        self.btn_stage_dlg.setToolTip("Connect a delay stage and set its "
+                                      "backlash approach margin")
+        self.btn_stage_dlg.clicked.connect(self.dlg_stage.toggle)
+        tb.addWidget(self.btn_stage_dlg)
+        # Its own button, deliberately apart from the two above: simulated
+        # hardware is no longer a default anything, and nothing that reads as a
+        # hardware control should be able to hand back synthetic data.
+        self.btn_sim_dlg = QPushButton("Simulation")
+        self.btn_sim_dlg.setToolTip(
+            "Run against simulated hardware — a synthetic beam, spectrometer, "
+            "stage or stitched pair, with no instrument attached")
+        self.btn_sim_dlg.clicked.connect(self.dlg_sim.toggle)
+        tb.addWidget(self.btn_sim_dlg)
         b_gfx = QPushButton("Graphics Settings")
         b_gfx.clicked.connect(lambda: self.dlg_graphics.toggle())
         tb.addWidget(b_gfx)
@@ -3955,7 +4587,6 @@ class FrogWindow(QMainWindow):
         tb.addWidget(b_align)
         tb.addWidget(self._build_export_button())
         tb.addWidget(self._build_calibration_button())
-        tb.addWidget(self._build_multispec_button())
         # Vendor-specific, so it is HIDDEN rather than disabled when there is
         # no Avantes attached — the toolbar already carries six buttons, and a
         # permanently greyed one is noise on a bench that has none. Visibility
@@ -4019,9 +4650,26 @@ class FrogWindow(QMainWindow):
         else:
             self.btn_autofit.setText("↔↕")
         self.btn_autofit.setFixedSize(HDR_BTN, HDR_BTN)
-        self.btn_autofit.setToolTip("Auto-fit spectrum X and Y axes to current data")
+        self.btn_autofit.setToolTip(
+            "Auto-fit spectrum X and Y axes to current data.\n"
+            + RIGHT_CLICK_HINT)
         self.btn_autofit.show()
         self.btn_autofit.clicked.connect(self._autofit_spectrum)
+
+        # Auto-stitch, in the spectrum header rather than only in the
+        # Spectrometer window: it is fitted against what is on the panel right
+        # now (it needs light across the overlap), so it belongs next to the
+        # curve you are judging it by. Pair-only, like the overlay toggle —
+        # _refresh_autostitch_button owns its visibility, and its icon comes
+        # from _refresh_autostitch_icon (per-theme, like the alignment mark).
+        self.btn_autostitch = QPushButton(self.canvas)
+        self.btn_autostitch.setObjectName("overlay")
+        self.btn_autostitch.setFixedSize(HDR_BTN, HDR_BTN)
+        self.btn_autostitch.setIconSize(QSize(HDR_ICON, HDR_ICON))
+        self._refresh_autostitch_icon()
+        self.btn_autostitch.hide()
+        self.btn_autostitch.clicked.connect(
+            lambda: self._menu_result(self._fit_stitch_factor))
 
         # Live-feed start/stop. In the spectrum header rather than the side
         # panel: it is the control most often reached for while watching that
@@ -4070,6 +4718,18 @@ class FrogWindow(QMainWindow):
         self.btn_align_trace.setFixedSize(40, HDR_BTN)
         self.btn_align_trace.hide()
         self.btn_align_trace.toggled.connect(self._on_align_trace_toggled)
+
+        # ── "No spectrometer connected" ──────────────────────────────────────
+        # A Qt child of the canvas, not a matplotlib artist: the canvas blits,
+        # so a text artist would have to force a full redraw on every show and
+        # hide, and this one has to carry a clickable button anyway. Stretched
+        # over the whole spectrum panel by _position_panel_buttons, which
+        # already runs on every relayout, resize and layout-mode change.
+        self.pnl_no_spec = NoDeviceOverlay(
+            self.canvas, "No spectrometer connected", "Connect Spectrometer",
+            self.dlg_spec.open_fresh)
+        self.pnl_no_spec.hide()
+
         self.canvas.axes_relaid.connect(self._position_panel_buttons)
         self._position_panel_buttons()
 
@@ -4097,7 +4757,9 @@ class FrogWindow(QMainWindow):
         self.status.addPermanentWidget(self.lamp2)
         self.lbl_sat2.hide(); self.lamp2.hide()
         self._reset_saturation()
-        self.status.showMessage("Simulated hardware — ready (fast build).", 4000)
+        self.status.showMessage(
+            "No hardware connected — connect a spectrometer and a stage, or "
+            "open Simulation to run without either.", 0)
 
     def _build_export_button(self):
         """Header export control — a drop-down of the output formats. Picking
@@ -4168,6 +4830,11 @@ class FrogWindow(QMainWindow):
 
     def _populate_calibration_menu(self, menu):
         self._reset_menu(menu)
+        if not self._have_spec():
+            act = QAction("(no spectrometer connected)", menu)
+            act.setEnabled(False)
+            menu.addAction(act)
+            return
         files = self._calibration_files()
         targets = self.spec.calibration_targets()
         for spec in targets:
@@ -4275,174 +4942,125 @@ class FrogWindow(QMainWindow):
             f"Calibration '{src.stem}' added — assign it from the "
             f"Calibration menu.", 5000)
 
-    # ── Multi-spectrometer menu ───────────────────────────────────────────────
-    def _build_multispec_button(self):
-        """Header Multi-Spectrometer control — connect two spectrometers as
-        one stitched device and manage the stitch factor."""
-        menu = QMenu(self)
-        menu.aboutToShow.connect(lambda: self._populate_multispec_menu(menu))
-        self.btn_multi = QPushButton("Multi-Spec")
-        self.btn_multi.setToolTip(
-            "Stitch two spectrometers with overlapping wavelength ranges into "
-            "one — each can take its own calibration file")
-        self.btn_multi.setMenu(menu)
-        return self.btn_multi
+    # ── Spectrometer slots ───────────────────────────────────────────────────
+    # Two slots, always. Slot 1 alone is a single spectrometer; both filled is a
+    # stitched pair. The Spectrometer dialog is the only caller — it drives
+    # these three, and everything else about the pair (stitch factor, overlap
+    # band, per-slot calibration) is unchanged from when this was a menu.
+    @contextmanager
+    def _slots_rolled_back_on_failure(self):
+        """Restore the whole slot table if the connect it wraps fails.
 
-    def _populate_multispec_menu(self, menu):
-        self._reset_menu(menu)
-        if not self._multi["on"]:
-            act = QAction("Enable multi-spectrometer mode", menu)
-            act.triggered.connect(self._enable_multi_mode)
-            menu.addAction(act)
-            return
-        stitched = isinstance(self.spec, StitchedSpectrometer)
-        info = QAction(self.spec.name if stitched
-                       else "Select a spectrometer for each slot", menu)
-        info.setEnabled(False)
-        menu.addAction(info)
-        if stitched:
-            stale = ("  (stale — integration times changed)"
-                     if self._stitch_stale else "")
-            res = self.spec.stitch_residual
-            # The residual is the honest answer to "is one scalar enough for
-            # this pair?", so it belongs next to the factor rather than in a
-            # status message that has already scrolled away.
-            quality = ("  — not fitted yet" if res is None else
-                       f"  (mismatch {res * 100:.1f}%)")
-            fct = QAction(f"Stitch factor: {self.spec.stitch_factor:.4g}"
-                          f"{quality}{stale}", menu)
-            fct.setEnabled(False)
-            menu.addAction(fct)
-            lo, hi = self.spec.overlap_band
-            glo, ghi = self.spec.geometric_overlap
-            act_band = QAction(f"Overlap band: {lo:.1f}–{hi:.1f} nm "
-                               f"(of {glo:.1f}–{ghi:.1f})…", menu)
-            act_band.setToolTip(
-                "The part of the overlap the stitch factor is fitted over and "
-                "the two spectra are crossfaded across — shown shaded green in "
-                "the per-spectrometer view")
-            act_band.triggered.connect(self._set_overlap_band)
-            menu.addAction(act_band)
-        menu.addSeparator()
-        for slot in (0, 1):
-            self._add_slot_spec_menu(menu, slot)
-            self._add_slot_cal_menu(menu, slot)
-            if slot == 0:
-                menu.addSeparator()
-        menu.addSeparator()
-        act_fit = QAction("Auto-stitch", menu)
-        act_fit.setEnabled(stitched)
-        act_fit.setToolTip("Fit the stitch factor from one frame — needs "
-                           "light across the overlap region")
-        act_fit.triggered.connect(
-            lambda: self._menu_result(self._fit_stitch_factor))
-        menu.addAction(act_fit)
-        act_set = QAction("Manual stitch…", menu)
-        act_set.setEnabled(stitched)
-        act_set.triggered.connect(self._set_stitch_factor)
-        menu.addAction(act_set)
-        menu.addSeparator()
-        act_off = QAction("Disable multi-spectrometer mode", menu)
-        act_off.triggered.connect(
-            lambda: self._menu_result(self._disable_multi_mode))
-        menu.addAction(act_off)
+        A snapshot of all three lists, not of the one entry being edited:
+        clearing slot 1 promotes slot 2 into it, so an edit can touch every
+        field, and a per-field undo would leave the table half-shuffled. Yields
+        a one-element list the body puts its (ok, msg) into.
+        """
+        before = {k: list(v) for k, v in self._multi.items()}
+        box = []
+        yield box
+        if box and not box[0][0]:
+            self._multi = before
 
-    def _add_slot_spec_menu(self, menu, slot):
-        label = self._multi["labels"][slot]
-        sub = menu.addMenu(f"Spectrometer {slot + 1}:  {label or '(none)'}")
-        # Enumeration is a USB query — do it when the submenu opens, not for
-        # every open of the parent menu.
-        sub.aboutToShow.connect(
-            lambda s=sub, i=slot: self._populate_slot_spec_menu(s, i))
-
-    def _populate_slot_spec_menu(self, sub, slot):
-        self._reset_menu(sub)
-        other = self._multi["serials"][1 - slot]
-
-        def add(serial, label):
-            act = QAction(label, sub)
-            act.setCheckable(True)
-            act.setChecked(serial == self._multi["serials"][slot])
-            act.triggered.connect(
-                lambda _=False, i=slot, s=serial, l=label:
-                self._select_slot_device(i, s, l))
-            sub.addAction(act)
-
-        # Simulated halves first, and BEFORE enumeration: they are the only
-        # way to try the mode without two spectrometers on the bench, so they
-        # have to stay reachable even when the USB query fails outright.
-        for serial, label in SIM_SLOT_DEVICES:
-            if serial != other:            # already claimed by the other slot
-                add(serial, label)
-        sub.addSeparator()
-        try:
-            devices = self._list_spectrometers()
-        except Exception as e:
-            act = QAction(f"(enumeration failed: {e})", sub)
-            act.setEnabled(False)
-            sub.addAction(act)
-            return
-        added = 0
-        for model, ident in devices:
-            if ident == other:
-                continue
-            # Bare serial in the label: the model name already says which
-            # vendor it is, so repeating the tag here would only make the menu
-            # wider. The full tagged id is what gets stored in the slot.
-            add(ident, f"{model} [{ident.split(':', 1)[-1]}]")
-            added += 1
-        if not added:
-            act = QAction("(no free spectrometers found)", sub)
-            act.setEnabled(False)
-            sub.addAction(act)
-
-    def _add_slot_cal_menu(self, menu, slot):
-        cal = self._multi["cals"][slot]
-        sub = menu.addMenu(f"Calibration {slot + 1}:  "
-                           f"{cal.stem if cal else 'none'}")
-        group = QActionGroup(sub)
-        group.setExclusive(True)
-        act = QAction("None (raw counts)", sub)
-        act.setCheckable(True)
-        act.setChecked(cal is None)
-        act.triggered.connect(
-            lambda _=False, i=slot: self._select_slot_calibration(i, None))
-        group.addAction(act); sub.addAction(act)
-        for f in self._calibration_files():
-            act = QAction(f.stem, sub)
-            act.setCheckable(True)
-            act.setChecked(cal is not None and f.stem == cal.stem)
-            act.triggered.connect(
-                lambda _=False, i=slot, p=f: self._select_slot_calibration(i, p))
-            group.addAction(act); sub.addAction(act)
-
-    def _select_slot_device(self, slot, serial, label):
+    def _set_slot(self, slot, serial, label):
+        """Point one slot at a device and connect whatever the slots now
+        describe. (ok, msg)."""
         if self._scan_running():
-            self.status.showMessage(
-                "A scan is running — stop it before changing spectrometers.", 4000)
-            return
-        self._multi["serials"][slot] = serial
-        self._multi["labels"][slot]  = label
-        if all(self._multi["serials"]):
-            self._menu_result(self._connect_multi_pair)
-        else:
-            self.status.showMessage(
-                f"Slot {slot + 1}: {label}. Select the other slot to connect "
-                f"the pair.", 5000)
+            return False, ("A scan is running — stop it before changing "
+                           "spectrometers.")
+        with self._slots_rolled_back_on_failure() as out:
+            self._multi["serials"][slot] = serial
+            self._multi["labels"][slot]  = label
+            if all(self._multi["serials"]):
+                out.append(self._connect_multi_pair())
+            elif slot == 0:
+                out.append(self._connect_single_slot())
+            else:
+                # Slot 2 filled with slot 1 still empty. Nothing to connect
+                # against yet, so remember it and say so rather than opening
+                # this device on its own — slot 1 is the single-device slot,
+                # by definition.
+                out.append((True, f"Slot 2: {label}. Fill slot 1 to connect "
+                                  f"the pair."))
+        return out[0]
+
+    def _clear_slot(self, slot):
+        """Empty one slot and connect whatever is left. (ok, msg)."""
+        if self._scan_running():
+            return False, ("A scan is running — stop it before changing "
+                           "spectrometers.")
+        if slot == 0 and self._multi["serials"][1] is None:
+            return self._disconnect_spectrometer()
+        with self._slots_rolled_back_on_failure() as out:
+            for key in ("serials", "labels", "cals"):
+                self._multi[key][slot] = None
+            if slot == 0:
+                # Slot 1 is the single-device slot, so slot 2 alone is not a
+                # configuration. Promote it rather than leave a device named in
+                # a slot with nothing driving it.
+                for key in ("serials", "labels", "cals"):
+                    self._multi[key][0] = self._multi[key][1]
+                    self._multi[key][1] = None
+                out.append(self._connect_single_slot())
+            elif not self._pair_live():
+                out.append((True, "Slot 2 cleared."))
+            else:
+                # A live pair loses a member: release both, then reopen slot 1
+                # as the single device. Filling slot 2, in reverse.
+                out.append(self._connect_single_slot())
+        return out[0]
+
+    def _connect_single_slot(self):
+        """Open slot 1 alone as the connected spectrometer. (ok, msg).
+
+        The single-device counterpart of _connect_multi_pair, and it releases
+        the current handle for the same reason: a vendor SDK cannot open the
+        same spectrometer twice, and slot 1 may well be a member of the pair
+        being torn down.
+        """
+        ident = self._multi["serials"][0]
+        if ident is None:
+            return self._disconnect_spectrometer()
+        if self._have_spec():
+            ok, err = self._apply_spectrometer(None)
+            if not ok:
+                return False, err
+        cal = self._multi["cals"][0]
+        ragged = 0
+        try:
+            spec = self._open_slot_device(ident)
+            if cal is not None:
+                ragged = spec.set_calibration(cal)
+        except Exception as e:
+            return False, f"Spectrometer connect failed: {e}"
+        ok, err = self._apply_spectrometer(spec)
+        if not ok:
+            self._drop(spec)
+            return False, err
+        self.status.showMessage(f"Spectrometer: {spec.name}", 5000)
+        msg = f"Spectrometer connected: {spec.name}."
+        if ragged:
+            msg += (f"\n\nNOTE: {ragged} malformed line(s) were skipped in "
+                    f"'{cal.stem}' — check the file.")
+        return True, msg
 
     def _select_slot_calibration(self, slot, path):
         member = self._multi_members[slot]
-        if member is not None and isinstance(self.spec, StitchedSpectrometer):
+        if member is None and slot == 0 and not self._pair_live():
+            # Single-device mode: slot 1 IS the connected spectrometer, so its
+            # calibration can be applied to the live device straight away.
+            member = self.spec
+        if member is not None:
             # Commit the slot ONLY once the device really carries the file.
-            # The menu label is drawn from _multi["cals"], so recording it
-            # first made the menu claim a calibration that had failed to load
-            # and left that member silently on raw counts.
+            # The dialog's combo is drawn from _multi["cals"], so recording it
+            # first made the combo claim a calibration that had failed to load
+            # and left that device silently on raw counts.
             if not self._apply_calibration(member, path):
                 return
             self._multi["cals"][slot] = path
             return
         # Not live yet — nothing to verify against, so the file is checked on
-        # its own and only then remembered for _connect_multi_pair.
+        # its own and only then remembered for the connect.
         if path is not None:
             try:
                 _wl, _fac, skipped = load_calibration_file(path)
@@ -4456,38 +5074,11 @@ class FrogWindow(QMainWindow):
             skipped = 0
         self._multi["cals"][slot] = path
         msg = (f"Slot {slot + 1} calibration: "
-               f"{path.stem if path else 'none'} — applied when the pair "
+               f"{path.stem if path else 'none'} — applied when the device "
                f"connects.")
         if skipped:
             msg += f"  NOTE: {skipped} malformed line(s) skipped."
         self.status.showMessage(msg, 8000 if skipped else 4000)
-
-    def _enable_multi_mode(self):
-        self._multi["on"] = True
-        # Pre-fill slot 1 with an already-connected real device so entering the
-        # mode does not throw away the current connection. spec_id is what the
-        # slot needs (it is reopened by id), and every real adapter sets it —
-        # so this works for any vendor without reaching into vendor objects.
-        ident = getattr(self.spec, "spec_id", None)
-        # An id ending in ":?" means the serial could not be read, so it names
-        # "whichever device enumerates first" rather than this one — not good
-        # enough for a slot, which must be able to reopen exactly this device
-        # alongside another. Leave the slot empty instead.
-        if ident and not str(ident).endswith(":?"):
-            self._multi["serials"][0] = ident
-            self._multi["labels"][0]  = self.spec.name
-        elif isinstance(self.spec, SimulatedSpectrometer):
-            # Entering the mode from the simulator: pre-pick the blue half, so
-            # picking the red half in slot 2 is all it takes to get a working
-            # pair to try the mode on.
-            self._multi["serials"][0], self._multi["labels"][0] = \
-                SIM_SLOT_DEVICES[0]
-        self.lbl_sat2.show(); self.lamp2.show()
-        self._reset_saturation()
-        self._sync_multi_ui()
-        self.status.showMessage(
-            "Multi-spectrometer mode: pick a spectrometer for each slot in "
-            "the Multi-Spec menu.", 6000)
 
     def _connect_multi_pair(self):
         """Open both slot devices and swap in the stitched pair. (ok, msg)."""
@@ -4498,12 +5089,9 @@ class FrogWindow(QMainWindow):
             return False, ("Both slots point at the same spectrometer — pick "
                            "two different devices.")
         # Release any handle we already hold on one of these devices first: a
-        # vendor SDK cannot open the same spectrometer twice. spec_id is set by
-        # every real adapter and left None on the simulators, so this covers
-        # any vendor without naming one.
-        if (getattr(self.spec, "spec_id", None)
-                or isinstance(self.spec, StitchedSpectrometer)):
-            ok, err = self._apply_spectrometer(self._make_sim_spectrometer())
+        # vendor SDK cannot open the same spectrometer twice.
+        if self._have_spec():
+            ok, err = self._apply_spectrometer(None)
             if not ok:
                 return False, err
         opened = []
@@ -4544,67 +5132,15 @@ class FrogWindow(QMainWindow):
                     f"calibration for {', '.join(ragged)} — check the file.")
         return True, msg
 
-    def _disable_multi_mode(self):
-        """Leave multi mode, keeping slot 1's device as the single
-        spectrometer when a pair is live. (ok, msg)."""
-        if self._scan_running():
-            return False, ("A scan is running — stop it before leaving "
-                           "multi-spectrometer mode.")
-        keep_serial = self._multi["serials"][0]
-        keep_label  = self._multi["labels"][0]
-        keep_cal    = self._multi["cals"][0]
-        was_live    = isinstance(self.spec, StitchedSpectrometer)
-        keep_is_sim = any(keep_serial == s for s, _l in SIM_SLOT_DEVICES)
-        msg = "Multi-spectrometer mode disabled."
-        if was_live:
-            # Release both members before reopening slot 1 on its own.
-            ok, err = self._apply_spectrometer(self._make_sim_spectrometer())
-            if not ok:
-                return False, err
-        if was_live and keep_is_sim:
-            # Nothing to reopen: the swap above already put the FULL-band
-            # simulator back. Keeping slot 1 would instead leave its half-band
-            # member behind, which outside a stitched pair just looks like a
-            # truncated spectrometer.
-            msg = ("Multi-spectrometer mode disabled — back to the simulated "
-                   "spectrometer.")
-        elif was_live:
-            single = None
-            try:
-                single = self._open_slot_device(keep_serial)
-                if keep_cal is not None:
-                    single.set_calibration(keep_cal)
-            except Exception as e:
-                msg = (f"Multi-spectrometer mode disabled, but reconnecting "
-                       f"{keep_label} failed ({e}) — using the simulated "
-                       f"spectrometer.")
-            if single is not None:
-                ok, err = self._apply_spectrometer(single)
-                if not ok:
-                    self._drop(single)
-                    msg = (f"Multi-spectrometer mode disabled ({err}) — "
-                           f"using the simulated spectrometer.")
-                else:
-                    msg = (f"Multi-spectrometer mode disabled — "
-                           f"{single.name} kept as the single spectrometer.")
-        self._multi = {"on": False, "serials": [None, None],
-                       "labels": [None, None], "cals": [None, None]}
-        self._multi_members = [None, None]
-        self._stitch_stale = False
-        self.lbl_sat2.hide(); self.lamp2.hide()
-        self._reset_saturation()
-        self._sync_multi_ui()
-        return True, msg
-
     def _menu_result(self, fn):
-        """Run an (ok, msg) action from a menu; failures pop a message box —
-        menus have no inline status label like the Hardware dialog's."""
+        """Run an (ok, msg) action from a header button; failures pop a message
+        box — the canvas header has no inline status label like the dialogs."""
         ok, msg = fn()
         if ok:
             if msg:
                 self.status.showMessage(msg, 8000)
         else:
-            QMessageBox.warning(self, "Multi-spectrometer", msg)
+            QMessageBox.warning(self, "Spectrometer", msg)
 
     def _usable_member_darks(self):
         """The recorded member darks, or None when they cannot be applied.
@@ -4635,7 +5171,7 @@ class FrogWindow(QMainWindow):
         return self._usable_member_darks()
 
     def _fit_stitch_factor(self):
-        if not isinstance(self.spec, StitchedSpectrometer):
+        if not self._pair_live():
             return False, "No stitched pair is connected."
         if self._scan_running():
             return False, "A scan is running — stop it before fitting."
@@ -4663,7 +5199,7 @@ class FrogWindow(QMainWindow):
                       + f".{quality}")
 
     def _set_stitch_factor(self):
-        if not isinstance(self.spec, StitchedSpectrometer):
+        if not self._pair_live():
             return
         val, ok = QInputDialog.getDouble(
             self, "Set stitch factor",
@@ -4679,7 +5215,7 @@ class FrogWindow(QMainWindow):
 
     def _set_overlap_band(self):
         """Pick the sub-range of the overlap that the fit and blend use."""
-        if not isinstance(self.spec, StitchedSpectrometer):
+        if not self._pair_live():
             return
         lo, hi = self.spec.overlap_band
         glo, ghi = self.spec.geometric_overlap
@@ -4707,9 +5243,27 @@ class FrogWindow(QMainWindow):
             f"Overlap band set to {lo:.1f}–{hi:.1f} nm — re-run Auto-stitch "
             f"to fit over it.", 6000)
 
+    @staticmethod
+    def _connect_page(grp, body, button):
+        """Put a panel's controls behind a Connect button.
+
+        Exactly one of the two is visible; _sync_connection_ui picks which.
+        Plain show/hide rather than a QStackedWidget, which sizes every page to
+        the tallest and would leave a lone Connect button floating in the
+        middle of a panel-sized empty box.
+        """
+        lay = QVBoxLayout(grp); lay.setSpacing(4)
+        lay.addWidget(button)
+        lay.addWidget(body)
+        button.hide()
+
     def _build_spectrum_group(self):
         grp = QGroupBox("Spectrum")
-        lay = QVBoxLayout(grp); lay.setSpacing(4)
+        # The controls go in `body`, which is hidden wholesale while there is
+        # no spectrometer — every one of them drives a device that isn't there.
+        body = QWidget()
+        lay = QVBoxLayout(body); lay.setSpacing(4)
+        lay.setContentsMargins(0, 0, 0, 0)
         # The feed toggle lives in the spectrum panel's header (see _build_ui).
         self.lbl_integration = QLabel("Integration Time")
         lay.addWidget(self.lbl_integration)
@@ -4770,11 +5324,22 @@ class FrogWindow(QMainWindow):
         drow.addWidget(self.chk_dark, 1)
         lay.addLayout(drow)
         # The alignment step lives in the Alignment dialog (toolbar).
+
+        self.btn_connect_spec = QPushButton("Connect Spectrometer")
+        self.btn_connect_spec.setObjectName("accent")
+        self.btn_connect_spec.setToolTip(
+            "Scan for attached spectrometers and connect one — or two, as a "
+            "stitched pair")
+        self.btn_connect_spec.clicked.connect(self.dlg_spec.open_fresh)
+        self._connect_page(grp, body, self.btn_connect_spec)
+        self._body_spectrum = body
         return grp
 
     def _build_stage_group(self):
         grp = QGroupBox("Stage")
-        lay = QVBoxLayout(grp); lay.setSpacing(4)
+        body = QWidget()
+        lay = QVBoxLayout(body); lay.setSpacing(4)
+        lay.setContentsMargins(0, 0, 0, 0)
 
         jog = QHBoxLayout()
         self.btn_minus = QPushButton("−"); self.btn_plus = QPushButton("+")
@@ -4841,13 +5406,23 @@ class FrogWindow(QMainWindow):
         self.btn_set_zero.clicked.connect(self._mark_zero)
         lay.addWidget(self.btn_set_zero)
 
-        # Backlash lives in the Hardware dialog's Stage section — it is a
-        # property of the connected stage, and _sync_backlash_ui below still
-        # seeds it from here.
+        # Backlash lives in the Stage dialog — it is a property of the
+        # connected stage, and _sync_backlash_ui below still seeds it from here.
 
-        self._update_stage_unit_ranges()   # stage + scan_cfg exist by now
+        # Ranges from whatever stage is loaded, which at build time is none:
+        # _travel_range_um falls back to 300 mm of travel, and _apply_stage
+        # calls this again with the real numbers on every connect.
+        self._update_stage_unit_ranges()
         self.spin_step.setValue(100.0)     # after ranges: default 100 fs jog
-        self._sync_backlash_ui()           # seed from whatever stage is loaded
+        self._sync_backlash_ui()
+
+        self.btn_connect_stage = QPushButton("Connect Stage")
+        self.btn_connect_stage.setObjectName("accent")
+        self.btn_connect_stage.setToolTip(
+            "Scan for attached delay stages and connect one")
+        self.btn_connect_stage.clicked.connect(self.dlg_stage.open_fresh)
+        self._connect_page(grp, body, self.btn_connect_stage)
+        self._body_stage = body
         return grp
 
     def _build_scan_group(self):
@@ -4942,6 +5517,8 @@ class FrogWindow(QMainWindow):
         self._refresh_layout_button()    # …and so are this one's
         self._refresh_feed_button()      # …and its glyph is drawn from PALETTE
         self._refresh_align_button()     # …and it has one file per theme
+        self._refresh_autostitch_icon()  # …as does this one
+        self.pnl_no_spec.refresh_theme()  # …and its watermark is tinted live
         self.status.showMessage(f"{name.capitalize()} mode.", 2000)
 
     # ── Plot layout ──────────────────────────────────────────────────────────
@@ -5014,6 +5591,34 @@ class FrogWindow(QMainWindow):
             return list(self._multi_members)
         return list(members)
 
+    def _sync_connection_ui(self):
+        """Show the Connect buttons or the controls, per what is connected.
+
+        The side panels and the "no spectrometer connected" message all say the
+        same thing, so one function owns all three. Called from _sync_multi_ui
+        (every spectrometer swap ends there) and from _apply_stage.
+        """
+        have_spec, have_stage = self._have_spec(), self._have_stage()
+        self._body_spectrum.setVisible(have_spec)
+        self.btn_connect_spec.setVisible(not have_spec)
+        self._body_stage.setVisible(have_stage)
+        self.btn_connect_stage.setVisible(not have_stage)
+        self.pnl_no_spec.setVisible(not have_spec)
+        if not have_spec:
+            self.pnl_no_spec.raise_()
+        # The header buttons act on a spectrum that may not exist; and the
+        # message just claimed the panel, so the row has to be re-packed
+        # around whatever is left showing.
+        for b in (self.btn_autofit, self.btn_feed, self.btn_align_spec):
+            b.setEnabled(have_spec)
+        self._position_panel_buttons()
+        if self.dlg_spec.isVisible():
+            self.dlg_spec._refresh()
+        if self.dlg_stage.isVisible():
+            self.dlg_stage._refresh()
+        if self.dlg_sim.isVisible():
+            self.dlg_sim._refresh()
+
     def _sync_multi_ui(self):
         """Bring every stitched-vs-single widget into line with self.spec.
 
@@ -5021,12 +5626,16 @@ class FrogWindow(QMainWindow):
         so no caller has to remember the set. Pure widget state — no device
         I/O, so it is safe to call outside _device_lock.
         """
-        stitched = isinstance(self.spec, StitchedSpectrometer)
+        stitched = self._pair_live()
         slots = self._slot_members() if stitched else []
         # One caption over both boxes — S1 on the left, S2 on the right.
         self.lbl_integration.setText("Integration Time — S1 / S2" if stitched
                                      else "Integration Time")
         self.spin_integration2.setVisible(stitched)
+        # Second saturation lamp: one alarm per device, so it exists exactly as
+        # long as the pair does.
+        self.lbl_sat2.setVisible(stitched)
+        self.lamp2.setVisible(stitched)
         if len(slots) != 2:
             # No live pair: the per-spectrometer view has nothing to show.
             if self.btn_overlay.isChecked():
@@ -5036,15 +5645,44 @@ class FrogWindow(QMainWindow):
             self.canvas.clear_members()
         self._sync_integration_ui()
         self._refresh_overlay_button()
+        self._refresh_autostitch_button()
         self._refresh_align_trace_button()
         self._refresh_avantes_button()
+        self._sync_connection_ui()
+
+    def _refresh_autostitch_icon(self):
+        """Per-theme mark on the Auto-stitch button, with the same text
+        fallback the other icon buttons keep for a bundle missing its icons."""
+        icon = STITCH_ICON[self._theme]
+        if icon.exists():
+            self.btn_autostitch.setIcon(QIcon(str(icon)))
+            self.btn_autostitch.setText("")
+        else:
+            self.btn_autostitch.setIcon(QIcon())
+            self.btn_autostitch.setText("⇌")
+
+    def _refresh_autostitch_button(self):
+        """Show the Auto-stitch header button only while a pair is live.
+
+        Same rule as the overlay toggle beside it: the fit needs two members to
+        match against, and it drives the same hardware a scan owns.
+        """
+        self.btn_autostitch.setVisible(self._pair_live()
+                                       and len(self._slot_members()) == 2)
+        self.btn_autostitch.setEnabled(not self._scan_running())
+        self.btn_autostitch.setToolTip(
+            "Auto-stitch — fit the factor that matches the two spectrometers "
+            "across the overlap. Needs light across the overlap region; the "
+            "fitted factor and its mismatch are shown in the Spectrometer "
+            "window.")
+        self._position_panel_buttons()   # its visibility drives the header row
 
     def _refresh_avantes_button(self):
         """Show the Avantes toolbar button only while an Avantes is live.
 
         Called from _sync_multi_ui because that is the one function guaranteed
-        to run after every device swap (_apply_spectrometer, _connect_multi_pair,
-        _enable_multi_mode, _disable_multi_mode all end in it).
+        to run after every device swap (_apply_spectrometer, _connect_multi_pair
+        and the slot handlers all end in it).
         """
         devices = self._avantes_devices()
         self.btn_avantes.setVisible(bool(devices))
@@ -5085,8 +5723,9 @@ class FrogWindow(QMainWindow):
         showing. A live pair takes one box per member, from that member's own
         limits — the two halves of a mixed-vendor pair do not share a range.
         """
-        slots = (self._slot_members()
-                 if isinstance(self.spec, StitchedSpectrometer) else [])
+        if not self._have_spec():
+            return          # the boxes are hidden with the rest of the panel
+        slots = self._slot_members() if self._pair_live() else []
         if len(slots) == 2:
             for mem, spin in zip(slots, (self.spin_integration,
                                          self.spin_integration2)):
@@ -5101,7 +5740,7 @@ class FrogWindow(QMainWindow):
         spectrum while the combined curve is up, continuous once the members
         are drawn apart.
         """
-        stitched = isinstance(self.spec, StitchedSpectrometer)
+        stitched = self._pair_live()
         self.btn_overlay.setVisible(stitched and len(self._slot_members()) == 2)
         self.btn_overlay.setEnabled(not self._scan_running())
         on = self.btn_overlay.isChecked()
@@ -5121,7 +5760,7 @@ class FrogWindow(QMainWindow):
         self._position_panel_buttons()
 
     def _on_overlay_toggled(self, on):
-        if on and not (isinstance(self.spec, StitchedSpectrometer)
+        if on and not (self._pair_live()
                        and len(self._slot_members()) == 2):
             with QSignalBlocker(self.btn_overlay):
                 self.btn_overlay.setChecked(False)
@@ -5131,6 +5770,7 @@ class FrogWindow(QMainWindow):
             # Don't wait for the next frame to put the combined curve back.
             self.canvas.clear_members()
         self._refresh_overlay_button()
+        self._refresh_autostitch_button()
         self.status.showMessage(
             "Spectrum panel: one curve per spectrometer." if on else
             "Spectrum panel: combined stitched spectrum.", 4000)
@@ -5148,10 +5788,10 @@ class FrogWindow(QMainWindow):
         self._sat_latched = False
         self._sat_frames  = 0            # saturated frames so far this scan
         self._sat_worst   = (0, 0.0, 0)  # (n_pixels, delay_fs, column index)
-        slots = self._slot_members() if self._multi["on"] else []
+        slots = self._slot_members() if self._pair_live() else []
         if slots:
-            # Multi mode with a live pair: one lamp per member, each judged
-            # against its own full scale.
+            # Live pair: one lamp per member, each judged against its own full
+            # scale.
             for i, mem in enumerate(slots):
                 full = self._member_full_scale(mem)
                 lamp = self.lamp if i == 0 else self.lamp2
@@ -5166,19 +5806,20 @@ class FrogWindow(QMainWindow):
                 else:
                     lamp.setToolTip(
                         f"{mem.name} does not report a full-scale value, so "
-                        f"saturation cannot be checked. Set one in Hardware → "
-                        f"Full scale.")
+                        f"saturation cannot be checked. Set one in "
+                        f"Spectrometer → Full scale.")
                     self._set_lamp("unknown", f"S{i + 1} — % FS", "satok", i)
             return
-        if self._multi["on"]:
-            # Multi mode enabled but no pair connected yet — lamp 2 idles.
-            self.lamp2.setToolTip("Slot 2 — no stitched pair connected yet.")
-            self._set_lamp("unknown", "", "satok", 1)
+        if not self._have_spec():
+            self.lamp.setToolTip("No spectrometer connected.")
+            self._set_lamp("unknown", "", "satok")
+            return
         full = self._full_scale()
         if not full:
             self.lamp.setToolTip(
                 "This spectrometer does not report a full-scale value, so "
-                "saturation cannot be checked. Set one in Hardware → Full scale.")
+                "saturation cannot be checked. Set one in Spectrometer → "
+                "Full scale.")
             self._set_lamp("unknown", "— % FS", "satok")
         else:
             source = ("override" if self.scan_cfg.saturation_counts else "device")
@@ -5217,7 +5858,7 @@ class FrogWindow(QMainWindow):
         """
         if self._sat_latched:
             return
-        slots = self._slot_members() if self._multi["on"] else []
+        slots = self._slot_members() if self._pair_live() else []
         frames = getattr(self.spec, "last_member_raw", None)
         if slots and frames is not None:
             # Two separate alarms: each member's own raw frame against its own
@@ -5276,6 +5917,13 @@ class FrogWindow(QMainWindow):
             return
         if self._live_frame is None:
             return
+        if not self._have_spec():
+            # The feed emits from its own thread, so a spectrum_ready queued
+            # before the disconnect is still delivered after it. Drop it: the
+            # frame describes a device that is gone, and every correction
+            # below it would go through self.spec.
+            self._live_frame = None
+            return
         with perf_tick("live_render"):
             wl, raw = self._live_frame
             self._live_frame = None
@@ -5313,9 +5961,9 @@ class FrogWindow(QMainWindow):
         moment Auto-stitch ran.
         """
         if not self.chk_dark.isChecked():
-            return raw if isinstance(self.spec, StitchedSpectrometer) \
+            return raw if self._pair_live() \
                 else self.spec.calibrate(raw)
-        if isinstance(self.spec, StitchedSpectrometer):
+        if self._pair_live():
             darks = self._usable_member_darks()
             if darks is None or frames is None:
                 self._warn_dark_mismatch()
@@ -5466,7 +6114,7 @@ class FrogWindow(QMainWindow):
                 f"limit or reduce the Alignment Step.", 7000)
             self._uncheck_align_spec(); return
 
-        self.btn_hw.setEnabled(False)
+        self._set_hardware_buttons_enabled(False)
         self.btn_scan.setEnabled(False)
         self._set_stage_controls_enabled(False)
         self.btn_align_spec.setEnabled(False)
@@ -5521,7 +6169,7 @@ class FrogWindow(QMainWindow):
     def _reset_align_ui(self):
         """Hand the devices back and re-enable what the sweep locked out."""
         self._moving(False)
-        self.btn_hw.setEnabled(True)
+        self._set_hardware_buttons_enabled(True)
         self.btn_scan.setEnabled(True)
         self._set_stage_controls_enabled(True)
         self.btn_align_spec.setEnabled(True)
@@ -5540,9 +6188,9 @@ class FrogWindow(QMainWindow):
         right-to-left and its width depends on which buttons are visible.
         """
         # getattr, not the attribute: the refresh methods that call this also
-        # run from _apply_spectrometer, which _build_hardware_sim reaches before
-        # _build_ui has created any of these buttons.
-        if getattr(self, "btn_align_trace", None) is None:
+        # run from _apply_spectrometer, which the connect paths can reach
+        # before _build_ui has created any of these buttons.
+        if getattr(self, "pnl_no_spec", None) is None:
             return
         c = self.canvas
 
@@ -5553,15 +6201,26 @@ class FrogWindow(QMainWindow):
             y = round(top) - HDR_PAD - HDR_BTN
             x = round(right) - 6
             for b in reversed(buttons):
-                if not b.isVisible():
+                # isHidden, not isVisible: isVisible() is False for every child
+                # until the top-level window itself is shown, so packing on it
+                # skipped the whole row on the layout passes that run during
+                # __init__ and left the buttons piled at (0, 0) until something
+                # else happened to trigger a relayout.
+                if b.isHidden():
                     continue      # hidden buttons take no room in the row
                 x -= b.width()
                 b.move(x, y)
                 x -= HDR_GAP
 
-        pack(c.ax_spec, [self.btn_autofit, self.btn_feed,
+        pack(c.ax_spec, [self.btn_autofit, self.btn_feed, self.btn_autostitch,
                          self.btn_overlay, self.btn_align_spec])
         pack(c.ax_trace, [self.btn_align_trace])
+
+        # The "no spectrometer connected" panel, stretched over the whole
+        # spectrum axes so it reads as the empty plot itself rather than a card
+        # floating in it. It is laid out only here — it has no parent layout to
+        # do that for it.
+        self.pnl_no_spec.setGeometry(c.panel_rect_px(c.ax_spec))
 
     def _refresh_align_button(self):
         """Per-theme crosshair on the alignment-sweep toggle.
@@ -5604,7 +6263,7 @@ class FrogWindow(QMainWindow):
     def _refresh_align_trace_button(self):
         """Show the RAW toggle only for a stitched pair, and only enable it
         once there is a scan whose raw member columns were recorded."""
-        stitched = isinstance(self.spec, StitchedSpectrometer)
+        stitched = self._pair_live()
         self.btn_align_trace.setVisible(stitched)
         self._position_panel_buttons()   # visibility drives the header row
         if not stitched:
@@ -5737,8 +6396,9 @@ class FrogWindow(QMainWindow):
             self.status.showMessage(
                 "A scan is running — integration time applies to the next scan.", 4000)
             return
-        slots = self._slot_members() if isinstance(self.spec,
-                                                   StitchedSpectrometer) else []
+        if not self._have_spec():
+            return
+        slots = self._slot_members() if self._pair_live() else []
         changed = []
         with self._device_lock() as ok:
             if not ok:
@@ -5806,6 +6466,9 @@ class FrogWindow(QMainWindow):
         if self._scan_running():
             self.status.showMessage("A scan is running — spectrometer is busy.", 3000)
             return
+        if not self._have_spec():
+            self.status.showMessage("Connect a spectrometer first.", 4000)
+            return
         with self._device_lock() as ok:
             if not ok:
                 self.status.showMessage(FEED_BUSY_MSG, 4000)
@@ -5864,6 +6527,18 @@ class FrogWindow(QMainWindow):
         # should not scroll away before the operator looks up.
         self.status.showMessage(f"Dark discarded — {reason}. Re-record it.", 0)
 
+    def _set_hardware_buttons_enabled(self, on):
+        """Every route to a device swap, locked together.
+
+        A scan and an alignment sweep both capture the stage and spectrometer
+        for their duration, so nothing may connect, disconnect or simulate
+        underneath them — and that is now five buttons across the toolbar and
+        the two side panels rather than the one it used to be.
+        """
+        for w in (self.btn_spec_dlg, self.btn_stage_dlg, self.btn_sim_dlg,
+                  self.btn_connect_spec, self.btn_connect_stage):
+            w.setEnabled(on)
+
     # ── Manual stage ──────────────────────────────────────────────────────────
     def _set_stage_controls_enabled(self, on):
         for w in (self.btn_minus, self.btn_plus, self.btn_moveto,
@@ -5890,6 +6565,9 @@ class FrogWindow(QMainWindow):
         """
         if self._scan_running():
             self.status.showMessage("A scan is running — the stage is busy.", 3000)
+            return
+        if not self._have_stage():
+            self.status.showMessage("Connect a stage first.", 4000)
             return
         self._set_stage_controls_enabled(False)
         self._moving(True)
@@ -5976,6 +6654,8 @@ class FrogWindow(QMainWindow):
         if self._scan_running():
             self.status.showMessage("A scan is running — the stage is busy.", 3000)
             self._sync_backlash_ui()      # snap back to what the stage has
+            return
+        if not self._have_stage():
             return
         # Plain attribute write, no device I/O — no lock needed. Ranges shift
         # because the low end reserves the margin.
@@ -6072,7 +6752,9 @@ class FrogWindow(QMainWindow):
         self.status.showMessage(f"Zero-delay set to {self.scan_cfg.zero_pos_um:.2f} um.", 3000)
 
     def _refresh_positions(self):
-        self.lbl_pos.setText(f"{_stage_to_um(self.stage.get_position()):.2f} um")
+        self.lbl_pos.setText(
+            f"{_stage_to_um(self.stage.get_position()):.2f} um"
+            if self._have_stage() else "— um")
         self.lbl_zero.setText(f"{self.scan_cfg.zero_pos_um:.2f} um")
 
     def _refresh_scan_um(self):
@@ -6088,8 +6770,11 @@ class FrogWindow(QMainWindow):
             self._worker.abort()
             self.btn_scan.setEnabled(False); self.btn_scan.setText("Aborting…")
             return
-        if self.spec is None:
+        if not self._have_spec():
             self.status.showMessage("Connect a spectrometer first.", 4000); return
+        if not self._have_stage():
+            self.status.showMessage("Connect a stage first — a FROG scan has "
+                                    "to sweep the delay.", 4000); return
         if self._align_running():
             self.status.showMessage(
                 "An alignment sweep is running — the stage is busy.", 3000); return
@@ -6134,7 +6819,7 @@ class FrogWindow(QMainWindow):
 
         # The worker captures these devices for the whole scan, so lock out
         # everything that could swap or drive them underneath it.
-        self.btn_hw.setEnabled(False)
+        self._set_hardware_buttons_enabled(False)
         self._set_stage_controls_enabled(False)
 
         self._scan_trace  = np.zeros((wl.size, delays.size))
@@ -6176,6 +6861,7 @@ class FrogWindow(QMainWindow):
         # to the stitched curve on its own (update_spectrum owns the mode);
         # grey the toggle out rather than let it look broken for the duration.
         self._refresh_overlay_button()
+        self._refresh_autostitch_button()
         self.status.showMessage(f"FROG scan: {delays.size} points…", 0)
 
     def _on_progress(self, done, total):
@@ -6257,7 +6943,7 @@ class FrogWindow(QMainWindow):
         col = self._scan_col
         if not self.chk_dark.isChecked():
             return col
-        if isinstance(self.spec, StitchedSpectrometer):
+        if self._pair_live():
             darks = self.background_members
             if darks is None:
                 return col
@@ -6308,7 +6994,7 @@ class FrogWindow(QMainWindow):
                        "sat")
         # The worker's signal aggregates over stitched members; latch both
         # lamps so neither device shows a green light over clipped data.
-        if self._multi["on"]:
+        if self._pair_live():
             self.lamp2.set_state("sat")
 
     def _on_finished(self, result):
@@ -6348,9 +7034,10 @@ class FrogWindow(QMainWindow):
         self.btn_scan.setEnabled(True)
         self.btn_scan.setObjectName("accent"); self.btn_scan.setText("Measure FROG")
         self.btn_scan.style().unpolish(self.btn_scan); self.btn_scan.style().polish(self.btn_scan)
-        self.btn_hw.setEnabled(True)
+        self._set_hardware_buttons_enabled(True)
         self._set_stage_controls_enabled(True)
         self._refresh_overlay_button()
+        self._refresh_autostitch_button()
         self._refresh_align_trace_button()
         if self._feed_was_on and self.btn_feed.isChecked():
             self._feed.resume()
@@ -6458,6 +7145,8 @@ class FrogWindow(QMainWindow):
         # out from under a thread still in acquire() faults in vendor code.
         if released:
             for dev in (self.stage, self.spec):
+                if dev is None:
+                    continue          # nothing was ever connected here
                 try:
                     dev.disconnect()
                 except Exception:
@@ -6466,7 +7155,8 @@ class FrogWindow(QMainWindow):
             print("warning: a device thread did not stop in time; leaving the "
                   "hardware to be released by process exit rather than closing "
                   "it underneath a running acquire.", file=sys.stderr)
-        self.dlg_settings.close(); self.dlg_hardware.close()
+        self.dlg_settings.close(); self.dlg_spec.close()
+        self.dlg_stage.close(); self.dlg_sim.close()
         self.dlg_graphics.close(); self.dlg_avantes.close()
         super().closeEvent(event)
 
