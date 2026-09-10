@@ -15,6 +15,10 @@ __pycache__/
 *.npz
 data/
 
+# Runtime preferences, written next to the program (see SETTINGS_PATH)
+settings.json
+settings.json.tmp
+
 # Editors / OS
 .vscode/
 .idea/

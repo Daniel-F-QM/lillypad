@@ -53,6 +53,7 @@ and shared with frog_gui.py via hardware.py / scan.py.
 import os
 import gc
 import sys
+import json
 import math
 import time
 import shutil
@@ -510,6 +511,14 @@ def app_dir():
 
 CALIBRATION_DIR = app_dir() / "calibration_files"
 
+# Preferences live beside the program for the same reason the calibration files
+# do: app_dir() is writable and permanent, while resource_path()'s _MEIPASS
+# bundle is re-extracted every launch. Never seeded, unlike the calibration
+# folder — the absence of this file IS the default state, so deleting it is a
+# full factory reset.
+SETTINGS_PATH = app_dir() / "settings.json"
+SETTINGS_VERSION = 1
+
 
 def seed_calibration_dir():
     """First-run seeding for the frozen build: the bundle ships the repo's
@@ -529,6 +538,143 @@ def seed_calibration_dir():
         pass   # e.g. read-only install dir — the menu just shows no files
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Settings persistence
+# ─────────────────────────────────────────────────────────────────────────────
+# Display preferences and acquisition policy only — never anything bound to a
+# particular piece of hardware. A serial number, an integration time or a stage
+# zero describes the rig that happened to be plugged in last time, and restoring
+# one silently would put a number the operator never entered into the next
+# measurement. What is kept here is only how the program LOOKS and how it has
+# been told to behave.
+#
+# A plain JSON file rather than QSettings and the registry, for the same reason
+# the calibration files are a folder: the operator can open it, read it, correct
+# it by hand and delete it.
+
+_SETTINGS = None
+
+
+def load_settings():
+    """Read settings.json once per process; {} for anything wrong with it.
+
+    Cached because two moments need the same answer and must not disagree:
+    main() needs the theme before the QApplication is styled, and the window
+    needs everything else after its widgets exist.
+
+    A missing file is the ordinary first-run case, and a corrupt one is treated
+    exactly the same way — defaults are always a working program, and a startup
+    that refused to start because a preferences file lost a brace would be a far
+    worse failure than a forgotten colormap.
+    """
+    global _SETTINGS
+    if _SETTINGS is None:
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _SETTINGS = data if isinstance(data, dict) else {}
+        except (OSError, ValueError, UnicodeDecodeError):
+            _SETTINGS = {}
+    return _SETTINGS
+
+
+def save_settings(data):
+    """Write settings.json atomically. True if it landed.
+
+    Temp file plus os.replace, never an in-place rewrite: a crash partway
+    through a rewrite leaves a TRUNCATED file, which is the one outcome worse
+    than not saving at all — it loses the previous session's settings too.
+    os.replace is atomic within a volume, hence the temp file in the same
+    folder.
+
+    No fsync deliberately: the rename already keeps the file from being torn,
+    and flushing the disk on every autosave to defend a colormap choice against
+    a power cut is not a trade worth making.
+
+    Failure is silent, like seed_calibration_dir — a read-only install directory
+    should cost the operator nothing but the memory of their preferences.
+    """
+    tmp = SETTINGS_PATH.with_name(SETTINGS_PATH.name + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            # default=float: matplotlib hands back numpy scalars from get_ylim()
+            # and friends, and one of them must not abort the whole write.
+            json.dump(data, f, indent=2, default=float)
+            f.write("\n")
+        os.replace(tmp, SETTINGS_PATH)
+        return True
+    except (OSError, TypeError, ValueError):
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def startup_theme(data):
+    """The theme to build the whole program in, validated.
+
+    Read straight from the settings dict instead of being restored through
+    _apply_theme like every other setting: PALETTE is sampled at CONSTRUCTION
+    time by the figure and by _build_ui's per-theme icon files, so the palette
+    has to be right before the first widget exists. Restoring it afterwards
+    would mean restyling the entire application at startup and trusting that
+    every widget which read a colour on the way up has a refresh hook.
+    """
+    name = data.get("theme")
+    return name if name in ("dark", "light") else "dark"
+
+
+def install_theme(app, name):
+    """Point the module-level PALETTE at `name` and restyle the application.
+
+    Shared by main()'s startup and _apply_theme's runtime switch, which
+    otherwise carried the same four lines twice — and a startup that styled
+    itself even slightly differently from a toggle is exactly the drift that
+    surfaces later as one stale widget colour.
+    """
+    PALETTE.clear()
+    PALETTE.update(LIGHT_PALETTE if name == "light" else DARK_PALETTE)
+    apply_app_palette(app, PALETTE)
+    app.setStyleSheet(build_stylesheet(PALETTE, name))
+
+
+def _as_bool(v):
+    """Strict bool for restore.
+
+    bool("false") is True, so a hand-edited file would otherwise mean the exact
+    opposite of what it says. Anything that is not a real JSON boolean raises,
+    and that one key falls back to its default.
+    """
+    if isinstance(v, bool):
+        return v
+    raise TypeError(v)
+
+
+def _restore_pair(lo_sb, hi_sb, value):
+    """Restore a (min, max) spinbox pair, low box first.
+
+    Order matters: each box's valueChanged handler pushes BOTH boxes at the
+    canvas, and the canvas setters ignore an inverted pair. Setting the low box
+    first guarantees the second call — the always-valid one — is what lands.
+    """
+    lo, hi = value
+    lo_sb.setValue(float(lo))
+    hi_sb.setValue(float(hi))
+
+
+def _on_a_screen(rect):
+    """True if `rect` overlaps some connected screen enough to be grabbed.
+
+    A saved position only means anything on the monitor layout it was saved on:
+    unplug the second display and a restored window sits in dead space with no
+    title bar to drag it back by.
+    """
+    for s in QApplication.screens():
+        i = s.availableGeometry().intersected(rect)
+        if i.width() >= 120 and i.height() >= 40:
+            return True
+    return False
 
 
 # Said in three places (the auto-scale checkboxes) about one gesture, so it is
@@ -536,6 +682,18 @@ def seed_calibration_dir():
 RIGHT_CLICK_HINT = ("Right-click the plot to toggle this: off fits the full "
                     "range and follows it live, on freezes the view where it "
                     "is.")
+
+
+def _ease(current, target, dt, tau):
+    """One-pole step from `current` toward `target` over `dt` seconds, with time
+    constant `tau`.
+
+    Solved rather than iterated, so the result depends only on elapsed TIME and
+    not on how many times it was called: at a 1 ms exposure this runs ~16 times
+    a second and at a 10 s exposure once every ten, and a per-call fraction
+    would have made the response time a function of the exposure.
+    """
+    return target + (current - target) * math.exp(-dt / tau)
 
 
 def _hline():
@@ -2587,7 +2745,7 @@ class GraphicsSettingsDialog(QDialog):
             self._fit_to_content()
 
     def _on_autoscale_y(self, on):
-        self.canvas.autoscale_y = on
+        self.canvas.set_autoscale_y(on)   # re-seeds the filter on the way on
         self.spin_ymin.setEnabled(not on)
         self.spin_ymax.setEnabled(not on)
 
@@ -2647,6 +2805,37 @@ class GraphicsSettingsDialog(QDialog):
         with QSignalBlocker(self.sld_prop):
             self.sld_prop.setValue(int(pct))
         self.lbl_prop.setText(f"{int(pct)}%")
+
+    def push_to_canvas(self):
+        """Drive the canvas from every widget in here, changed or not.
+
+        The counterpart of sync_limits, and what lets a settings restore leave
+        the normal signal wiring to do the work: setValue/setChecked emit only
+        on a CHANGE, and the widget construction defaults are not the canvas
+        defaults — an empty spectrum panel sits nowhere near 0…5000 counts, so a
+        restored value that happens to match a spinbox's default would reach the
+        widget and never reach the plot.
+
+        Every setter below is idempotent and their draw_idle()s coalesce into
+        one frame, so re-asserting the lot is cheaper to reason about than
+        working out which ones stayed silent.
+        """
+        c = self.canvas
+        c.set_cmap(self.cmb_cmap.currentText())
+        c.set_trace_reversed(self.chk_cmap_rev.isChecked())
+        c.set_trace_threshold(self.spin_thresh.value())
+        c.set_linewidth(self.spin_lw.value())
+        c.set_log_scale(self.chk_log.isChecked())
+        c.set_proportions(self.sld_prop.value() / 100.0)
+        # Manual bounds only mean anything with their auto-scale off; applying
+        # them anyway would fight the very next live frame.
+        if not c.autoscale_x:
+            c.set_xlim(self.spin_xmin.value(), self.spin_xmax.value())
+        if not c.autoscale_y:
+            c.set_ylim(self.spin_ymin.value(), self.spin_ymax.value())
+        if not c.autoscale_trace:
+            c.set_trace_xlim(self.spin_tmin.value(), self.spin_tmax.value())
+            c.set_trace_ylim(self.spin_twmin.value(), self.spin_twmax.value())
 
     def toggle(self):
         if self.isVisible():
@@ -2958,6 +3147,9 @@ class FrogCanvas(FigureCanvasQTAgg):
         # actually move (autoscale otherwise re-sets identical limits each frame).
         self._xlim_cache = None
         self._ylim_cache = None
+        # Continuous y auto-scale filter state — see _autoscale_y / _pin_ylim.
+        self._ylim_smooth = None   # where the view is heading, unquantized
+        self._ylim_t      = 0.0    # monotonic stamp of the last filter step
         self._ac_xlim_cache = (-1.0, 1.0)     # the empty-state ranges set above
         self._ac_ylim_cache = _AC_YLIM
         self._trace_xlim_cache = None
@@ -3434,7 +3626,7 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.autoscale_x = False
             self.autoscale_y = False
             self._xlim_cache = (xlo, xhi)
-            self._ylim_cache = (ylo, yhi)
+            self._pin_ylim((ylo, yhi))
         elif ax is self.ax_ac:
             self.autoscale_ac_x = False
             self.autoscale_ac_y = False
@@ -3491,11 +3683,11 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.autoscale_x = False           # freeze wherever it sits now
             self.autoscale_y = False
             self._xlim_cache = self.ax_spec.get_xlim()
-            self._ylim_cache = self.ax_spec.get_ylim()
+            self._pin_ylim(self.ax_spec.get_ylim())
             return
         self.fit_xy()                          # fits, but freezes autoscale…
         self.autoscale_x = True                # …so re-enable live follow
-        self.autoscale_y = True
+        self.set_autoscale_y(True)
 
     def _set_trace_autoscale(self, on):
         """FROG-trace auto-scale. On restores the scan's full extent."""
@@ -3530,7 +3722,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.ax_spec.set_autoscaley_on(True)
         self.ax_spec.relim(visible_only=True)
         self.ax_spec.autoscale_view(scalex=False)
-        self._ylim_cache = self.ax_spec.get_ylim()
+        self._pin_ylim(self.ax_spec.get_ylim())
         self.draw_idle()
         return self.ax_spec.get_ylim()
 
@@ -3545,13 +3737,13 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.autoscale_x = False
         self.autoscale_y = False
         self._xlim_cache = self.ax_spec.get_xlim()
-        self._ylim_cache = self.ax_spec.get_ylim()
+        self._pin_ylim(self.ax_spec.get_ylim())
         self.draw_idle()
 
     def set_ylim(self, ymin, ymax):
         if ymin < ymax:
             self.ax_spec.set_ylim(ymin, ymax)
-            self._ylim_cache = (ymin, ymax)
+            self._pin_ylim((ymin, ymax))
             self.draw_idle()
 
     def set_xlim(self, xmin, xmax):
@@ -3574,6 +3766,23 @@ class FrogCanvas(FigureCanvasQTAgg):
         if ymin < ymax:
             self.ax_trace.set_ylim(ymin, ymax)
             self._trace_ylim_cache = (ymin, ymax)
+            self.draw_idle()
+
+    def set_ac_xlim(self, xmin, xmax):
+        """Autocorrelation delay axis. No dialog row drives this — it exists so
+        a frozen AC view (right-click, or a rubber-band zoom) can be restored
+        between sessions together with autoscale_ac_x, which on its own would
+        pin the panel to a range it was never pinned to."""
+        if xmin < xmax:
+            self.ax_ac.set_xlim(xmin, xmax)
+            self._ac_xlim_cache = (xmin, xmax)
+            self.draw_idle()
+
+    def set_ac_ylim(self, ymin, ymax):
+        """Autocorrelation amplitude axis. See set_ac_xlim."""
+        if ymin < ymax:
+            self.ax_ac.set_ylim(ymin, ymax)
+            self._ac_ylim_cache = (ymin, ymax)
             self.draw_idle()
 
     def set_cmap(self, name):
@@ -3602,7 +3811,10 @@ class FrogCanvas(FigureCanvasQTAgg):
                 self.ax_spec.set_ylim(1.0, 10.0)
             elif lo <= 0:
                 self.ax_spec.set_ylim(bottom=max(1.0, hi * 0.001))
-        self._ylim_cache = self.ax_spec.get_ylim()
+        # Pinned, not just cached: the filter's state is in the OLD scale's
+        # units, and easing a linear-space limit toward a log-space target
+        # would walk the view somewhere neither of them asked for.
+        self._pin_ylim(self.ax_spec.get_ylim())
         self.draw_idle()
 
     def set_linewidth(self, lw):
@@ -3753,12 +3965,26 @@ class FrogCanvas(FigureCanvasQTAgg):
         else:
             self._request_blit(spec_only=True)
 
-    # Fractional ylim move worth paying a full redraw for. Autoscaling a noisy
-    # live signal nudges the limits on nearly every frame, and each accepted
-    # nudge turns a ~1 ms blit into a draw_idle() — which, once a scan has put a
-    # real trace in the image, re-rasterizes that too. Same idea as the 0.5%
-    # guard on _clim_peak.
-    _YLIM_HYST = 0.02
+    # Continuous y auto-scale is a FILTER, not a follower.
+    #
+    # A deadband alone was not enough. It rejects small moves, but every move it
+    # accepts lands on the RAW instantaneous autoscale result — so a live
+    # spectrum whose peak wanders a few percent frame to frame (shot noise, and
+    # several percent is ordinary) cleared the old 2% guard constantly and the
+    # view chased the noise both ways. Each accepted nudge also turns a ~1 ms
+    # blit into a draw_idle(), which once a scan has put a real trace in the
+    # image re-rasterizes that too, so the jitter came with a stutter.
+    #
+    # Instead the raw result is a TARGET fed through a one-pole filter with
+    # asymmetric time constants: expand fast, contract slowly. The view settles
+    # on the ceiling of the noise envelope and stays there — a real change still
+    # shows within a fraction of a second, but a spike that decays again never
+    # pulls the view back down. The deadband survives on top, now deciding only
+    # how coarsely the filtered value is committed (and so how often the
+    # expensive redraw is paid for).
+    _YLIM_TAU_UP   = 0.15   # s — view growing to meet new data
+    _YLIM_TAU_DOWN = 2.0    # s — view shrinking after the signal drops
+    _YLIM_HYST     = 0.04   # commit deadband, fraction of the applied span
 
     def _autoscale_y(self):
         """Autoscale the spectrum's y axis; True if the view actually moved.
@@ -3768,22 +3994,72 @@ class FrogCanvas(FigureCanvasQTAgg):
         the axes, and keeping them while taking the blit path would draw the
         curve over a cached background whose ticks were rendered for the old
         ones.
+
+        autoscale_view() is kept as the source of the target rather than reading
+        dataLim directly: it already accounts for the 5% margins, the log
+        transform set_log_scale installs and visible_only's overlay-line
+        bookkeeping, none of which is worth reimplementing here.
         """
         self.ax_spec.set_autoscaley_on(True)
         self.ax_spec.relim(visible_only=True)
         self.ax_spec.autoscale_view(scalex=False)
-        yl  = self.ax_spec.get_ylim()
+        target = self.ax_spec.get_ylim()          # raw, instantaneous
         old = self._ylim_cache
-        if old is None:
-            self._ylim_cache = yl
+        if old is None or self._ylim_smooth is None:
+            self._pin_ylim(target)                # nothing to filter from yet
             return True
+        now = time.monotonic()
+        dt  = max(now - self._ylim_t, 0.0)
+        self._ylim_t = now
+        slo, shi = self._ylim_smooth
+        # Asymmetric about the CURRENT filter state, not the applied limits: the
+        # bottom expands by going lower, the top by going higher, so each end
+        # gets the fast constant only in the direction that grows the view.
+        lo = _ease(slo, target[0], dt,
+                   self._YLIM_TAU_UP if target[0] < slo else self._YLIM_TAU_DOWN)
+        hi = _ease(shi, target[1], dt,
+                   self._YLIM_TAU_UP if target[1] > shi else self._YLIM_TAU_DOWN)
+        self._ylim_smooth = (lo, hi)
         span = max(abs(old[1] - old[0]), 1e-12)
-        if (abs(yl[0] - old[0]) > self._YLIM_HYST * span
-                or abs(yl[1] - old[1]) > self._YLIM_HYST * span):
-            self._ylim_cache = yl
+        if (abs(lo - old[0]) > self._YLIM_HYST * span
+                or abs(hi - old[1]) > self._YLIM_HYST * span):
+            # Commit the FILTERED value, never the target — committing the
+            # target here would put the noise straight back on screen and make
+            # the filter nothing but a delay on the same jitter.
+            self.ax_spec.set_ylim(lo, hi)
+            self._ylim_cache = (lo, hi)
             return True
         self.ax_spec.set_ylim(*old)
         return False
+
+    def set_autoscale_y(self, on):
+        """Turn continuous y auto-scale on or off.
+
+        Switching it ON drops the filter state, so the next frame SNAPS onto the
+        data instead of easing toward it. Without that, ticking the checkbox
+        from a manual view — or restoring auto-scale at startup, where the
+        spinbox defaults have already put 0…5000 counts on the axes — would
+        spend ten seconds crawling down from limits that were never about the
+        live signal. The filter exists to reject noise, not to animate a
+        deliberate change of mode.
+        """
+        on = bool(on)
+        if on and not self.autoscale_y:
+            self._ylim_smooth = None
+        self.autoscale_y = on
+
+    def _pin_ylim(self, yl):
+        """Record `yl` as both the applied limits AND the auto-scale filter's
+        state.
+
+        Every path that moves the y view by hand goes through here. Setting only
+        _ylim_cache would leave the filter still converging on where the view
+        USED to be, and the next few live frames would walk it straight back off
+        the zoom, fit or manual limits the operator just asked for.
+        """
+        self._ylim_cache  = tuple(yl)
+        self._ylim_smooth = tuple(yl)
+        self._ylim_t      = time.monotonic()
 
     def update_member_spectra(self, wl1, s1, wl2, s2):
         """Draw one curve per spectrometer instead of the combined one.
@@ -3976,7 +4252,13 @@ class FrogWindow(QMainWindow):
         self.setWindowTitle("Lillypad — Fast")
         self.setWindowIcon(app_icon())
         self.setMinimumSize(1180, 760)
-        self._theme = "dark"
+        # load_settings() is cached, so this is the same dict main() already
+        # read the theme from on its way to styling the QApplication — the two
+        # cannot disagree. The rest is applied at the END of __init__, once the
+        # widgets it drives exist.
+        self._settings = load_settings()
+        self._settings_saved = {}
+        self._theme = startup_theme(self._settings)
 
         self.scan_cfg      = FrogScanConfig(delay_start_fs=-500, delay_stop_fs=500,
                                             delay_step_fs=1.0, zero_pos_um=150000.0)
@@ -4135,6 +4417,21 @@ class FrogWindow(QMainWindow):
             self._perf_timer.setInterval(10_000)
             self._perf_timer.timeout.connect(_perf.report)
             self._perf_timer.start()
+
+        # Last, because it drives widgets from every group above as well as the
+        # canvas _build_ui created. Nothing has painted yet — the event loop
+        # only starts in main() — so the draw_idle()s this sets off all collapse
+        # into the first frame.
+        self._restore_settings()
+        # Closing is not the only way this program ends: a vendor driver can
+        # take the process with it (see the warning in closeEvent), and losing a
+        # session of preferences to a fault in someone else's DLL is exactly the
+        # annoyance persistence is here to remove. Ten seconds is the most that
+        # can be lost, and the write only happens when something changed.
+        self._settings_timer = QTimer(self)
+        self._settings_timer.setInterval(10_000)
+        self._settings_timer.timeout.connect(self._autosave_settings)
+        self._settings_timer.start()
 
     # ── Connection state ─────────────────────────────────────────────────────
     # self.spec and self.stage are None when nothing is connected — a real
@@ -4602,10 +4899,18 @@ class FrogWindow(QMainWindow):
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
         self.btn_theme = QPushButton()
-        self.btn_theme.setIcon(QIcon(str(SUN_ICON)))
+        # Derived from self._theme rather than hard-coded to the dark-mode pair:
+        # the theme is restored from settings.json before _build_ui runs, so a
+        # session that ended in light mode would otherwise come back showing the
+        # sun and offering to switch to the mode it is already in. Same
+        # expressions as _apply_theme, which owns the runtime switch — the
+        # button always advertises what a CLICK produces.
+        self.btn_theme.setIcon(QIcon(str(MOON_ICON if self._theme == "light"
+                                         else SUN_ICON)))
         self.btn_theme.setIconSize(QSize(18, 18))
         self.btn_theme.setFixedWidth(42)
-        self.btn_theme.setToolTip("Switch to light mode")
+        self.btn_theme.setToolTip("Switch to dark mode" if self._theme == "light"
+                                  else "Switch to light mode")
         self.btn_theme.clicked.connect(self._toggle_theme)
         tb.addWidget(self.btn_theme)
         # Plot layout toggle; icon and tooltip come from _refresh_layout_button.
@@ -5503,11 +5808,7 @@ class FrogWindow(QMainWindow):
 
     def _apply_theme(self, name):
         self._theme = name
-        PALETTE.clear()
-        PALETTE.update(LIGHT_PALETTE if name == "light" else DARK_PALETTE)
-        app = QApplication.instance()
-        apply_app_palette(app, PALETTE)
-        app.setStyleSheet(build_stylesheet(PALETTE, name))
+        install_theme(QApplication.instance(), name)   # shared with startup
         self.canvas.apply_palette(PALETTE)
         self.lamp.update()          # repaints from the new PALETTE
         self.btn_theme.setIcon(QIcon(str(MOON_ICON if name == "light" else SUN_ICON)))
@@ -5525,12 +5826,23 @@ class FrogWindow(QMainWindow):
     def _toggle_layout(self):
         mode = ("vertical" if self.canvas._layout_mode == "horizontal"
                 else "horizontal")
-        self.canvas.set_layout_mode(mode)
-        self._refresh_layout_button()
+        self._set_layout(mode)
         self.status.showMessage(
             "Horizontal layout — trace and autocorrelation share the delay axis."
             if mode == "horizontal" else
             "Vertical layout — autocorrelation full width below.", 4000)
+
+    def _set_layout(self, mode):
+        """Apply a layout mode and keep its button honest.
+
+        Split out of _toggle_layout so a restored mode takes exactly the same
+        path as a click — minus the status message, which at startup would push
+        the 'no hardware connected' banner off the bar before it was read.
+        """
+        if mode not in ("horizontal", "vertical"):
+            raise ValueError(mode)          # a bad settings key, caught upstream
+        self.canvas.set_layout_mode(mode)
+        self._refresh_layout_button()
 
     def _refresh_layout_button(self):
         """Icon and tooltip of the plot-layout toggle. Like the theme and
@@ -7043,13 +7355,23 @@ class FrogWindow(QMainWindow):
             self._feed.resume()
 
     # ── Save ──────────────────────────────────────────────────────────────────
+    def _set_export_fmt(self, key):
+        """Make `key` the active export format, without writing anything.
+
+        Split out of _export_as so a restored format can be applied at startup:
+        _export_as goes on to announce 'no scan to save yet', which would land
+        on the status bar over the 'no hardware connected' banner.
+        """
+        _label, suffix, _filt, _writer = EXPORT_FORMATS[key]   # bad key: KeyError
+        self._export_fmt = key
+        self._export_actions[key].setChecked(True)
+        self.btn_save.setText(f"Save ({suffix})")
+
     def _export_as(self, key):
         """Make `key` the active export format and write the last scan in it.
         With no scan yet this only switches the format."""
-        self._export_fmt = key
+        self._set_export_fmt(key)
         _label, suffix, filt, writer = EXPORT_FORMATS[key]
-        self._export_actions[key].setChecked(True)
-        self.btn_save.setText(f"Save ({suffix})")
         if self.result is None:
             self.status.showMessage(f"Export format: {suffix} — no scan to save yet.", 4000)
             return
@@ -7110,7 +7432,218 @@ class FrogWindow(QMainWindow):
         return max(5000.0, 2.0 * shots * exposure
                    + 2000.0 * float(c.wait_after_move_s) + 5000.0)
 
+    # ── Settings persistence ─────────────────────────────────────────────────
+    # One table, read in both directions: (key, getter, setter). Adding a
+    # setting is one line here and nothing else — the save, the autosave diff
+    # and the restore all walk this list.
+    #
+    # A setter of None means "restored somewhere else, for a reason given at
+    # that site": the theme has to exist before any widget does, and the
+    # geometry has to be applied in the same breath as the decision to show
+    # maximized. Both are still SAVED from here, so this stays the one place
+    # that knows the full set.
+    #
+    # ORDER IS LOAD-BEARING on restore, twice over:
+    #   • the auto-scale checkboxes come before the limit spinboxes, because
+    #     _on_autoscale_trace(False) pins those four boxes to whatever is on
+    #     screen and would overwrite the values being restored;
+    #   • the layout mode comes before the split fraction, so the axes are laid
+    #     out once, in the mode they are going to stay in.
+    #
+    # Getters read the CANVAS for the auto-scale flags and the WIDGETS for the
+    # manual limits. That split is not arbitrary: _apply_zoom and reset_axes
+    # mutate canvas.autoscale_* directly, so the canvas is the only thing that
+    # always knows; while the spinboxes are the memory of the last bounds the
+    # operator dialled in by hand, which is what should come back — not a
+    # snapshot of an auto-scaled view that happened to be live at the time.
+    def _setting_specs(self):
+        c = self.canvas
+        g = self.dlg_graphics
+        d = self.dlg_settings
+        return [
+            ("theme",   lambda: self._theme,    None),
+            ("window",  self._window_geometry,  None),
+
+            ("layout_mode", lambda: c._layout_mode, self._set_layout),
+            ("spec_frac",   lambda: float(c._spec_frac),
+                            lambda v: g.sld_prop.setValue(int(round(float(v) * 100)))),
+
+            ("autoscale_x",     lambda: bool(c.autoscale_x),
+                                lambda v: g.chk_auto_x.setChecked(_as_bool(v))),
+            ("autoscale_y",     lambda: bool(c.autoscale_y),
+                                lambda v: g.chk_auto_y.setChecked(_as_bool(v))),
+            ("autoscale_trace", lambda: bool(c.autoscale_trace),
+                                lambda v: g.chk_auto_trace.setChecked(_as_bool(v))),
+            ("autoscale_ac_x",  lambda: bool(c.autoscale_ac_x),
+                                lambda v: setattr(c, "autoscale_ac_x", _as_bool(v))),
+            ("autoscale_ac_y",  lambda: bool(c.autoscale_ac_y),
+                                lambda v: setattr(c, "autoscale_ac_y", _as_bool(v))),
+
+            ("spec_xlim",  lambda: [g.spin_xmin.value(), g.spin_xmax.value()],
+                           lambda v: _restore_pair(g.spin_xmin, g.spin_xmax, v)),
+            ("spec_ylim",  lambda: [g.spin_ymin.value(), g.spin_ymax.value()],
+                           lambda v: _restore_pair(g.spin_ymin, g.spin_ymax, v)),
+            ("trace_xlim", lambda: [g.spin_tmin.value(), g.spin_tmax.value()],
+                           lambda v: _restore_pair(g.spin_tmin, g.spin_tmax, v)),
+            ("trace_ylim", lambda: [g.spin_twmin.value(), g.spin_twmax.value()],
+                           lambda v: _restore_pair(g.spin_twmin, g.spin_twmax, v)),
+            # The autocorrelation has no dialog row, so a frozen view has to be
+            # carried by the limits themselves — see set_ac_xlim.
+            ("ac_xlim",    lambda: [float(x) for x in c.ax_ac.get_xlim()],
+                           lambda v: c.set_ac_xlim(float(v[0]), float(v[1]))),
+            ("ac_ylim",    lambda: [float(y) for y in c.ax_ac.get_ylim()],
+                           lambda v: c.set_ac_ylim(float(v[0]), float(v[1]))),
+
+            ("log_scale",  g.chk_log.isChecked,
+                           lambda v: g.chk_log.setChecked(_as_bool(v))),
+            # setCurrentText is a silent no-op on a non-editable combo for a name
+            # that is not in the list, so a colormap dropped from
+            # TRACE_COLORMAPS needs no guard of its own.
+            ("cmap",          lambda: c._cmap_name, g.cmb_cmap.setCurrentText),
+            ("cmap_reversed", lambda: bool(c._cmap_rev),
+                              lambda v: g.chk_cmap_rev.setChecked(_as_bool(v))),
+            # Percent, as typed — the canvas keeps the fraction.
+            ("trace_threshold_pct", g.spin_thresh.value,
+                                    lambda v: g.spin_thresh.setValue(float(v))),
+            ("line_width",    lambda: float(c._lw),
+                              lambda v: g.spin_lw.setValue(float(v))),
+            ("export_format", lambda: self._export_fmt, self._set_export_fmt),
+
+            ("avg_per_point",      d.spin_avg.value,
+                                   lambda v: d.spin_avg.setValue(int(v))),
+            ("idle_shots",         d.spin_idle.value,
+                                   lambda v: d.spin_idle.setValue(int(v))),
+            ("wait_after_move_ms", d.spin_wait.value,
+                                   lambda v: d.spin_wait.setValue(int(v))),
+            ("saturation_pct",     d.spin_sat.value,
+                                   lambda v: d.spin_sat.setValue(float(v))),
+            ("abort_on_saturation",  d.chk_abort_sat.isChecked,
+                                     lambda v: d.chk_abort_sat.setChecked(_as_bool(v))),
+            ("abort_on_stage_fault", d.chk_abort_stage_fault.isChecked,
+                                     lambda v: d.chk_abort_stage_fault.setChecked(_as_bool(v))),
+
+            ("scan_start_fs",   self.spin_start.value,
+                                lambda v: self.spin_start.setValue(float(v))),
+            ("scan_stop_fs",    self.spin_stop.value,
+                                lambda v: self.spin_stop.setValue(float(v))),
+            ("scan_step_fs",    self.spin_step_fs.value,
+                                lambda v: self.spin_step_fs.setValue(float(v))),
+            ("scan_background", self.chk_bg.isChecked,
+                                lambda v: self.chk_bg.setChecked(_as_bool(v))),
+            ("align_step_fs",   self.spin_align_step.value,
+                                lambda v: self.spin_align_step.setValue(float(v))),
+        ]
+
+    def _window_geometry(self):
+        """Position and size for the next launch.
+
+        normalGeometry when maximized, not geometry: a maximized window reports
+        the whole screen, and saving that would make the next un-maximize
+        restore to a 'normal' size the operator never chose.
+        """
+        r = self.normalGeometry() if self.isMaximized() else self.geometry()
+        return {"x": r.x(), "y": r.y(), "w": r.width(), "h": r.height(),
+                "maximized": self.isMaximized()}
+
+    def show_restored(self):
+        """Show the window where the last session left it, maximized by default.
+
+        Neither in __init__ nor as two calls in main(): setGeometry has to
+        happen before the first show to be honoured without a visible jump, and
+        the maximized decision has to be made in the same place or one of the
+        two silently wins.
+
+        Explicit x/y/w/h rather than a base64 saveGeometry() blob, because this
+        file is meant to be readable and fixable by hand — an opaque blob cannot
+        be corrected when a window comes back on a monitor that is no longer
+        there, and restoreGeometry rejects blobs across Qt versions without
+        saying so.
+        """
+        geo = self._settings.get("window")
+        maximized = True
+        if isinstance(geo, dict):
+            maximized = geo.get("maximized", True) is not False
+            try:
+                r = QRect(int(geo["x"]), int(geo["y"]),
+                          int(geo["w"]), int(geo["h"]))
+            except (KeyError, TypeError, ValueError):
+                r = QRect()
+            if r.isValid() and _on_a_screen(r):
+                self.setGeometry(r)        # Qt clamps up to setMinimumSize itself
+        if maximized:
+            self.showMaximized()
+        else:
+            self.show()
+
+    def _restore_settings(self):
+        """Apply the saved settings to widgets that already exist.
+
+        Every key is applied on its own and every failure is swallowed on its
+        own: a file half-written by an older build, a hand-edit with a typo in
+        it, or a colormap that no longer exists must cost the operator that ONE
+        setting and never the rest of them.
+
+        Deliberately NOT blockSignals. The dialog's signal wiring IS the only
+        path from a widget to the canvas — blocking it would restore the
+        dialog's appearance while leaving the canvas on defaults — and the
+        handlers carry side effects nothing else does: _on_autoscale_* enable
+        and disable the boxes they own, _on_prop repaints its percent label.
+        Restoring through the same route a click takes is also the version that
+        cannot drift from it. push_to_canvas() then covers the values that
+        happened to equal a widget's default and so emitted nothing.
+        """
+        for key, _get, setter in self._setting_specs():
+            if setter is None or key not in self._settings:
+                continue
+            try:
+                setter(self._settings[key])
+            except Exception:
+                continue          # one bad key costs one setting
+        try:
+            self.dlg_graphics.push_to_canvas()
+        except Exception:
+            pass
+        self._settings_saved = self._settings_snapshot()
+
+    def _settings_snapshot(self):
+        """Everything worth saving, as JSON-native values."""
+        data = {"version": SETTINGS_VERSION}
+        for key, getter, _set in self._setting_specs():
+            try:
+                data[key] = getter()
+            except Exception:
+                # Carry the last good value forward rather than dropping the
+                # key: a getter that throws should not also erase what the
+                # operator had.
+                if key in self._settings_saved:
+                    data[key] = self._settings_saved[key]
+        return data
+
+    def _save_settings(self, data=None):
+        if data is None:
+            data = self._settings_snapshot()
+        if save_settings(data):
+            self._settings_saved = data
+
+    def _autosave_settings(self):
+        """Periodic write, but only when something actually changed.
+
+        Polled off the table rather than wired to thirty valueChanged signals,
+        for two reasons: adding a setting stays one line, and a slider drag
+        emits fifty changes a second, not one of which is worth a disk write.
+        Comparing a ~30-entry dict every ten seconds is free next to the 60 ms
+        render tick.
+        """
+        snap = self._settings_snapshot()
+        if snap != self._settings_saved:
+            self._save_settings(snap)
+
     def closeEvent(self, event):
+        # First, before anything else: everything below this waits on threads
+        # that may not stop and calls into vendor code that may not return, and
+        # the settings must not be the casualty of a device that will not let go.
+        self._settings_timer.stop()
+        self._save_settings()
         self._display_timer.stop()
         if self._perf_timer is not None:
             self._perf_timer.stop()   # report() walks the widget tree we tear down
@@ -7179,15 +7712,23 @@ def main():
     app.setApplicationName("Lillypad")
     app.setWindowIcon(app_icon())
     app.setFont(QFont("Segoe UI", 10, QFont.Normal))
-    apply_app_palette(app, PALETTE)
-    app.setStyleSheet(build_stylesheet(PALETTE, "dark"))
+    # Theme before the first widget exists: PALETTE is sampled at construction
+    # time by the figure and by the per-theme icon files _build_ui picks, so a
+    # theme restored after the window was built would mean restyling the whole
+    # application at startup and trusting every widget that read a colour on the
+    # way up to have a refresh hook. _apply_theme still owns the runtime switch,
+    # and shares install_theme with this. load_settings() is cached, so
+    # FrogWindow reads the same dict.
+    install_theme(app, startup_theme(load_settings()))
     seed_calibration_dir()
 
     win = FrogWindow()
     # Maximized, not fullscreen: the plots are the point and they scale with
     # whatever room there is, but the operator still needs the title bar and
-    # the taskbar to get at the acquisition software beside this one.
-    win.showMaximized()
+    # the taskbar to get at the acquisition software beside this one. Still the
+    # default — but a session that deliberately left the window a particular
+    # size on a particular monitor gets it back. See show_restored.
+    win.show_restored()
     # The startup graph — every widget, artist, stylesheet rule and Qt binding —
     # is permanent, but the live loop allocates numpy arrays continuously, so
     # gen-2 collections run regularly and would otherwise walk all of it every
