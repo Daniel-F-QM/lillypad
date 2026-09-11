@@ -474,6 +474,21 @@ ALIGN_ICON = {"dark":  resource_path("icons", "alignment_dark.png"),
 # in their own theme's accent.
 STITCH_ICON = {"dark":  resource_path("icons", "autostitch_dark.png"),
                "light": resource_path("icons", "autostitch_light.png")}
+# Continuous y auto-scale, beside the spectrum's title. A padlock showing the
+# CURRENT state, not the action a click performs: an axis free to follow the
+# data is UNLOCKED, one frozen where it sits is LOCKED. That is the opposite
+# convention to SPLIT_ICON/MERGE_ICON above, and deliberately so — a padlock is
+# read as a condition ("this is locked"), not as an instruction, so showing the
+# lock you would GET by clicking would say exactly the wrong thing.
+UNLOCKED_ICON = {"dark":  resource_path("icons", "unlocked_dark.png"),
+                 "light": resource_path("icons", "unlocked_light.png")}
+LOCKED_ICON   = {"dark":  resource_path("icons", "locked_dark.png"),
+                 "light": resource_path("icons", "locked_light.png")}
+# Re-run the alignment sweep, beside the mode toggle that opened the panel.
+# An ACTION, but one with no second state to depict, so it follows the
+# mode-icon convention: one mark, one file per theme's accent.
+REFRESH_ICON = {"dark":  resource_path("icons", "refresh_dark.png"),
+                "light": resource_path("icons", "refresh_light.png")}
 # Symmetry mode, on the FROG trace panel's header. ONE file for both themes —
 # the mark is a mirror line, which reads the same either way.
 SYMMETRY_ICON = resource_path("icons", "symmetry.png")
@@ -2860,6 +2875,11 @@ _GEO_L_MAX  = 0.14   # …but never eat this much of a narrow window
 _GEO_GAP_PX = 70     # column-gap floor: the right column's y label and tick
                      # labels, plus clearance for the split handle beside them
 _GEO_ROW_RATIO = 1.8        # tall row : short row, both modes
+# Spectrum : deviation panel, when alignment mode splits the spectrum's cell.
+# Taller than _GEO_ROW_RATIO: the deviations are a strip either side of zero,
+# not a curve that has to fill a panel, and the spectrum it takes room from is
+# the one being aligned.
+_GEO_DEV_RATIO = 2.4
 _GEO_V_BOT     = 0.095
 _GEO_V_COLGAP  = 0.055
 _GEO_V_HSPACE  = 0.31       # the gridspec hspace the vertical layout was tuned with
@@ -2995,6 +3015,15 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.ax_spec  = self.fig.add_subplot(gs[0, 0])
         self.ax_trace = self.fig.add_subplot(gs[0, 1])
         self.ax_ac    = self.fig.add_subplot(gs[1, :])
+        # Alignment mode's deviation panel, under the spectrum and sharing its
+        # wavelength axis — the same relationship the autocorrelation has to the
+        # FROG trace. It exists from the start but is hidden and unpositioned
+        # until set_dev_visible(True); _layout_axes gives it room only then, so
+        # a session that never runs an alignment sweep has the geometry it
+        # always had.
+        self.ax_dev = self.fig.add_subplot(gs[1, 0])
+        self.ax_dev.set_visible(False)
+        self._dev_on = False
 
         (self.line_spec,) = self.ax_spec.plot([], [], color=PALETTE["accent"], lw=1)
         (self.line_ac,)   = self.ax_ac.plot([], [], color=PALETTE["accent2"], lw=1)
@@ -3046,20 +3075,31 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.band_span.set_visible(False)
         self._band = None
         self._overlay = False
-        # Alignment mode: the two symmetry-difference curves. Independent of
-        # the combined/member switch above, so they stay on screen over a live
-        # spectrum, a scan column or the per-member view without any of those
-        # having to know about them. Drawn in the SAME count units as the
-        # spectrum, hence the zero reference line — a difference is only
-        # readable against the level it is a difference from.
-        (self.line_d1,) = self.ax_spec.plot([], [], color=DIFF_COLORS[0], lw=1.2)
-        (self.line_d2,) = self.ax_spec.plot([], [], color=DIFF_COLORS[1], lw=1.2)
+        # Alignment mode: the two symmetry-difference curves, on their OWN panel
+        # rather than over the spectrum. They used to share ax_spec, which put
+        # two quantities that happen to share an axis and a unit on one set of
+        # limits: a difference swings either side of zero while a spectrum sits
+        # on a pedestal, so whichever had the larger excursion flattened the
+        # other. Their own panel gives each its own y range, and leaves the
+        # spectrum readable while a sweep is being judged.
+        #
+        # Still in the SAME count units as the spectrum, hence the zero
+        # reference line — a difference is only readable against the level it is
+        # a difference from.
+        (self.line_d1,) = self.ax_dev.plot([], [], color=DIFF_COLORS[0], lw=1.2)
+        (self.line_d2,) = self.ax_dev.plot([], [], color=DIFF_COLORS[1], lw=1.2)
         self.line_d1.set_visible(False)
         self.line_d2.set_visible(False)
-        # Static, like band_span: it moves only when the view does.
-        self.diff_zero = self.ax_spec.axhline(
+        self.diff_zero = self.ax_dev.axhline(
             0.0, color=PALETTE["text_dim"], lw=0.8, ls="--", zorder=0)
         self.diff_zero.set_visible(False)
+        # The PREVIOUS sweep, kept as a filled area under the new curves so a
+        # tweak can be judged against what it replaced. PolyCollections, not
+        # lines: fill_between has no set_data, so each refresh removes these and
+        # makes new ones — a sweep is four stage moves, so the cost is nothing.
+        self._ghosts = []
+        self._ghost_y = ()           # the ghost's y arrays, for the auto-scale
+        self._prev_diff = None       # (wl, d1, d2) of the last sweep shown
         # NaN, not zeros: with no scan yet there is no data, and _apply_cmap
         # paints 'bad' pixels in the plot background — so an empty panel reads
         # as empty. Zeros would paint the colormap's bottom colour over the
@@ -3129,8 +3169,12 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_ac.set_animated(True)
         self.line_m1.set_animated(True)
         self.line_m2.set_animated(True)
-        self.line_d1.set_animated(True)
-        self.line_d2.set_animated(True)
+        # line_d1/line_d2 are NOT animated: they change once per alignment
+        # sweep, which is four stage moves apart, and both show_diff and
+        # clear_diff end in _request_full() — the redraw that re-caches the
+        # background they now live in. Leaving them animated cost every live
+        # frame two extra draw_artist calls to put back curves that had not
+        # moved since the last stage move.
         self.im.set_animated(True)
         self.txt_fwhm.set_animated(True)
         self.line_half.set_animated(True)
@@ -3142,8 +3186,6 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._animated = [(self.ax_spec, self.line_spec),
                           (self.ax_spec, self.line_m1),
                           (self.ax_spec, self.line_m2),
-                          (self.ax_spec, self.line_d1),
-                          (self.ax_spec, self.line_d2),
                           (self.ax_trace, self.im),
                           (self.ax_trace, self.line_fold),
                           (self.ax_trace, self.txt_sym),
@@ -3188,7 +3230,8 @@ class FrogCanvas(FigureCanvasQTAgg):
     def _style(self):
         specs = [(self.ax_spec,  "Wavelength (nm)", "Counts",          "Spectrum"),
                  (self.ax_trace, "Delay (fs)",      "Wavelength (nm)", "FROG Trace"),
-                 (self.ax_ac,    "Delay (fs)",      "AC (a.u.)",       "Autocorrelation")]
+                 (self.ax_ac,    "Delay (fs)",      "AC (a.u.)",       "Autocorrelation"),
+                 (self.ax_dev,   "Wavelength (nm)", "Δ counts",        "Alignment")]
         for ax, xl, yl, title in specs:
             ax.set_facecolor(PALETTE["plot_bg"])
             ax.tick_params(colors=PALETTE["text_dim"], labelsize=8.5)
@@ -3199,6 +3242,7 @@ class FrogCanvas(FigureCanvasQTAgg):
             self._place_title(ax, title)
         self.ax_spec.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
         self.ax_ac.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
+        self.ax_dev.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
         # Last: this re-does the two decorations the loop just reset to their
         # vertical-mode defaults, so a theme switch cannot undo the layout mode.
         self._apply_mode_decorations()
@@ -3241,13 +3285,44 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.ax_trace.tick_params(axis="x", labelbottom=not horiz,
                                   direction="in" if horiz else "out")
         self._place_title(self.ax_ac, "Autocorrelation", inside=horiz)
+        # The deviation panel does to the spectrum exactly what the AC does to
+        # the trace above: same wavelength axis, stacked flush, so the bottom
+        # panel carries the one set of ticks and the top one gives them up. The
+        # `dev` flag stands in for `horiz` here — this pair is stacked in BOTH
+        # layout modes, or not present at all.
+        dev = self._dev_on
+        self.ax_spec.set_xlabel("" if dev else "Wavelength (nm)",
+                                color=PALETTE["text_dim"], fontsize=9.5,
+                                labelpad=2)
+        self.ax_spec.tick_params(axis="x", labelbottom=not dev,
+                                 direction="in" if dev else "out")
+        self._place_title(self.ax_dev, "Alignment", inside=True)
+
+    def _split_spec_cell(self, x, y, w, h):
+        """Place the spectrum in the cell (x, y, w, h) it has been given.
+
+        With alignment mode off it takes the whole cell — which is what every
+        layout did before the deviation panel existed. With it on, the cell is
+        split into spectrum over deviations, flush, in the same
+        tall-row : short-row proportion the trace and AC use.
+        """
+        if not self._dev_on:
+            self.ax_spec.set_position([x, y, w, h])
+            return
+        h_dev = h / (1.0 + _GEO_DEV_RATIO)
+        self.ax_spec.set_position([x, y + h_dev, w, h - h_dev])
+        self.ax_dev.set_position([x, y, w, h_dev])
 
     def _layout_axes(self):
-        """Position all three axes for the current mode and spectrum width.
+        """Position every axes for the current mode and spectrum width.
 
         Single source of truth for the plot geometry: the axes are placed
         explicitly instead of being left where the gridspec put them, so the
         proportion slider works in either mode (and before the first draw).
+
+        The spectrum's cell is handed to _split_spec_cell rather than assigned
+        directly, so alignment mode's extra panel is one decision made in one
+        place instead of a branch in each layout mode.
         """
         L, R, TOP = self._left_margin(), _GEO_R, self._top_margin()
         horiz   = self._layout_mode == "horizontal"
@@ -3261,7 +3336,7 @@ class FrogCanvas(FigureCanvasQTAgg):
             BOT, rgap = _GEO_H_BOT, _GEO_H_ROWGAP
             h_ac = (TOP - BOT - rgap) / (1.0 + _GEO_ROW_RATIO)
             h_tr = TOP - BOT - rgap - h_ac
-            self.ax_spec.set_position([L, BOT, spec_w, TOP - BOT])
+            self._split_spec_cell(L, BOT, spec_w, TOP - BOT)
             self.ax_trace.set_position([right_x, BOT + h_ac + rgap, right_w, h_tr])
             self.ax_ac.set_position([right_x, BOT, right_w, h_ac])
             # The whole column gap is shared by both sides here.
@@ -3275,7 +3350,7 @@ class FrogCanvas(FigureCanvasQTAgg):
             rgap  = (TOP - BOT) - rows
             h_ac  = rows / (1.0 + _GEO_ROW_RATIO)
             h_top = rows - h_ac
-            self.ax_spec.set_position([L, BOT + h_ac + rgap, spec_w, h_top])
+            self._split_spec_cell(L, BOT + h_ac + rgap, spec_w, h_top)
             self.ax_trace.set_position([right_x, BOT + h_ac + rgap, right_w, h_top])
             self.ax_ac.set_position([L, BOT, R - L, h_ac])
             # Only the top row is split — the autocorrelation spans both columns.
@@ -3457,7 +3532,8 @@ class FrogCanvas(FigureCanvasQTAgg):
         # to work on either background, and re-theming them would cost the
         # colourblind separation that is the whole point. Same for the two
         # DIFF_COLORS curves; their zero reference is a plain rule, so it does
-        # follow the theme.
+        # follow the theme. The ghost fills are drawn in DIFF_COLORS too, so
+        # they need no re-colouring either.
         self.diff_zero.set_color(pal["text_dim"])
         self._style()   # re-applies axes/tick/label/grid colors from PALETTE
         self._apply_cmap()   # masked pixels must follow the new background
@@ -3528,11 +3604,9 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.ax_spec.draw_artist(self.line_spec)
             self.ax_spec.draw_artist(self.line_m1)
             self.ax_spec.draw_artist(self.line_m2)
-            # The alignment differences are animated too, so the restore above
-            # wiped them out of the buffer — every live frame has to put them
-            # back or they would flicker away under the feed.
-            self.ax_spec.draw_artist(self.line_d1)
-            self.ax_spec.draw_artist(self.line_d2)
+            # The alignment differences are NOT drawn here — they live on their
+            # own panel now, are not animated, and are already in the cached
+            # background this path restored.
             # Only the spectrum panel changed, so that is all Qt has to repaint:
             # restore_region above left the trace/AC regions of the buffer byte
             # for byte identical to what is already on screen. matplotlib's Qt
@@ -3603,7 +3677,7 @@ class FrogCanvas(FigureCanvasQTAgg):
                 min(max(event.y, bb.y0), bb.y1))
 
     def _on_press(self, event):
-        axes = (self.ax_spec, self.ax_trace, self.ax_ac)
+        axes = (self.ax_spec, self.ax_trace, self.ax_ac, self.ax_dev)
         if event.button == 3:
             if self._drag_ax is not None:      # right-click aborts a drag
                 self._cancel_drag()
@@ -3671,7 +3745,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         if ax is self.ax_spec:
             self.autoscale_x = False
             self.autoscale_y = False
-            self._xlim_cache = (xlo, xhi)
+            self._pin_xlim((xlo, xhi))
             self._pin_ylim((ylo, yhi))
         elif ax is self.ax_ac:
             self.autoscale_ac_x = False
@@ -3692,6 +3766,13 @@ class FrogCanvas(FigureCanvasQTAgg):
             self._trace_xlim_cache = (xlo, xhi)
             self._trace_ylim_cache = (ylo, yhi)
             self._sync_ac_x()
+        elif ax is self.ax_dev:
+            # Shared wavelength axis: hand the x half to its owner, the
+            # spectrum, exactly as an AC zoom is handed to the trace. The y half
+            # stays here — it is counts of difference, not counts.
+            self.autoscale_x = False
+            self.ax_spec.set_xlim(xlo, xhi)
+            self._pin_xlim((xlo, xhi))
         self.draw_idle()
         self.limits_changed.emit()
 
@@ -3728,7 +3809,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         if not on:
             self.autoscale_x = False           # freeze wherever it sits now
             self.autoscale_y = False
-            self._xlim_cache = self.ax_spec.get_xlim()
+            self._pin_xlim(self.ax_spec.get_xlim())
             self._pin_ylim(self.ax_spec.get_ylim())
             return
         self.fit_xy()                          # fits, but freezes autoscale…
@@ -3782,7 +3863,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.ax_spec.autoscale_view()
         self.autoscale_x = False
         self.autoscale_y = False
-        self._xlim_cache = self.ax_spec.get_xlim()
+        self._pin_xlim(self.ax_spec.get_xlim())
         self._pin_ylim(self.ax_spec.get_ylim())
         self.draw_idle()
 
@@ -3795,7 +3876,7 @@ class FrogCanvas(FigureCanvasQTAgg):
     def set_xlim(self, xmin, xmax):
         if xmin < xmax:
             self.ax_spec.set_xlim(xmin, xmax)
-            self._xlim_cache = (xmin, xmax)
+            self._pin_xlim((xmin, xmax))
             self.draw_idle()
 
     # ── FROG trace: manual bounds and colour ──────────────────────────────
@@ -3968,38 +4049,117 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_spec.set_data([], [])
         self._request_full()
 
-    def show_diff(self, wl, d1, d2):
-        """Overlay the two alignment symmetry differences on the spectrum.
+    # ── Alignment mode: the deviation panel ───────────────────────────────
+    def set_dev_visible(self, on):
+        """Open or close the deviation panel under the spectrum.
 
-        Untouched by every other spectrum path, so the live feed keeps drawing
-        underneath: the curves stay until clear_diff().
+        Opening it takes room from the spectrum, so the whole figure is laid
+        out again — and the spectrum hands over its wavelength ticks, which is
+        a decoration change, hence both calls.
         """
+        on = bool(on)
+        if on == self._dev_on:
+            return
+        self._dev_on = on
+        self.ax_dev.set_visible(on)
+        if on:
+            # Adopt the spectrum's wavelength range NOW. The panel is stacked
+            # flush under it sharing that axis, and nothing else would sync it
+            # until the next thing to move the spectrum's x — which, with
+            # auto-scale x frozen, might be never.
+            self._sync_dev_x()
+        self._apply_mode_decorations()
+        self._layout_axes()          # ends in draw_idle()
+
+    def dev_visible(self):
+        return self._dev_on
+
+    def _clear_ghosts(self):
+        for g in self._ghosts:
+            g.remove()
+        self._ghosts = []
+        self._ghost_y = ()      # …and what the auto-scale knew about them
+
+    def show_diff(self, wl, d1, d2):
+        """Draw one alignment sweep's two symmetry differences.
+
+        Whatever was on the panel becomes a semi-transparent area under the new
+        curves first, so a refresh reads as "this against the last one" — which
+        is the whole question a sweep is run to answer. Exactly ONE generation
+        is kept: the comparison that matters is with the state before the last
+        adjustment, and a pile of older fills would just darken the panel.
+
+        Fills are removed and rebuilt rather than updated, because fill_between
+        returns a collection with no set_data. A sweep is four stage moves, so
+        the allocation is free next to what produced the data.
+        """
+        self._clear_ghosts()
+        if self._prev_diff is not None:
+            pwl, pd1, pd2 = self._prev_diff
+            for prev, color in ((pd1, DIFF_COLORS[0]), (pd2, DIFF_COLORS[1])):
+                self._ghosts.append(self.ax_dev.fill_between(
+                    pwl, 0.0, prev, color=color, alpha=0.18, linewidth=0,
+                    zorder=1))
+            # Recorded separately from _prev_diff, which is about to become the
+            # sweep being drawn NOW: the auto-scale needs what is on the panel,
+            # and after the line below _prev_diff no longer describes the ghost.
+            self._ghost_y = (pd1, pd2)
+        self._prev_diff = (np.asarray(wl, float).copy(),
+                           np.asarray(d1, float).copy(),
+                           np.asarray(d2, float).copy())
         self.line_d1.set_data(wl, d1)
         self.line_d2.set_data(wl, d2)
         self.line_d1.set_visible(True)
         self.line_d2.set_visible(True)
         self.diff_zero.set_visible(True)
-        # A difference dips below zero, so the y range almost always has to
-        # move; and diff_zero is a static artist that has to be baked into the
-        # blit backgrounds either way. Autoscale first so one full draw covers
-        # both — _autoscale_y reads the visible lines, which now include these.
-        if self.autoscale_y:
-            self._autoscale_y()
+        self._sync_dev_x()
+        self._autoscale_dev()
         self._request_full()
 
+    def _autoscale_dev(self):
+        """Fit the deviation panel to its curves AND the ghost under them.
+
+        Derived from the DATA on every call, never from the view it is about to
+        replace. set_ylim() switches matplotlib's own y auto-scale off, which
+        makes a later autoscale_view() a silent no-op — so reading get_ylim()
+        back as a starting point fed each refresh the PREVIOUS refresh's
+        already-padded limits, and the panel ratcheted wider every sweep
+        however small the new deviation was.
+
+        The ghost has to be folded in by hand either way: relim() only looks at
+        lines, and the previous sweep is a filled collection.
+        """
+        series = [np.asarray(ln.get_ydata(), float)
+                  for ln in (self.line_d1, self.line_d2) if ln.get_visible()]
+        series.extend(self._ghost_y)       # the shaded previous sweep, if any
+        vals = [s for s in series if s.size and np.any(np.isfinite(s))]
+        if not vals:
+            return
+        lo = min(float(np.nanmin(s)) for s in vals)
+        hi = max(float(np.nanmax(s)) for s in vals)
+        # Zero is the reference the whole panel is read against, so it is always
+        # in view even when both sweeps sit to one side of it.
+        lo, hi = min(lo, 0.0), max(hi, 0.0)
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            return
+        if hi <= lo:                     # an all-zero difference: show a band
+            lo, hi = lo - 1.0, hi + 1.0
+        pad = 0.05 * (hi - lo)
+        self.ax_dev.set_ylim(lo - pad, hi + pad)
+
     def clear_diff(self):
-        """Take the alignment differences off the spectrum panel.
+        """Empty the deviation panel — both curves and the remembered sweep.
 
         Data cleared as well as hidden, for the reason in _set_spec_mode: a
         hidden line still holding a frame keeps driving relim().
         """
+        self._clear_ghosts()
+        self._prev_diff = None
         self.line_d1.set_data([], [])
         self.line_d2.set_data([], [])
         self.line_d1.set_visible(False)
         self.line_d2.set_visible(False)
         self.diff_zero.set_visible(False)
-        if self.autoscale_y:
-            self._autoscale_y()
         self._request_full()
 
     def diff_visible(self):
@@ -4030,7 +4190,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         if self.autoscale_x:
             xl = (float(wl[0]), float(wl[-1]))
             if xl != self._xlim_cache:
-                self.ax_spec.set_xlim(*xl); self._xlim_cache = xl; changed = True
+                self.ax_spec.set_xlim(*xl); self._pin_xlim(xl); changed = True
         if self.autoscale_y:
             changed |= self._autoscale_y()
         if changed:
@@ -4183,7 +4343,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         if self.autoscale_x:
             xl = (float(min(wl1[0], wl2[0])), float(max(wl1[-1], wl2[-1])))
             if xl != self._xlim_cache:
-                self.ax_spec.set_xlim(*xl); self._xlim_cache = xl; changed = True
+                self.ax_spec.set_xlim(*xl); self._pin_xlim(xl); changed = True
         if self.autoscale_y:
             changed |= self._autoscale_y()
         if changed:
@@ -4777,8 +4937,7 @@ class FrogWindow(QMainWindow):
             # Same for both halves of alignment mode: a difference and a raw
             # trace describe the device that measured them, right down to the
             # pixel grid they sit on.
-            self._uncheck_align_spec()
-            self.canvas.clear_diff()
+            self._close_align_mode()
             self._clear_align_trace()
             self.chk_dark.setChecked(False); self.chk_dark.setEnabled(False)
             self.last_spectrum = None
@@ -5145,8 +5304,8 @@ class FrogWindow(QMainWindow):
         self.btn_overlay.hide()
         self.btn_overlay.toggled.connect(self._on_overlay_toggled)
 
-        # Alignment mode, spectrum side: step to +/-x and +/-2x and overlay the
-        # two differences.
+        # Alignment mode, spectrum side: opens the deviation panel under the
+        # spectrum, steps to +/-x and +/-2x, and plots the two differences there.
         self.btn_align_spec = QPushButton(self.canvas)
         self.btn_align_spec.setObjectName("overlay")
         self.btn_align_spec.setCheckable(True)
@@ -5154,12 +5313,30 @@ class FrogWindow(QMainWindow):
         self.btn_align_spec.setIconSize(QSize(HDR_ICON, HDR_ICON))
         self._refresh_align_button()
         self.btn_align_spec.setToolTip(
-            "Alignment mode — measure at −2x, −x, +x, +2x (Alignment → "
-            "Alignment step) and overlay S(+x)−S(−x) and S(+2x)−S(−2x).\nA "
-            "symmetric pulse gives two flat curves on zero. Press again to "
-            "clear.")
+            "Alignment mode — opens a deviation panel under the spectrum, then "
+            "measures at −2x, −x, +x, +2x (Alignment → Alignment step) and "
+            "plots S(+x)−S(−x) and S(+2x)−S(−2x) in it.\nA symmetric pulse "
+            "gives two flat curves on zero. Use ⟳ to re-measure after an "
+            "adjustment — the previous sweep stays as a shaded area to compare "
+            "against.\nPress again to close the panel.")
         self.btn_align_spec.show()
         self.btn_align_spec.toggled.connect(self._on_align_spec_toggled)
+
+        # Re-run the sweep without leaving the mode. Only meaningful while the
+        # panel is open, so it lives and dies with it — and the comparison it
+        # makes possible (this sweep against the last) is the reason the panel
+        # keeps a ghost at all.
+        self.btn_align_refresh = QPushButton(self.canvas)
+        self.btn_align_refresh.setObjectName("overlay")
+        self.btn_align_refresh.setFixedSize(HDR_BTN, HDR_BTN)
+        self.btn_align_refresh.setIconSize(QSize(HDR_ICON, HDR_ICON))
+        self._refresh_align_refresh_icon()
+        self.btn_align_refresh.setToolTip(
+            "Re-run the alignment sweep. The sweep now on the panel is kept as "
+            "a shaded area underneath, so you can see whether the last "
+            "adjustment made the deviation better or worse.")
+        self.btn_align_refresh.hide()
+        self.btn_align_refresh.clicked.connect(self._start_align_sweep)
 
         # Alignment mode, trace side — the trace panel's own header.
         # Wider than the rest: it is the one button still carrying a word.
@@ -6612,23 +6789,59 @@ class FrogWindow(QMainWindow):
         self.btn_align_spec.setChecked(False)
         self.btn_align_spec.blockSignals(False)
 
+    def _close_align_mode(self):
+        """Leave alignment mode: panel closed, curves dropped, button out.
+
+        The one way out, so every caller that has to abandon the mode — the
+        toggle, a device swap, the start of a scan — leaves the same state
+        behind. Silent about signals: _uncheck_align_spec blocks them, so this
+        never re-enters the toggle handler that may have called it.
+        """
+        self._uncheck_align_spec()
+        self.btn_align_refresh.hide()
+        self.canvas.clear_diff()
+        self.canvas.set_dev_visible(False)
+        self._position_panel_buttons()   # the header row just lost a button
+
     def _on_align_spec_toggled(self, on):
+        """Open or close alignment mode.
+
+        Opening it puts the deviation panel on screen and runs the first sweep;
+        the ⟳ button then re-runs it in place, so judging an adjustment no
+        longer means toggling the mode off and on (which threw away the
+        measurement you wanted to compare against).
+        """
         if not on:
-            self.canvas.clear_diff()
-            self.status.showMessage("Alignment differences cleared.", 2500)
+            self._close_align_mode()
+            self.status.showMessage("Alignment mode off.", 2500)
             return
+        if not self._start_align_sweep():
+            self._uncheck_align_spec()
+            return
+        self.canvas.set_dev_visible(True)
+        self.btn_align_refresh.show()
+        self._position_panel_buttons()
+
+    def _start_align_sweep(self):
+        """Run one alignment sweep. False if it could not be started — the
+        caller that was also opening the mode then does not open it.
+
+        Every refusal below leaves the hardware exactly as it found it; the
+        feed, which has to be handed over before the worker can drive the
+        devices, is the only thing with any unwinding to do.
+        """
         if self._align_running():
-            self._uncheck_align_spec(); return
+            return False
         if self._scan_running():
             self.status.showMessage("A scan is running — the stage is busy.", 3000)
-            self._uncheck_align_spec(); return
+            return False
         if self.spec is None or self.stage is None:
             self.status.showMessage("Connect a stage and a spectrometer first.", 4000)
-            self._uncheck_align_spec(); return
+            return False
         if getattr(self.stage, "needs_homing", False):
             self.status.showMessage(
                 "Stage is not homed — press Home before an alignment sweep.", 6000)
-            self._uncheck_align_spec(); return
+            return False
 
         # Same handover contract as _start_scan: the worker drives the stage
         # and the spectrometer for the whole sweep, so the feed has to let go
@@ -6639,7 +6852,7 @@ class FrogWindow(QMainWindow):
             if self._feed_was_on:
                 self._feed.resume()
             self.status.showMessage(f"Alignment not started — {FEED_BUSY_MSG}", 6000)
-            self._uncheck_align_spec(); return
+            return False
 
         # Only now is it safe to read the stage from this thread — the feed is
         # parked, so nothing else is talking to it. Checked BEFORE moving:
@@ -6653,7 +6866,7 @@ class FrogWindow(QMainWindow):
             if self._feed_was_on:
                 self._feed.resume()
             self.status.showMessage(f"Alignment failed — stage: {e}", 5000)
-            self._uncheck_align_spec(); return
+            return False
         span_um = abs(float(delay_to_position_um(2.0 * step, 0.0, pf)))
         lo, hi = self._travel_range_um()
         if start_um - span_um < lo or start_um + span_um > hi:
@@ -6663,12 +6876,13 @@ class FrogWindow(QMainWindow):
                 f"±2×{step:.0f} fs (±{span_um:.1f} um) from here leaves the "
                 f"travel range [{lo:.1f}, {hi:.1f}] um — move away from the "
                 f"limit or reduce the Alignment Step.", 7000)
-            self._uncheck_align_spec(); return
+            return False
 
         self._set_hardware_buttons_enabled(False)
         self.btn_scan.setEnabled(False)
         self._set_stage_controls_enabled(False)
         self.btn_align_spec.setEnabled(False)
+        self.btn_align_refresh.setEnabled(False)
         self._moving(True)
 
         self._align_worker = AlignmentWorker(self.stage, self.spec,
@@ -6680,6 +6894,7 @@ class FrogWindow(QMainWindow):
         self.status.showMessage(
             f"Alignment sweep: −{2 * step:.0f}, −{step:.0f}, "
             f"+{step:.0f}, +{2 * step:.0f} fs…", 0)
+        return True
 
     def _on_align_progress(self, done, total):
         self.status.showMessage(f"Alignment sweep: point {done}/{total}…", 0)
@@ -6697,8 +6912,11 @@ class FrogWindow(QMainWindow):
             d1 = s[2] - s[1]        # S(+x)  - S(-x)
             d2 = s[3] - s[0]        # S(+2x) - S(-2x)
         except Exception as e:
+            # The MODE stays open: the panel is still the right place to look,
+            # the previous sweep (if any) is still on it, and ⟳ is how you try
+            # again. Closing it here would throw away the comparison the
+            # operator was in the middle of making.
             self.status.showMessage(f"Alignment differences failed: {e}", 5000)
-            self._uncheck_align_spec()
             return
         self.canvas.show_diff(wl, d1, d2)
         step = float(self.spin_align_step.value())
@@ -6713,8 +6931,9 @@ class FrogWindow(QMainWindow):
             f"{100 * r2:.1f}% at ±{2 * step:.0f} fs.", 8000)
 
     def _on_align_error(self, msg):
+        # Mode left open, for the reason in _on_align_done: a sweep that failed
+        # is a reason to fix something and press ⟳, not to lose the panel.
         self._reset_align_ui()
-        self._uncheck_align_spec()
         self.status.showMessage(f"Alignment sweep failed: {msg}", 6000)
 
     def _reset_align_ui(self):
@@ -6724,6 +6943,7 @@ class FrogWindow(QMainWindow):
         self.btn_scan.setEnabled(True)
         self._set_stage_controls_enabled(True)
         self.btn_align_spec.setEnabled(True)
+        self.btn_align_refresh.setEnabled(True)
         self._refresh_positions()
         if self._feed_was_on:
             self._feed.resume()
@@ -6772,6 +6992,81 @@ class FrogWindow(QMainWindow):
         # floating in it. It is laid out only here — it has no parent layout to
         # do that for it.
         self.pnl_no_spec.setGeometry(c.panel_rect_px(c.ax_spec))
+
+    def _refresh_autofit_icon(self):
+        """Per-theme mark on the one-shot auto-fit button, with the text
+        fallback it used to carry if the icons are missing from the bundle."""
+        icon = RESCALE_ICON[self._theme]
+        if icon.exists():
+            self.btn_autofit.setIcon(QIcon(str(icon)))
+            self.btn_autofit.setText("")
+        else:
+            self.btn_autofit.setIcon(QIcon())
+            self.btn_autofit.setText("↔↕")
+
+    def _refresh_autoscale_icon(self):
+        """Padlock matching the axis' CURRENT state — open while it follows the
+        data, shut while it is frozen. Per theme, and re-read on every state
+        change, so this is called from _refresh_autoscale_button rather than
+        only from the theme switch."""
+        on = bool(self.canvas.autoscale_y)
+        icon = (UNLOCKED_ICON if on else LOCKED_ICON)[self._theme]
+        if icon.exists():
+            self.btn_autoscale.setIcon(QIcon(str(icon)))
+            self.btn_autoscale.setText("")
+        else:
+            self.btn_autoscale.setIcon(QIcon())
+            self.btn_autoscale.setText("🔓" if on else "🔒")
+
+    def _refresh_logscale_button(self):
+        """Label and tooltip of the log/linear toggle. Reads the checkbox, not
+        the axes: chk_log is the single source of truth for the scale."""
+        on = self.dlg_graphics.chk_log.isChecked()
+        self.btn_logscale.setText("log" if on else "lin")
+        self.btn_logscale.setToolTip(
+            "Spectrum Y axis is LOGARITHMIC — click for linear." if on else
+            "Spectrum Y axis is LINEAR — click for logarithmic.")
+
+    def _on_autoscale_clicked(self):
+        """Toggle the spectrum panel's auto-scale.
+
+        Routed through the canvas' own reset_axes rather than set_autoscale_y:
+        that is exactly what a right-click on the panel does, so the button and
+        the right-click cannot end up meaning different things. It emits
+        limits_changed on the way out, which is what puts the button's own
+        checked state back in agreement with the canvas — including when the
+        canvas refuses to move.
+        """
+        self.canvas.reset_axes(self.canvas.ax_spec)
+
+    def _refresh_autoscale_button(self):
+        """Show the canvas' auto-scale state on the header toggle.
+
+        Signals blocked: this is called FROM limits_changed, which reset_axes
+        emits, so letting the setChecked re-enter the click handler would
+        toggle the mode straight back off again.
+        """
+        on = bool(self.canvas.autoscale_y)
+        with QSignalBlocker(self.btn_autoscale):
+            self.btn_autoscale.setChecked(on)
+        self._refresh_autoscale_icon()   # the padlock IS the state readout
+        self.btn_autoscale.setToolTip(
+            ("Y axis UNLOCKED — the spectrum's Y axis follows the live signal.\n"
+             "Click to lock it where it is."
+             if on else
+             "Y axis LOCKED — the spectrum's Y axis stays where it is.\n"
+             "Click to unlock it: fit the data, then follow it.")
+            + "\n" + RIGHT_CLICK_HINT)
+
+    def _refresh_align_refresh_icon(self):
+        """Per-theme mark on the re-run button, with the usual text fallback."""
+        icon = REFRESH_ICON[self._theme]
+        if icon.exists():
+            self.btn_align_refresh.setIcon(QIcon(str(icon)))
+            self.btn_align_refresh.setText("")
+        else:
+            self.btn_align_refresh.setIcon(QIcon())
+            self.btn_align_refresh.setText("⟳")
 
     def _refresh_align_button(self):
         """Per-theme crosshair on the alignment-sweep toggle.
@@ -7615,10 +7910,9 @@ class FrogWindow(QMainWindow):
         self.canvas.init_trace(delays, wl)
         self._reset_saturation(); self.progress.setValue(0)
         # A difference measured at the old position says nothing about the
-        # scan that is starting, and the scan owns the spectrum panel now.
-        if self.canvas.diff_visible():
-            self._uncheck_align_spec()
-            self.canvas.clear_diff()
+        # scan that is starting, and the scan owns the stage the sweep needs.
+        if self.btn_align_spec.isChecked() or self.canvas.dev_visible():
+            self._close_align_mode()
 
         self.btn_scan.setObjectName("danger"); self.btn_scan.setText("Abort Scan")
         self.btn_scan.style().unpolish(self.btn_scan); self.btn_scan.style().polish(self.btn_scan)
