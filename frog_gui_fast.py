@@ -2902,6 +2902,76 @@ _TITLE_INSET_IN  = (0.08, 0.06)   # (right, down) from the axes' top-left corner
 # the other Qt chrome constants — _glyph_icon needs HDR_ICON at import time.
 
 
+class AxisBoundEditor(QLineEdit):
+    """The box that appears over an axis' end tick label when it is clicked.
+
+    A Qt child of the canvas rather than a dialog: the value being changed is
+    the number under the cursor, and a modal box for one float would put a
+    title bar and two buttons in front of the plot it is about. Same reasoning
+    as the rubber band and the split handle — it composites above the canvas
+    and never lands in the cached blit background.
+
+    Commits on Return and cancels on Escape or on losing focus. Cancelling on
+    focus-out (rather than committing) is deliberate: clicking away from a
+    half-typed number is how you abandon it, and the axis limits are not
+    somewhere a stray keystroke should be able to land unnoticed.
+    """
+    PAD = 10          # logical px of slack around the tick label's own width
+    MIN_W = 56
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self._canvas = canvas
+        self._target = None       # (ax, "x"|"y", "lo"|"hi") while open
+        self.setAlignment(Qt.AlignCenter)
+        self.hide()
+        self.returnPressed.connect(self._commit)
+        self.editingFinished.connect(self.cancel)
+
+    def open_on(self, ax, which, end, value, rect):
+        """Start editing `end` of `ax`'s `which` axis, over the tick label at
+        `rect` (canvas-widget pixels)."""
+        self._target = (ax, which, end)
+        # %g, not the tick's own label: the label is rounded for display, and
+        # seeding the box with a rounded number makes "just nudge the max"
+        # silently move the bound the operator did not mean to touch.
+        self.setText(f"{value:g}")
+        w = max(rect.width() + self.PAD, self.MIN_W)
+        self.setGeometry(rect.center().x() - w // 2, rect.top() - 2,
+                         w, rect.height() + 6)
+        self.show()
+        self.raise_()
+        self.setFocus(Qt.OtherFocusReason)
+        self.selectAll()
+
+    def cancel(self):
+        self._target = None
+        self.hide()
+
+    def _commit(self):
+        if self._target is None:
+            return                      # Return after a cancel; nothing to do
+        ax, which, end = self._target
+        text = self.text().strip()
+        # Clear the target BEFORE applying: apply_axis_bound redraws, which can
+        # pull focus and re-enter through editingFinished -> cancel().
+        self._target = None
+        self.hide()
+        try:
+            value = float(text)
+        except ValueError:
+            self._canvas.axis_edit_failed.emit(
+                f"{text!r} is not a number — axis unchanged.")
+            return
+        self._canvas.apply_axis_bound(ax, which, end, value)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.cancel()
+            return
+        super().keyPressEvent(event)
+
+
 class PlotSplitHandle(QWidget):
     """The divider between the spectrum and the panel(s) beside it: a separator
     line down the shared height, with a draggable grip at its middle — the
@@ -2995,6 +3065,7 @@ class FrogCanvas(FigureCanvasQTAgg):
     axes_relaid = Signal()           # axes repositioned → overlay buttons follow
     fold_dragged = Signal(float)     # symmetry fold line moved to this delay
     fold_reset_requested = Signal()  # double-click on it → back to the AC peak
+    axis_edit_failed = Signal(str)   # typed axis bound rejected → status bar
 
     def __init__(self):
         self.fig = Figure(facecolor=PALETTE["plot_bg"])
@@ -3154,6 +3225,9 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._drag_start = None      # (x, y) in mpl display coords
         self._fold_drag = False      # dragging the symmetry fold line
         self._rubber = QRubberBand(QRubberBand.Rectangle, self)
+        # Click an end tick label to type a bound. Created here so _on_press can
+        # reach it from the first click.
+        self._axis_editor = AxisBoundEditor(self)
         self.mpl_connect('button_press_event', self._on_press)
         self.mpl_connect('motion_notify_event', self._on_motion)
         self.mpl_connect('button_release_event', self._on_release)
@@ -3358,6 +3432,11 @@ class FrogCanvas(FigureCanvasQTAgg):
         # The gap's centre line, over the rows the two sides actually share.
         self._split_band = (right_x - cgap / 2.0, split_bot, TOP)
         self._position_split_handle()
+        # An open bound editor is pinned to a tick label that has just moved,
+        # and there is nothing sensible to re-pin it to — the ticks themselves
+        # are about to be regenerated. Drop it rather than leave it floating.
+        if getattr(self, "_axis_editor", None) is not None:
+            self._axis_editor.cancel()
         # Everything moved, so both cached backgrounds describe the old geometry.
         self._bg = None
         self._bg_static = None
@@ -3489,15 +3568,20 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._layout_axes()      # ends in draw_idle()
 
     def _sync_ac_x(self):
-        """Horizontal mode: the FROG trace owns the shared delay axis and the
-        autocorrelation mirrors it. Returns True if the AC view moved.
+        """The FROG trace owns the delay axis; the autocorrelation mirrors it.
+        Returns True if the AC view moved.
+
+        In BOTH layout modes, not just the one where the two panels are
+        stacked. They plot the same quantity over the same scan either way, so
+        a delay that means one thing on the trace and another on the AC below
+        it is never what is wanted — it just happened to be invisible while
+        both were independently autoscaling to the same scan range. Making it
+        explicit is what lets a delay bound be typed into either panel's axis
+        and land on both.
 
         Deliberately does NOT touch autoscale_ac_x: the flag keeps whatever the
-        user left it on, so switching back to vertical resumes independent AC
-        autoscaling with no bookkeeping. No-op in vertical mode.
+        user left it on, and _set_ac_autoscale still consults it.
         """
-        if self._layout_mode != "horizontal":
-            return False
         xl = self.ax_trace.get_xlim()
         if xl == self._ac_xlim_cache:
             return False
@@ -3663,6 +3747,101 @@ class FrogCanvas(FigureCanvasQTAgg):
         bb = self.ax_spec.get_window_extent()
         return event.x < bb.x0 and bb.y0 <= event.y <= bb.y1
 
+    # ── Click-to-edit axis bounds ─────────────────────────────────────────
+    # Which axis ends can be typed into, and what each one writes through to.
+    # The spectrum's Y is deliberately absent: its tick-label strip is the log
+    # toggle (see _hit_spec_yaxis), and one strip cannot mean two things.
+    # The AC's delay ends ARE editable and land on the TRACE, which owns that
+    # axis — in horizontal mode the trace's own delay ticks are hidden, so the
+    # AC's are the only ones there are to click.
+    _AXIS_EDIT_PAD = 3      # px of slack around a tick label's ink
+
+    def _editable_axes(self):
+        """(axes, which) pairs whose end tick labels open an editor.
+
+        The deviation panel's wavelength ends are in here for the same reason
+        the AC's delay ends are: while it is open the spectrum's own ticks are
+        hidden, so these are the only wavelength numbers on screen.
+        """
+        return ((self.ax_spec, "x"), (self.ax_dev, "x"),
+                (self.ax_trace, "x"), (self.ax_trace, "y"),
+                (self.ax_ac, "x"))
+
+    def _end_tick_labels(self, ax, which):
+        """The lowest and highest tick labels actually on `ax`'s `which` axis.
+
+        Filtered to ticks inside the view: matplotlib keeps locator-generated
+        labels for positions just outside the limits, and those draw nothing
+        but would still take the click.
+        """
+        axis = ax.xaxis if which == "x" else ax.yaxis
+        lo, hi = ax.get_xlim() if which == "x" else ax.get_ylim()
+        lo, hi = min(lo, hi), max(lo, hi)
+        inside = [t for t in axis.get_ticklabels()
+                  if t.get_visible() and t.get_text()
+                  and lo <= (t.get_position()[0] if which == "x"
+                             else t.get_position()[1]) <= hi]
+        return (inside[0], inside[-1]) if len(inside) >= 2 else ()
+
+    def _hit_axis_end(self, event):
+        """(ax, which, end, QRect) for the end tick label under the cursor, or
+        None. Needs a renderer, so it declines until the first draw."""
+        if self._renderer is None:
+            return None
+        pad = self._AXIS_EDIT_PAD
+        for ax, which in self._editable_axes():
+            if not ax.get_visible():
+                continue
+            labels = self._end_tick_labels(ax, which)
+            for end, label in zip(("lo", "hi"), labels):
+                try:
+                    bb = label.get_window_extent(self._renderer)
+                except (ValueError, RuntimeError):
+                    continue            # nothing drawn for this tick
+                if (bb.x0 - pad <= event.x <= bb.x1 + pad
+                        and bb.y0 - pad <= event.y <= bb.y1 + pad):
+                    tl = self._disp_to_qt(bb.x0, bb.y1)
+                    br = self._disp_to_qt(bb.x1, bb.y0)
+                    return ax, which, end, QRect(tl, br).normalized()
+        return None
+
+    def _open_axis_editor(self, hit):
+        ax, which, end, rect = hit
+        lo, hi = ax.get_xlim() if which == "x" else ax.get_ylim()
+        self._axis_editor.open_on(ax, which, end,
+                                  lo if end == "lo" else hi, rect)
+
+    def apply_axis_bound(self, ax, which, end, value):
+        """Write one typed axis bound through the ordinary limit setters.
+
+        Goes through set_xlim/set_trace_xlim/set_trace_ylim rather than touching
+        the axes directly, so the limit caches the blit paths read stay in step.
+        A typed bound is a MANUAL bound, so the matching auto-scale is switched
+        off the same way a rubber-band zoom switches it off — otherwise the next
+        frame would snap the view straight back off the number just entered.
+        """
+        if ax is self.ax_ac and which == "x":
+            ax, which = self.ax_trace, "x"      # the trace owns the delay axis
+        elif ax is self.ax_dev and which == "x":
+            ax, which = self.ax_spec, "x"       # …and the spectrum the wavelength
+        lo, hi = ax.get_xlim() if which == "x" else ax.get_ylim()
+        lo, hi = (value, hi) if end == "lo" else (lo, value)
+        if not (np.isfinite(lo) and np.isfinite(hi)) or lo >= hi:
+            self.axis_edit_failed.emit(
+                f"{value:g} would leave the axis inverted or empty — "
+                f"axis unchanged.")
+            return
+        if ax is self.ax_spec:
+            self.autoscale_x = False
+            self.set_xlim(lo, hi)
+        elif which == "x":
+            self.autoscale_trace = False
+            self.set_trace_xlim(lo, hi)
+        else:
+            self.autoscale_trace = False
+            self.set_trace_ylim(lo, hi)
+        self.limits_changed.emit()
+
     def _cancel_drag(self):
         self._rubber.hide()
         self._drag_ax = None
@@ -3698,8 +3877,16 @@ class FrogCanvas(FigureCanvasQTAgg):
         if event.inaxes in axes:
             self._drag_ax = event.inaxes
             self._drag_start = (event.x, event.y)
-        elif event.inaxes is None and self._hit_spec_yaxis(event):
-            self.log_toggle_requested.emit()
+        elif event.inaxes is None:
+            # Outside every panel: the margins. An end tick label gets first
+            # refusal — it is a specific few pixels, while the log toggle is
+            # the whole y strip, so testing the strip first would swallow the
+            # spectrum's own end labels where the two overlap.
+            hit = self._hit_axis_end(event)
+            if hit is not None:
+                self._open_axis_editor(hit)
+            elif self._hit_spec_yaxis(event):
+                self.log_toggle_requested.emit()
 
     def _on_motion(self, event):
         if self._fold_drag:
@@ -3752,12 +3939,12 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.autoscale_ac_y = False
             self._ac_xlim_cache = (xlo, xhi)
             self._ac_ylim_cache = (ylo, yhi)
-            if self._layout_mode == "horizontal":
-                # Shared delay axis: hand the zoom to its owner, the trace, so
-                # both stay registered (and the dialog's trace bounds truthful).
-                self.ax_trace.set_xlim(xlo, xhi)
-                self.autoscale_trace = False
-                self._trace_xlim_cache = (xlo, xhi)
+            # The trace owns the delay axis in BOTH modes now, so hand the zoom
+            # to it either way: both stay registered, the dialog's trace bounds
+            # stay truthful, and the two delay axes cannot come apart.
+            self.ax_trace.set_xlim(xlo, xhi)
+            self.autoscale_trace = False
+            self._trace_xlim_cache = (xlo, xhi)
         elif ax is self.ax_trace:
             # update_trace never touches limits, so nothing to freeze for the
             # rest of this scan — but the NEXT scan's init_trace would snap the
@@ -3796,11 +3983,15 @@ class FrogCanvas(FigureCanvasQTAgg):
         elif ax is self.ax_ac:
             on = not (self.autoscale_ac_x or self.autoscale_ac_y)
             self._set_ac_autoscale(on)
-            if self._layout_mode == "horizontal":
-                # Shared delay axis: the trace owns it, so it has to go the
-                # SAME way rather than toggle off its own flag. (_sync_ac_x in
-                # there then pulls the AC's x back onto the scan range.)
-                self._set_trace_autoscale(on)
+            # Shared delay axis in both modes: the trace owns it, so it has to
+            # go the SAME way rather than toggle off its own flag. (_sync_ac_x
+            # in there then pulls the AC's x back onto the scan range.)
+            self._set_trace_autoscale(on)
+        elif ax is self.ax_dev:
+            # Only ever fits: the panel holds one sweep's worth of data, so
+            # there is nothing continuous here to freeze.
+            self._autoscale_dev()
+            self._sync_dev_x()
         self.draw_idle()
         self.limits_changed.emit()
 
@@ -4310,6 +4501,30 @@ class FrogCanvas(FigureCanvasQTAgg):
             self._ylim_fast   = False    # no move in flight to stay fast for
         self.autoscale_y = on
 
+    def _pin_xlim(self, xl):
+        """Record `xl` as the spectrum's applied x limits and mirror them onto
+        the deviation panel.
+
+        Every path that moves the spectrum's wavelength view goes through here,
+        for the same reason _pin_ylim exists below: the two panels are stacked
+        flush on one wavelength axis, and a bound written straight to
+        _xlim_cache would leave the deviations describing a different stretch of
+        spectrum than the curve directly above them.
+        """
+        self._xlim_cache = tuple(xl)
+        self._sync_dev_x()
+
+    def _sync_dev_x(self):
+        """Point the deviation panel at the spectrum's wavelength range.
+        Returns True if it moved. The spectrum owns the axis; this mirrors it,
+        exactly as _sync_ac_x mirrors the trace's delay axis."""
+        xl = self.ax_spec.get_xlim()
+        if xl == self._dev_xlim_cache:
+            return False
+        self.ax_dev.set_xlim(*xl)
+        self._dev_xlim_cache = xl
+        return True
+
     def _pin_ylim(self, yl):
         """Record `yl` as both the applied limits AND the auto-scale filter's
         state.
@@ -4461,16 +4676,10 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_ac.set_data(delays, shown)
         self._set_half_line(shown)
         self._bg_static = None        # AC line changed
-        changed = False
-        if self._layout_mode == "horizontal":
-            # Shared delay axis: the trace dictates it, so the AC's own x
-            # autoscale sits this one out (its flag is left untouched, and takes
-            # over again the moment the layout goes back to vertical).
-            changed = self._sync_ac_x()
-        elif self.autoscale_ac_x and delays.size > 1:
-            xl = (float(delays[0]), float(delays[-1]))
-            if xl != self._ac_xlim_cache:
-                self.ax_ac.set_xlim(*xl); self._ac_xlim_cache = xl; changed = True
+        # The trace dictates the delay axis in either layout mode, so the AC's
+        # own x autoscale never runs: _sync_ac_x is the single writer, and
+        # init_trace has already pointed the trace at this scan's range.
+        changed = self._sync_ac_x()
         if self.autoscale_ac_y and self._ac_ylim_cache != _AC_YLIM:
             # The normalized curve needs one fixed view, so this fires at most
             # once (after a zoom was reset). The old stepped autoscale existed
