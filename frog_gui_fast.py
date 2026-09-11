@@ -231,6 +231,19 @@ def _make_check_icon(color, tag):
 HDR_BTN = 24
 HDR_GAP = 4
 HDR_PAD = 6
+# Width of a header button carrying a WORD rather than a mark. Sized against
+# the WIDEST plausible rendering, not the expected one: "log" at #overlay[word]'s
+# 13px/600 is ~24px in Segoe UI but measures 39 on a wide fallback face, and a
+# clipped three-letter label is the one failure mode this button cannot absorb.
+# Nothing bounds it from above any more — the group sits after the title, where
+# _position_panel_buttons' clamp handles a narrow panel.
+HDR_LBL = 44
+# Space after a panel title before the buttons that qualify it, and the clear
+# span that separates that group from the right-aligned row. The second is much
+# the larger of the two: it is the only thing telling the eye these are two
+# groups and not one row of eight.
+HDR_TITLE_GAP = 10
+HDR_GROUP_GAP = 28
 # Icon side inside a header button. EVEN, and even after the 1 px border is
 # taken off both sides of HDR_BTN: (24 - 2 - 14) / 2 = 4 exactly, so Qt centres
 # the icon on a whole pixel instead of rounding half a pixel one way.
@@ -315,6 +328,21 @@ QPushButton#overlay {{ border-color:{pal['accent']}; color:{pal['accent']};
     padding:0px; font-size:12px; border-radius:4px; }}
 QPushButton#overlay:hover {{ background-color:{pal['accent']}; color:{pal['bg']}; }}
 QPushButton#overlay:pressed {{ background-color:{pal['accent']}; color:{pal['bg']}; }}
+/* Checked state for the header toggles. NOT the accent fill the hover and
+   pressed rules use: every one of these buttons carries an icon drawn in that
+   same accent, which would disappear into it — an "on" state you can only see
+   by taking the mouse away is no state at all. A raised surface behind a
+   thicker accent border reads as pressed-in while leaving the mark on top. */
+QPushButton#overlay:checked {{ background-color:{pal['border_hover']};
+    border:2px solid {pal['accent']}; }}
+/* A header button whose whole content is a WORD, not a mark. One step up from
+   #overlay's 12px: the icon buttons beside it fill their 24px with a glyph
+   drawn to the edges, and 12px lettering next to those reads as a caption
+   rather than a control. Inherits everything else from #overlay above — Qt
+   applies both rules, this one only overriding what it names. */
+QPushButton#overlay[word="true"] {{ font-size:13px; font-weight:600; }}
+QPushButton#overlay:checked:hover {{ background-color:{pal['accent']};
+    color:{pal['bg']}; }}
 /* The "no spectrometer connected" message centred on an empty spectrum panel.
    Accent, not danger: nothing is wrong, there is simply nothing connected yet
    — and the accent is what carries against the plot background it sits on,
@@ -448,7 +476,11 @@ ICON_ICO_PATH = resource_path("icons", "Lilypad.ico")
 ICON_PATH    = resource_path("icons", "Lilypad.png")   # README / large uses
 SUN_ICON     = resource_path("icons", "sun.png")
 MOON_ICON    = resource_path("icons", "moon.png")
-RESCALE_ICON = resource_path("icons", "rescale.png")
+# One-shot auto-fit, on the spectrum panel's header. An ACTION, and the mark is
+# the same in both files — only the accent differs — so it follows the
+# ALIGN_ICON/STITCH_ICON convention rather than the two-state pairs'.
+RESCALE_ICON = {"dark":  resource_path("icons", "rescale_dark.png"),
+                "light": resource_path("icons", "rescale_light.png")}
 # Spectrum-panel view toggle, keyed by theme (the suffix names the theme each
 # icon was drawn for, not what it depicts). The icons advertise the ACTION:
 # the broken one means "split the pair apart", the continuous one "put it back
@@ -3193,6 +3225,10 @@ class FrogCanvas(FigureCanvasQTAgg):
         # first frame of a scan needs no relimit at all.
         self.ax_ac.set_xlim(-1.0, 1.0)
         self.ax_ac.set_ylim(*_AC_YLIM)
+        # Title artist per axes, recorded by _place_title. The header buttons
+        # that sit AFTER a title have to know how wide that title actually
+        # rendered, and set_title's return value is the only handle on it.
+        self._title_art = {}
         self._style()
 
         self.autoscale_y = False
@@ -3341,6 +3377,10 @@ class FrogCanvas(FigureCanvasQTAgg):
             else (0.0, _TITLE_ABOVE_IN)
         t.set_transform(
             ax.transAxes + ScaledTranslation(dx, dy, self.fig.dpi_scale_trans))
+        # Kept so title_right_px can measure it; the artist is the same object
+        # on every re-call (set_title writes into ax._left_title), so this just
+        # re-records the same handle when the mode decorations re-title a panel.
+        self._title_art[ax] = t
 
     def _apply_mode_decorations(self):
         """Labelling that differs between the two layout modes.
@@ -3475,6 +3515,27 @@ class FrogCanvas(FigureCanvasQTAgg):
         pos = ax.get_position()
         w, h = float(self.width()), float(self.height())
         return pos.x0 * w, (1.0 - pos.y1) * h, pos.x1 * w
+
+    def title_right_px(self, ax):
+        """Right edge of `ax`'s title in canvas widget pixels — where a header
+        button placed AFTER the title has to start.
+
+        Measured, not estimated: the titles differ in length ("Spectrum" vs
+        "Autocorrelation") and the font is a theme/DPI property, so the only
+        honest answer comes from the rendered artist. Falls back to the panel's
+        left edge before the first draw provides a renderer, which packs the
+        buttons over the title for exactly one frame — _on_draw re-runs the
+        layout as soon as there is something to measure with.
+        """
+        t = self._title_art.get(ax)
+        left = self.panel_edges_px(ax)[0]
+        if t is None or self._renderer is None or not t.get_text():
+            return left
+        try:
+            bb = t.get_window_extent(self._renderer)
+        except (ValueError, RuntimeError):
+            return left
+        return max(bb.x1 / self.devicePixelRatioF(), left)
 
     def panel_rect_px(self, ax):
         """`ax` as a QRect in canvas widget pixels — what an overlay widget
@@ -3637,8 +3698,15 @@ class FrogCanvas(FigureCanvasQTAgg):
         # Only a completed draw knows how much of the gap the tick labels took,
         # and only then can the separator be placed clear of both panels. Moving
         # a Qt child cannot recurse back into the figure draw.
+        had_renderer = self._renderer is not None
         self._renderer = getattr(event, "renderer", None) or self._renderer
         self._position_split_handle()
+        # The first renderer is also the first chance to measure a title, which
+        # is what the buttons packed after one are placed against. Re-run that
+        # layout once, here — not on every draw: after this the title's width
+        # only changes with the theme or the DPI, and both already relayout.
+        if not had_renderer and self._renderer is not None:
+            self.axes_relaid.emit()
 
     def _blit(self):
         """Fast path: repaint the animated artists over the cached background.
@@ -3977,7 +4045,14 @@ class FrogCanvas(FigureCanvasQTAgg):
         would snap the view back on the next frame.
         """
         if ax is self.ax_spec:
-            self._set_spec_autoscale(not (self.autoscale_x or self.autoscale_y))
+            # autoscale_y alone decides which way this goes, NOT either flag.
+            # The two are not equals: y is the continuous follow the operator
+            # means by "auto-scale" (and what the header toggle displays),
+            # while x defaults to on and only ever tracks the spectrometer's
+            # wavelength span. Reading `x or y` made the very first right-click
+            # from a fresh start — y off, x on — freeze the panel instead of
+            # turning the follow on, so it took two to do what one says.
+            self._set_spec_autoscale(not self.autoscale_y)
         elif ax is self.ax_trace:
             self._set_trace_autoscale(not self.autoscale_trace)
         elif ax is self.ax_ac:
@@ -5463,17 +5538,56 @@ class FrogWindow(QMainWindow):
         # the window size and the layout mode.
         self.btn_autofit = QPushButton(self.canvas)
         self.btn_autofit.setObjectName("overlay")
-        if RESCALE_ICON.exists():
-            self.btn_autofit.setIcon(QIcon(str(RESCALE_ICON)))
-            self.btn_autofit.setIconSize(QSize(HDR_ICON, HDR_ICON))
-        else:
-            self.btn_autofit.setText("↔↕")
+        self.btn_autofit.setIconSize(QSize(HDR_ICON, HDR_ICON))
+        self._refresh_autofit_icon()
         self.btn_autofit.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_autofit.setToolTip(
             "Auto-fit spectrum X and Y axes to current data.\n"
             + RIGHT_CLICK_HINT)
         self.btn_autofit.show()
         self.btn_autofit.clicked.connect(self._autofit_spectrum)
+
+        # Continuous auto-scale, next to the one-shot fit it complements: that
+        # button fits ONCE, this one says whether the panel goes on following
+        # the data. It is the third way in to the same state — Graphics
+        # Settings' checkbox and a right-click on the panel are the other two —
+        # so it drives reset_axes(), the very function the right-click calls,
+        # rather than a parallel path that could drift out of step with it.
+        # Its own checked state is never set here: _refresh_autoscale_button
+        # reads it back off the canvas, whichever of the three moved it.
+        self.btn_autoscale = QPushButton(self.canvas)
+        self.btn_autoscale.setObjectName("overlay")
+        self.btn_autoscale.setCheckable(True)
+        self.btn_autoscale.setFixedSize(HDR_BTN, HDR_BTN)
+        self.btn_autoscale.setIconSize(QSize(HDR_ICON, HDR_ICON))
+        self._refresh_autoscale_icon()
+        self.btn_autoscale.show()
+        self.btn_autoscale.clicked.connect(self._on_autoscale_clicked)
+
+        # Log/linear, at the top of the y axis it rescales — beside the padlock
+        # that freezes the same axis, so the two controls that decide what the
+        # y axis does sit together on it. The scale was previously reachable
+        # only by knowing to click the tick-label strip (still supported) or by
+        # opening Graphics Settings; neither announces itself.
+        #
+        # The text is the CURRENT scale, matching the padlock beside it rather
+        # than the "icon shows what a click gives you" rule the pair toggles
+        # use. Both of these read as a readout of the axis' state.
+        self.btn_logscale = QPushButton(self.canvas)
+        self.btn_logscale.setObjectName("overlay")
+        # Selects the larger type in build_stylesheet — see #overlay[word].
+        # A dynamic property rather than a second objectName, so the button
+        # still picks up every #overlay rule (hover, pressed, the lot).
+        self.btn_logscale.setProperty("word", "true")
+        self.btn_logscale.setFixedSize(HDR_LBL, HDR_BTN)
+        self.btn_logscale.show()
+        # Through the checkbox, not canvas.set_log_scale: chk_log is the single
+        # source of truth for the scale (it is what gets persisted, and what the
+        # y-strip click already routes through), so driving the canvas directly
+        # would leave the dialog showing the wrong thing.
+        # Lambda, not a direct connect: dlg_graphics is built further down.
+        self.btn_logscale.clicked.connect(
+            lambda: self.dlg_graphics.chk_log.toggle())
 
         # Auto-stitch, in the spectrum header rather than only in the
         # Spectrometer window: it is fitted against what is on the panel right
@@ -5597,6 +5711,20 @@ class FrogWindow(QMainWindow):
         self.canvas.proportions_changed.connect(self.dlg_graphics.sync_proportions)
         self.canvas.fold_dragged.connect(self._on_fold_dragged)
         self.canvas.fold_reset_requested.connect(self._on_fold_reset)
+        self.canvas.axis_edit_failed.connect(
+            lambda msg: self.status.showMessage(msg, 4000))
+        # The auto-scale toggle is an INDICATOR as much as a control, so it has
+        # to follow the state however it was reached: limits_changed covers the
+        # right-click and every zoom, the checkbox covers Graphics Settings.
+        self.canvas.limits_changed.connect(self._refresh_autoscale_button)
+        self.dlg_graphics.chk_auto_y.toggled.connect(self._refresh_autoscale_button)
+        self._refresh_autoscale_button()
+        # Same arrangement for the scale: the checkbox owns it, and everything
+        # that can change it (this button, the y-strip click, the dialog, a
+        # restored setting) goes through chk_log, so one connection keeps the
+        # label honest.
+        self.dlg_graphics.chk_log.toggled.connect(self._refresh_logscale_button)
+        self._refresh_logscale_button()
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -6376,7 +6504,11 @@ class FrogWindow(QMainWindow):
         self._refresh_layout_button()    # …and so are this one's
         self._refresh_feed_button()      # …and its glyph is drawn from PALETTE
         self._refresh_align_button()     # …and it has one file per theme
+        self._refresh_align_refresh_icon()  # …as does its re-run button
+        self._refresh_autofit_icon()     # …and the auto-fit mark
         self._refresh_autostitch_icon()  # …as does this one
+        self._refresh_autoscale_icon()   # …and this one
+        self._size_moving_label()        # its font came from the stylesheet
         self.pnl_no_spec.refresh_theme()  # …and its watermark is tinted live
         self.status.showMessage(f"{name.capitalize()} mode.", 2000)
 
@@ -7168,12 +7300,20 @@ class FrogWindow(QMainWindow):
     # ── Alignment mode: raw stitched trace ───────────────────────────────────
     def _position_panel_buttons(self):
         """Lay out each panel's header row: the buttons that act on that panel,
-        right-aligned to its right edge, on the line the panel title occupies.
+        on the line the panel title occupies.
+
+        Two groups per panel. Most buttons are right-aligned to the panel's
+        right edge. The two that describe the Y AXIS — the auto-scale padlock
+        and the log/linear toggle — are packed immediately AFTER the title
+        instead, so they read as part of that panel's name rather than as two
+        more entries in a row of six; the clear span between the two groups is
+        what separates "what this panel's y axis is doing" from "things you can
+        do to this panel".
 
         Every edge here moves with the split fraction, the window size and the
-        layout mode, so this runs off canvas.axes_relaid — and off the two
-        refresh methods that show or hide a button, because the row is packed
-        right-to-left and its width depends on which buttons are visible.
+        layout mode, so this runs off canvas.axes_relaid — and off the refresh
+        methods that show or hide a button, because each row is packed from its
+        own edge and its width depends on which buttons are visible.
         """
         # getattr, not the attribute: the refresh methods that call this also
         # run from _apply_spectrometer, which the connect paths can reach
@@ -7182,11 +7322,17 @@ class FrogWindow(QMainWindow):
             return
         c = self.canvas
 
-        def pack(ax, buttons):
-            _left, top, right = c.panel_edges_px(ax)
+        def _row_y(top):
             # The band sits ABOVE the axes: HDR_PAD of clear space between the
             # buttons' bottom edge and the top spine.
-            y = round(top) - HDR_PAD - HDR_BTN
+            return round(top) - HDR_PAD - HDR_BTN
+
+        def pack(ax, buttons):
+            """Right-align `buttons` to the panel's right edge. Returns the x of
+            the leftmost one placed, which is where the clear span before it
+            begins."""
+            _left, top, right = c.panel_edges_px(ax)
+            y = _row_y(top)
             x = round(right) - 6
             for b in reversed(buttons):
                 # isHidden, not isVisible: isVisible() is False for every child
@@ -7199,10 +7345,40 @@ class FrogWindow(QMainWindow):
                 x -= b.width()
                 b.move(x, y)
                 x -= HDR_GAP
+            return x + HDR_GAP        # undo the trailing gap
 
-        pack(c.ax_spec, [self.btn_autofit, self.btn_feed, self.btn_autostitch,
-                         self.btn_overlay, self.btn_align_spec])
+        def pack_after_title(ax, buttons, limit):
+            """Lay `buttons` out left to right starting just past the title.
+
+            `limit` is the x the group must not reach — the leftmost button of
+            the right-hand group. On a narrow panel the whole group slides left
+            to respect it, over the title if it has to: a control half off the
+            panel edge, or overlapping a row it does not belong to, is worse
+            than one sitting on its own title for the few pixels it takes.
+            """
+            _left, top, _right = c.panel_edges_px(ax)
+            y = _row_y(top)
+            start = round(c.title_right_px(ax)) + HDR_TITLE_GAP
+            shown = [b for b in buttons if not b.isHidden()]
+            if not shown:
+                return
+            width = sum(b.width() for b in shown) + HDR_GAP * (len(shown) - 1)
+            start = min(start, round(limit) - HDR_GROUP_GAP - width)
+            x = max(start, 0)
+            for b in shown:
+                b.move(x, y)
+                x += b.width() + HDR_GAP
+
+        spec_right = pack(
+            c.ax_spec, [self.btn_autofit, self.btn_feed, self.btn_autostitch,
+                        self.btn_overlay, self.btn_align_spec,
+                        self.btn_align_refresh])
         pack(c.ax_trace, [self.btn_align_trace, self.btn_symmetry])
+        # The y-axis pair, tucked against the title it qualifies. Padlock first:
+        # it is the one that changes what the axis DOES, the scale toggle only
+        # how it is drawn.
+        pack_after_title(c.ax_spec, [self.btn_autoscale, self.btn_logscale],
+                         spec_right)
 
         # The "no spectrometer connected" panel, stretched over the whole
         # spectrum axes so it reads as the empty plot itself rather than a card
