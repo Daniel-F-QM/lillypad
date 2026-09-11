@@ -4376,6 +4376,7 @@ class FrogWindow(QMainWindow):
         self.background_exposures = None
         self._dark_member_warned = False
         self._overlay_on   = False   # spectrum panel showing the members apart
+        self._pair_seen    = False   # a live pair has already had its default
         # Set when an integration time changes under a stitched pair: frames
         # are raw counts, so stitch_factor carries the exposure ratio and goes
         # stale. Surfaced in the Multi-Spec menu rather than silently re-fitted.
@@ -4505,6 +4506,7 @@ class FrogWindow(QMainWindow):
         self._scan_last_i = -1
         self._scan_col    = None
         self._scan_pos_um = 0.0
+        self._scan_members_raw = None  # newest column's raw member frames
         self._display_timer = QTimer(self)
         self._display_timer.setInterval(60)      # ~16 fps display cadence
         self._display_timer.timeout.connect(self._display_tick)
@@ -6060,9 +6062,21 @@ class FrogWindow(QMainWindow):
         """
         stitched = self._pair_live()
         slots = self._slot_members() if stitched else []
-        # One caption over both boxes — S1 on the left, S2 on the right.
-        self.lbl_integration.setText("Integration Time — S1 / S2" if stitched
-                                     else "Integration Time")
+        # One caption over both boxes — S1 on the left, S2 on the right, each
+        # in ITS OWN curve's colour. Two boxes under one caption is the compact
+        # arrangement (see _build_spectrum_group), but it leaves the reader to
+        # infer which box is which device from position alone; matching the
+        # names to the curves on the panel says it outright. Rich text rather
+        # than two labels, so the caption stays one widget on one line.
+        #
+        # MEMBER_COLORS is theme-invariant by design, so this needs no
+        # _apply_theme hook — see the note beside line_m1/line_m2 in
+        # FrogCanvas.apply_palette.
+        self.lbl_integration.setText(
+            (f"Integration Time — "
+             f"<span style='color:{MEMBER_COLORS[0]}'><b>S1</b></span> / "
+             f"<span style='color:{MEMBER_COLORS[1]}'><b>S2</b></span>")
+            if stitched else "Integration Time")
         self.spin_integration2.setVisible(stitched)
         # Second saturation lamp: one alarm per device, so it exists exactly as
         # long as the pair does.
@@ -6075,6 +6089,22 @@ class FrogWindow(QMainWindow):
                     self.btn_overlay.setChecked(False)
             self._overlay_on = False
             self.canvas.clear_members()
+        elif not self._pair_seen:
+            # A pair that has just come up starts UNSTITCHED — one curve per
+            # spectrometer. The combined curve hides the one thing a fresh pair
+            # most needs checking: whether the two halves actually agree across
+            # the overlap. Seeing them apart is what makes a bad stitch factor
+            # or a dark half obvious, and Auto-stitch is judged against it.
+            #
+            # Only on the way IN, hence the latch: this runs on every device
+            # sync, and re-asserting the default there would override the
+            # operator every time anything else about the pair changed.
+            with QSignalBlocker(self.btn_overlay):
+                self.btn_overlay.setChecked(True)
+            self._overlay_on = True
+        # Latch AFTER the branch above, and cleared whenever the pair goes, so
+        # the next one to come up gets the default again.
+        self._pair_seen = len(slots) == 2
         self._sync_integration_ui()
         self._refresh_overlay_button()
         self._refresh_autostitch_button()
@@ -6093,15 +6123,25 @@ class FrogWindow(QMainWindow):
             self.btn_autostitch.setIcon(QIcon())
             self.btn_autostitch.setText("⇌")
 
-    def _refresh_autostitch_button(self):
-        """Show the Auto-stitch header button only while a pair is live.
+    def _refresh_autostitch_button(self, running=None):
+        """Show the Auto-stitch header button only while a pair is live, and
+        enable it only while no scan owns the hardware it would drive.
 
-        Same rule as the overlay toggle beside it: the fit needs two members to
-        match against, and it drives the same hardware a scan owns.
+        `running` overrides the inferred state for the same reason
+        _refresh_symmetry_button takes it: _reset_scan_ui runs from the slot for
+        finished_scan, which the worker emits INSIDE run() — before the finally
+        that parks the stage. Whether the QThread has left run() by the time the
+        GUI thread picks that signal up is a race, and on real hardware (where
+        parking is a stage move measured in seconds) it reliably has not, so
+        _scan_running() reads True and this re-greyed the button immediately
+        after the scan that was over. Nothing refreshed it again, so it stayed
+        dead until a device swap or a theme switch happened along.
         """
+        if running is None:
+            running = self._scan_running()
         self.btn_autostitch.setVisible(self._pair_live()
                                        and len(self._slot_members()) == 2)
-        self.btn_autostitch.setEnabled(not self._scan_running())
+        self.btn_autostitch.setEnabled(not running)
         self.btn_autostitch.setToolTip(
             "Auto-stitch — fit the factor that matches the two spectrometers "
             "across the overlap. Needs light across the overlap region; the "
@@ -6174,7 +6214,10 @@ class FrogWindow(QMainWindow):
         """
         stitched = self._pair_live()
         self.btn_overlay.setVisible(stitched and len(self._slot_members()) == 2)
-        self.btn_overlay.setEnabled(not self._scan_running())
+        # Live through a scan, unlike Auto-stitch beside it: this only chooses
+        # which curves the panel draws, and _render_scan_frame now honours the
+        # choice from the scan's own member frames. Auto-stitch has to stay
+        # disabled — it drives the hardware the worker owns.
         on = self.btn_overlay.isChecked()
         icon = (MERGE_ICON if on else SPLIT_ICON)[self._theme]
         if icon.exists():
@@ -6441,7 +6484,7 @@ class FrogWindow(QMainWindow):
             self._pending_rescale = False
             self._rescale_spectrum()
 
-    def _render_overlay(self):
+    def _render_overlay(self, frames=None):
         """Draw one curve per stitched member. False = nothing to draw yet, so
         the caller falls back to the combined frame.
 
@@ -6450,12 +6493,18 @@ class FrogWindow(QMainWindow):
         one computation rather than two derivations that can drift. Each member
         keeps its NATIVE pixel grid; no interpolation happens here.
 
+        `frames` are the RAW member frames to draw. Passed in by the scan, which
+        holds the pair its worker measured the current column with; the live
+        feed omits it and gets the device's newest pair instead. Same
+        arrangement, and for the same reason, as _corrected_frame's.
+
         Reads self.spec.last_member_raw from the GUI thread without the device
         lock, exactly as _update_saturation does: the tuple assignment is
         atomic, and calibrate() plus the wavelength arrays are pure.
         """
         spec = self.spec
-        frames = getattr(spec, "last_member_raw", None)
+        if frames is None:
+            frames = getattr(spec, "last_member_raw", None)
         slots = self._slot_members()
         if frames is None or len(slots) != 2:
             return False
@@ -7518,6 +7567,7 @@ class FrogWindow(QMainWindow):
         # against the fresh, differently-sized arrays.
         self._scan_dirty  = False
         self._scan_last_i = -1
+        self._scan_members_raw = None   # …and the last scan's member frames
         self._live_frame  = None     # park any leftover live-feed frame too
         self._init_align_trace(wl, delays.size)
         self.canvas.init_trace(delays, wl)
@@ -7546,11 +7596,14 @@ class FrogWindow(QMainWindow):
         # position and leave it there.
         self._worker.finished.connect(self._refresh_positions)
         self._worker.start()
-        # The worker only hands back combined columns, so the panel falls back
-        # to the stitched curve on its own (update_spectrum owns the mode);
-        # grey the toggle out rather than let it look broken for the duration.
+        # Auto-stitch drives the pair the worker now owns, so it greys out for
+        # the duration. The per-spectrometer view does not — the scan carries
+        # its own member frames, and _render_scan_frame draws them.
         self._refresh_overlay_button()
-        self._refresh_autostitch_button()
+        # Explicit, not inferred: this happens to run after _worker.start(), so
+        # _scan_running() would answer True — but that is an ordering accident,
+        # and the same call one line earlier would have greyed nothing.
+        self._refresh_autostitch_button(running=True)
         self.status.showMessage(f"FROG scan: {delays.size} points…", 0)
 
     def _on_progress(self, done, total):
@@ -7568,6 +7621,11 @@ class FrogWindow(QMainWindow):
         # than kept per column and re-derived at render time: that keeps the
         # memory to one trace-sized array and the work to O(n_wl) per column.
         self._store_align_column(i, members_raw)
+        # …but the NEWEST pair is kept as-is, so the per-spectrometer spectrum
+        # view has something to draw while a scan owns the device. One tuple
+        # reference, overwritten per column — the scan's cut and normalisation
+        # above are for the trace and are the wrong thing for this panel.
+        self._scan_members_raw = members_raw
         # Fold the new column into the running reductions the render needs, so
         # _render_scan_frame stays O(1) in the column index. Recomputing either
         # of these from the whole trace per column made the scan cost O(N^2).
@@ -7607,9 +7665,18 @@ class FrogWindow(QMainWindow):
             # n_average frames, so its peak sits below any single frame's and
             # would under-report clipping. Saturation during a scan is reported
             # per-frame by the worker via saturation_warning -> _on_saturation.
+            #
+            # The per-spectrometer view is honoured here exactly as the live
+            # feed honours it: update_spectrum owns the panel mode, so calling
+            # it unconditionally was what dropped a stitched pair back to the
+            # combined curve the moment a measurement started. A column whose
+            # member frames did not arrive falls through to the combined curve
+            # rather than freezing on the last one.
             if self._scan_wl is not None:
-                self.canvas.update_spectrum(self._scan_wl,
-                                            self._scan_col_corrected())
+                if not (self._overlay_on
+                        and self._render_overlay(self._scan_members_raw)):
+                    self.canvas.update_spectrum(self._scan_wl,
+                                                self._scan_col_corrected())
             if self._align_trace_on and self._align_trace is not None:
                 self.canvas.update_trace(self._align_trace_view(), 1.0)
             else:
@@ -7726,7 +7793,9 @@ class FrogWindow(QMainWindow):
         self._set_hardware_buttons_enabled(True)
         self._set_stage_controls_enabled(True)
         self._refresh_overlay_button()
-        self._refresh_autostitch_button()
+        # running=False for the same reason as the symmetry button below: the
+        # worker's thread may not have left run() yet, so neither may infer it.
+        self._refresh_autostitch_button(running=False)
         self._refresh_align_trace_button()
         self._refresh_symmetry_button(running=False)   # a finished scan folds
         if self._feed_was_on and self.btn_feed.isChecked():
