@@ -3157,6 +3157,8 @@ class FrogCanvas(FigureCanvasQTAgg):
         # Continuous y auto-scale filter state — see _autoscale_y / _pin_ylim.
         self._ylim_smooth = None   # where the view is heading, unquantized
         self._ylim_t      = 0.0    # monotonic stamp of the last filter step
+        self._ylim_fast   = False  # latched: contracting onto a real change
+        self._dev_xlim_cache = None           # mirrors _xlim_cache when open
         self._ac_xlim_cache = (-1.0, 1.0)     # the empty-state ranges set above
         self._ac_ylim_cache = _AC_YLIM
         self._trace_xlim_cache = None
@@ -4041,9 +4043,25 @@ class FrogCanvas(FigureCanvasQTAgg):
     # pulls the view back down. The deadband survives on top, now deciding only
     # how coarsely the filtered value is committed (and so how often the
     # expensive redraw is paid for).
-    _YLIM_TAU_UP   = 0.15   # s — view growing to meet new data
-    _YLIM_TAU_DOWN = 2.0    # s — view shrinking after the signal drops
-    _YLIM_HYST     = 0.04   # commit deadband, fraction of the applied span
+    #
+    # Contraction therefore runs in three regimes, because "slow to shrink" is
+    # only right while the discrepancy is noise-sized:
+    #
+    #   far   (gap > _YLIM_STEP_FRAC of the view)  the signal really did drop;
+    #         contract at the FAST constant, and LATCH that until it converges.
+    #   near  (gap between the two thresholds)     still closing a latched move,
+    #         or ordinary wander; whichever the latch says.
+    #   home  (gap < _YLIM_HYST of the view)       converged; drop the latch and
+    #         go back to rejecting noise, which the deadband then absorbs.
+    #
+    # The latch is what makes a real drop feel instant. Without it the fast
+    # constant would hand back to the slow one the moment the gap fell under
+    # _YLIM_STEP_FRAC, leaving the last fifth of the move to crawl — a smaller
+    # version of exactly the rubber-band this is meant to remove.
+    _YLIM_TAU_UP    = 0.15  # s — view growing to meet new data
+    _YLIM_TAU_DOWN  = 2.0   # s — view shrinking after the signal drops
+    _YLIM_HYST      = 0.04  # commit deadband, fraction of the applied span
+    _YLIM_STEP_FRAC = 0.20  # gap this big is a real change, not noise
 
     def _autoscale_y(self):
         """Autoscale the spectrum's y axis; True if the view actually moved.
@@ -4071,13 +4089,25 @@ class FrogCanvas(FigureCanvasQTAgg):
         dt  = max(now - self._ylim_t, 0.0)
         self._ylim_t = now
         slo, shi = self._ylim_smooth
+        # How far the target sits from where the filter currently is, relative
+        # to the view it would be moving. Both ends share one decision: they
+        # describe one axis, and letting them latch separately would contract
+        # the top fast while the bottom crawled.
+        span_s = max(abs(shi - slo), 1e-12)
+        gap    = max(abs(target[0] - slo), abs(target[1] - shi))
+        if gap > self._YLIM_STEP_FRAC * span_s:
+            self._ylim_fast = True     # a real change: stop easing, go there
+        elif gap < self._YLIM_HYST * span_s:
+            self._ylim_fast = False    # arrived: back to rejecting noise
+        tau_down = self._YLIM_TAU_UP if self._ylim_fast else self._YLIM_TAU_DOWN
         # Asymmetric about the CURRENT filter state, not the applied limits: the
         # bottom expands by going lower, the top by going higher, so each end
-        # gets the fast constant only in the direction that grows the view.
+        # gets the fast constant only in the direction that grows the view —
+        # unless the latch above has already said this is not noise.
         lo = _ease(slo, target[0], dt,
-                   self._YLIM_TAU_UP if target[0] < slo else self._YLIM_TAU_DOWN)
+                   self._YLIM_TAU_UP if target[0] < slo else tau_down)
         hi = _ease(shi, target[1], dt,
-                   self._YLIM_TAU_UP if target[1] > shi else self._YLIM_TAU_DOWN)
+                   self._YLIM_TAU_UP if target[1] > shi else tau_down)
         self._ylim_smooth = (lo, hi)
         span = max(abs(old[1] - old[0]), 1e-12)
         if (abs(lo - old[0]) > self._YLIM_HYST * span
@@ -4105,6 +4135,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         on = bool(on)
         if on and not self.autoscale_y:
             self._ylim_smooth = None
+            self._ylim_fast   = False    # no move in flight to stay fast for
         self.autoscale_y = on
 
     def _pin_ylim(self, yl):
@@ -4119,6 +4150,10 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._ylim_cache  = tuple(yl)
         self._ylim_smooth = tuple(yl)
         self._ylim_t      = time.monotonic()
+        # The view IS where the filter wants to be, so any contraction that was
+        # in flight is over — leaving the latch set would spend the next frames
+        # racing away from limits that were just chosen deliberately.
+        self._ylim_fast   = False
 
     def update_member_spectra(self, wl1, s1, wl2, s2):
         """Draw one curve per spectrometer instead of the combined one.
