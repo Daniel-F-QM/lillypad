@@ -7521,6 +7521,13 @@ class FrogWindow(QMainWindow):
             "autocorrelation peak.")
 
     def _on_symmetry_toggled(self, on):
+        # Switching the mode re-centres the fold, in BOTH directions. A
+        # hand-dragged position belongs to the look the operator was taking at
+        # the time; turning the mode off ends that look, so coming back to it
+        # should start from the autocorrelation peak rather than resurrect a
+        # fold placed for a question already answered. Before the view is
+        # computed on the next line, so the `on` path folds about the peak.
+        self._fold_fs = None
         view = self._current_symmetry_view() if on else None
         if on and view is None:
             self.btn_symmetry.blockSignals(True)
