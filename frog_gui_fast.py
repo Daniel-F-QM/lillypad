@@ -6253,7 +6253,15 @@ class FrogWindow(QMainWindow):
         # Centred, and bold in both states (see the #idle/#moving rules): it is
         # a status lamp in text, not a number to read off. No stretch either —
         # the two positions need every pixel at six significant figures.
+        #
+        # Which is exactly why it needs a floor: with stretch 0 it is the column
+        # the row squeezes first, and the two readouts beside it reach eleven
+        # monospace characters. Below the width of "MOVING" a centred QLabel
+        # clips at BOTH edges, so the word lost its leading M and read "OVING".
+        # _size_moving_label reserves that width; the layout takes the pixels
+        # off the stretchy columns, which have them to give.
         _readout("Stage", self.lbl_moving, 0, Qt.AlignHCenter)
+        self._size_moving_label()
         lay.addLayout(prow)
 
         self.btn_set_zero = QPushButton("Set Position as 0 fs")
@@ -7819,6 +7827,23 @@ class FrogWindow(QMainWindow):
                   self.btn_home, self.btn_goto_zero, self.btn_set_zero,
                   self.btn_units, self.spin_backlash):
             w.setEnabled(on)
+
+    def _size_moving_label(self):
+        """Reserve the width of the WIDER of the stage label's two states.
+
+        The label shows "IDLE" at rest, so its own size hint asks for four
+        characters — and the layout, which has no reason to expect a fifth,
+        hands it exactly that when the row is tight. "MOVING" then does not fit,
+        and because the label is centred it is clipped at both ends, which is
+        what turned it into "OVING".
+
+        Measured rather than hard-coded: the #idle/#moving rules set the size
+        and weight in the stylesheet, so the number changes with the theme —
+        hence the call from _apply_theme as well as from the build.
+        """
+        fm = self.lbl_moving.fontMetrics()
+        # +4: QLabel's own text margin, which fontMetrics does not include.
+        self.lbl_moving.setMinimumWidth(fm.horizontalAdvance("MOVING") + 4)
 
     def _moving(self, on):
         self.lbl_moving.setText("MOVING" if on else "IDLE")
