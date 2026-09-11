@@ -3007,6 +3007,14 @@ class FrogCanvas(FigureCanvasQTAgg):
             zorder=5,
             bbox=dict(boxstyle="round,pad=0.3", facecolor=PALETTE["surface"],
                       edgecolor=PALETTE["border"], alpha=0.85))
+        # The level that width is measured AT. The number alone says how wide
+        # the pulse is; the line says where the curve was cut to get it, which
+        # is what shows a pedestal or a shoulder distorting the figure. Its
+        # height is recomputed from the plotted curve on every update rather
+        # than pinned at 0.5, so it cannot disagree with scan.fwhm().
+        self.line_half = self.ax_ac.axhline(
+            0.5, color=PALETTE["accent2"], lw=0.9, ls="--", alpha=0.7, zorder=4)
+        self.line_half.set_visible(False)
         # Symmetry mode: the fold line and the asymmetry readout, both on the
         # trace panel and both hidden until the mode is on. The readout mirrors
         # txt_fwhm above — same corner, same box, in the panel it describes.
@@ -3125,6 +3133,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_d2.set_animated(True)
         self.im.set_animated(True)
         self.txt_fwhm.set_animated(True)
+        self.line_half.set_animated(True)
         # Animated even while hidden, like the member lines above: draw()
         # returns immediately on an invisible artist, and leaving them out
         # would make them appear on a blit and vanish on the next full redraw.
@@ -3139,6 +3148,7 @@ class FrogCanvas(FigureCanvasQTAgg):
                           (self.ax_trace, self.line_fold),
                           (self.ax_trace, self.txt_sym),
                           (self.ax_ac, self.line_ac),
+                          (self.ax_ac, self.line_half),
                           (self.ax_ac, self.txt_fwhm)]
         self._bg = None            # cached full-figure background (no animated)
         # Background with the trace image + AC line already composited, so a
@@ -3435,6 +3445,7 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.fig.set_facecolor(pal["plot_bg"])
         self.line_spec.set_color(pal["accent"])
         self.line_ac.set_color(pal["accent2"])
+        self.line_half.set_color(pal["accent2"])
         self.txt_fwhm.set_color(pal["accent2"])
         self.txt_fwhm.get_bbox_patch().set_facecolor(pal["surface"])
         self.txt_fwhm.get_bbox_patch().set_edgecolor(pal["border"])
@@ -3508,8 +3519,9 @@ class FrogCanvas(FigureCanvasQTAgg):
                 self.ax_trace.draw_artist(self.line_fold)
                 self.ax_trace.draw_artist(self.txt_sym)
                 self.ax_ac.draw_artist(self.line_ac)
-                # Static between scan columns, exactly like the AC line — so it
-                # belongs in the cached background, not in the per-frame draw.
+                # Static between scan columns, exactly like the AC line — so
+                # these belong in the cached background, not the per-frame draw.
+                self.ax_ac.draw_artist(self.line_half)
                 self.ax_ac.draw_artist(self.txt_fwhm)
                 self._bg_static = self.copy_from_bbox(self.fig.bbox)
             self.restore_region(self._bg_static)
@@ -4285,7 +4297,9 @@ class FrogCanvas(FigureCanvasQTAgg):
         # first column. Nothing reads this line back — the stored trace, the
         # exports and the autocorrelation the scan computed keep raw counts.
         peak = float(ac.max()) if ac.size else 0.0
-        self.line_ac.set_data(delays, ac / peak if peak > 0 else ac)
+        shown = ac / peak if peak > 0 else ac
+        self.line_ac.set_data(delays, shown)
+        self._set_half_line(shown)
         self._bg_static = None        # AC line changed
         changed = False
         if self._layout_mode == "horizontal":
@@ -4308,6 +4322,34 @@ class FrogCanvas(FigureCanvasQTAgg):
             self._request_full()
         else:
             self._request_blit()
+
+    def _set_half_line(self, shown):
+        """Put the half-maximum rule at the level scan.fwhm() measured `shown`
+        at, or hide it when that curve cannot be bracketed.
+
+        The level is derived from the PLOTTED array with fwhm()'s own formula
+        rather than pinned at 0.5. The two agree for a finished scan — the
+        stored autocorrelation is already shifted to its minimum, and update_ac
+        divides by its max — but not for everything that reaches this panel: a
+        scan's first columns have barely any contrast, and a zoom or a symmetry
+        re-render pushes a different slice through here. Recomputing costs one
+        pass over a 1-D array and removes the whole class of "the line is not
+        where the number says" by construction.
+        """
+        y = np.asarray(shown, float)
+        # fwhm() gives up on these too, and it is the authority on the level:
+        # a line drawn where no width could be measured is a claim we cannot
+        # back with a number in the corner.
+        if y.size < 3 or not np.any(y > 0):
+            if self.line_half.get_visible():
+                self.line_half.set_visible(False)
+            return
+        half = 0.5 * (float(np.nanmax(y)) + float(np.nanmin(y)))
+        if not np.isfinite(half):
+            self.line_half.set_visible(False)
+            return
+        self.line_half.set_ydata([half, half])
+        self.line_half.set_visible(True)
 
     def set_fwhm(self, fs=None):
         """Autocorrelation width shown in the AC panel's top-right corner.
