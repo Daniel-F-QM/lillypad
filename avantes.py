@@ -42,6 +42,7 @@ import ctypes
 import glob
 import math
 import os
+import re
 import struct
 import sys
 import threading
@@ -594,6 +595,21 @@ def _close_open_devices() -> None:
             pass
 
 
+def _version_key(path: str) -> tuple:
+    """Sort key that orders install folders by VERSION, newest first.
+
+    The installer's folder name carries a dotted version — C:\\AvaSpecX64-DLL_9.14.0.0
+    — and a plain string sort gets that wrong in the one case it matters: "9.9"
+    sorts above "9.14" because '9' > '1' character by character, so the OLDER
+    install wins. Every number in the path is compared numerically instead, with
+    the string as a tiebreak so the order stays stable for paths that carry no
+    version at all.
+
+    Returned for use with reverse=True, i.e. highest version first.
+    """
+    return ([int(n) for n in re.findall(r"\d+", path)], path)
+
+
 def _candidate_paths() -> list[str]:
     """Where to look for the DLL, in order of decreasing confidence."""
     out: list[str] = []
@@ -606,17 +622,17 @@ def _candidate_paths() -> list[str]:
     if sys.platform == "win32":
         # The AvaSpec-DLL installer defaults to a versioned folder at the ROOT
         # of the system drive (C:\AvaSpecX64-DLL_9.14.0.0\), not Program Files.
-        # Newest version first, so a machine with several installs picks the
-        # latest rather than whichever sorts first.
+        # Newest version first (see _version_key), so a machine with several
+        # installs picks the latest rather than whichever sorts first as text.
         sysdrive = os.environ.get("SystemDrive", "C:") + os.sep
         for pattern in ("AvaSpec*DLL*", os.path.join("Avantes", "*"), "Avantes"):
             for name in _DLL_NAMES:
                 out.extend(sorted(glob.glob(os.path.join(sysdrive, pattern, name)),
-                                  reverse=True))
+                                  key=_version_key, reverse=True))
         for base in (r"C:\Program Files\Avantes", r"C:\Program Files (x86)\Avantes"):
             for name in _DLL_NAMES:
                 out.extend(sorted(glob.glob(os.path.join(base, "*", name)),
-                                  reverse=True))
+                                  key=_version_key, reverse=True))
                 out.extend(sorted(glob.glob(os.path.join(base, name))))
         # AvaSoft carries a 32-bit avaspec.dll. It is listed LAST and only so
         # that a 64-bit interpreter finds it and can say why it is useless,
@@ -1092,10 +1108,12 @@ class AvaSpec:
         device config reports which applies. AVS_PrepareMeasure is the only
         oracle, so bisect against it.
 
-        Costs a dozen PrepareMeasure calls once per connect, and buys an
-        exposure range that cannot ask for something the device will refuse —
-        which matters because that refusal otherwise surfaces one acquire()
-        later, on the caller's acquisition thread.
+        Costs about 18 PrepareMeasure calls once per connect — the two bracket
+        probes, 15 halvings to take 2 ms down to the 1e-4 ms tolerance below,
+        and the snap check at the end — and buys an exposure range that cannot
+        ask for something the device will refuse, which matters because that
+        refusal otherwise surfaces one acquire() later, on the caller's
+        acquisition thread.
         """
         keep = float(self.config.m_IntegrationTime)
 

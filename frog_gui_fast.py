@@ -1290,9 +1290,10 @@ class AlignmentDialog(QDialog):
 
         hint = QLabel(
             "Press Δ above the spectrum to run the sweep. It measures at −2x, "
-            "−x, +x and +2x from where the stage is now and overlays "
-            "S(+x)−S(−x) and S(+2x)−S(−2x): a symmetric pulse gives two flat "
-            "curves on zero. The stage is left where it started.")
+            "−x, +x and +2x from where the stage is now and plots "
+            "S(+x)−S(−x) and S(+2x)−S(−2x) on their own panel under the "
+            "spectrum: a symmetric pulse gives two flat curves on zero. The "
+            "stage is left where it started.")
         hint.setObjectName("dim"); hint.setWordWrap(True)
         lay.addWidget(hint)
 
@@ -1966,13 +1967,14 @@ class AvantesSettingsDialog(QDialog):
     """Every Avantes-only control, in its own window.
 
     The Avantes DLL exposes far more than the Ocean adapter does — on-board
-    averaging, ADC resolution, dark and non-linearity correction, smoothing,
-    external triggering, sync, prescan, board temperature. None of it belongs
-    in the Hardware dialog, which has to stay legible on a bench with no
-    Avantes attached, so it lives here behind a toolbar button that is HIDDEN
-    unless an Avantes is connected (see FrogWindow._refresh_avantes_button).
+    averaging, ADC resolution, dark and prescan correction, smoothing,
+    external triggering, sync, board temperature. None of it belongs in the
+    Hardware dialog, which has to stay legible on a bench with no Avantes
+    attached, so it lives here behind a toolbar button that is HIDDEN unless an
+    Avantes is connected (see FrogWindow._refresh_avantes_button).
 
-    Nothing persists between launches — there is no settings file — so
+    None of these device settings are written to settings.json — that file
+    holds the app's own preferences, not the spectrometer's state — so
     `_refresh` reads the device's current state INTO the widgets. Pushing
     widget defaults the other way would mean that merely opening this dialog
     silently reconfigured the spectrometer.
@@ -4865,7 +4867,8 @@ class FrogWindow(QMainWindow):
         self._pair_seen    = False   # a live pair has already had its default
         # Set when an integration time changes under a stitched pair: frames
         # are raw counts, so stitch_factor carries the exposure ratio and goes
-        # stale. Surfaced in the Multi-Spec menu rather than silently re-fitted.
+        # stale. Surfaced in the Spectrometer window's Stitching block rather
+        # than silently re-fitted.
         self._stitch_stale = False
         self.last_spectrum = None
         self.result        = None
@@ -6218,9 +6221,11 @@ class FrogWindow(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Overlap band", str(e))
             return
-        # The shading and the merged curve both change; push the band to the
-        # canvas now rather than waiting for the next overlay frame, so the
-        # combined view updates too.
+        # Push the band to the canvas now rather than waiting for the next
+        # overlay frame, so the shading moves as soon as the dialog closes. The
+        # shading only renders in the per-spectrometer view (set_overlap_band
+        # gates it on that); the combined curve has already been crossfaded, so
+        # there is nothing there for it to mark.
         self.canvas.set_overlap_band(lo, hi)
         self.status.showMessage(
             f"Overlap band set to {lo:.1f}–{hi:.1f} nm — re-run Auto-stitch "
@@ -6273,7 +6278,8 @@ class FrogWindow(QMainWindow):
         # Second exposure, shown only for a stitched pair. The two devices see
         # very different signal levels, so one shared value always leaves one
         # of them either buried in read noise or clipped. S1/S2 are SLOT order
-        # — the same numbering as the saturation lamps and the Multi-Spec menu.
+        # — the same numbering as the saturation lamps and the Spectrometer
+        # window's two slots.
         #
         # Side by side under ONE caption rather than a second labelled row: a
         # stitched pair is the tallest the panel ever gets, and a caption that
@@ -7913,7 +7919,8 @@ class FrogWindow(QMainWindow):
             self._stitch_stale = True
             self.status.showMessage(
                 f"{', '.join(changed)} — the two spectrometers no longer "
-                f"share a scale; re-run Multi-Spec → Auto-stitch.", 8000)
+                f"share a scale; re-run Auto-stitch (⇌ above the spectrum, or "
+                f"the Spectrometer window).", 8000)
         if had_dark:
             # Last, so its persistent message is the one left standing.
             self._invalidate_dark(f"integration time changed to "

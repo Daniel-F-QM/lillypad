@@ -30,7 +30,10 @@ import numpy as np
 from collections.abc import Callable
 from pathlib import Path
 
-C_NM_PER_FS = 299.792458   # speed of light, nm/fs (used only by the simulator)
+# Speed of light, nm/fs. Used by the simulator here AND by scan.py's
+# delay <-> position conversions, which are the load-bearing ones: change this
+# and every delay axis the app records moves with it.
+C_NM_PER_FS = 299.792458
 
 # Fraction of the geometric overlap a stitched pair fits and crossfades over by
 # default, centred — so the outer 5% at each end, where both detectors are at
@@ -96,10 +99,12 @@ class StageBase(abc.ABC):
     and the whole trace sits at the wrong delay. At double pass, 8 um of
     backlash is 53 fs.
 
-    Setting backlash_mm > 0 makes EVERY move on this stage arrive travelling in
-    the + direction, so the marked zero and the scan share one frame. The
-    pre-move only happens when the move would otherwise arrive from above, so a
-    monotonic ascending sweep pays nothing for it.
+    Setting backlash_mm > 0 makes moves on this stage arrive travelling in the
+    + direction, so the marked zero and the scan share one frame. The pre-move
+    only happens when the move would otherwise arrive from above, so a monotonic
+    ascending sweep pays nothing for it. The one case it cannot cover is a target
+    within backlash_mm of the bottom of travel: there is no room to undershoot,
+    so the pre-move is skipped and that move may still arrive from above.
 
     Leave backlash_mm at 0 when the controller already does this in firmware
     (Thorlabs Kinesis does) or when there is no backlash to correct (piezo).
@@ -143,8 +148,11 @@ class StageBase(abc.ABC):
         by backlash_mm first and take the slack up on the way back.
 
         Both legs go through _move_stepped, so neither can travel further than
-        max_step_mm in one go. The position is read once here and then carried
-        through, so a move costs the same device I/O it always did.
+        max_step_mm in one go. The current position is read once here and
+        carried through both legs rather than re-read per leg — but it IS an
+        extra get_position() per move, which is why an adapter that needs
+        neither backlash nor a step limit (PiezoJenaStage) sets both to 0 and
+        takes the no-readback fast path below.
         """
         target = float(position_mm)
         b = self.backlash_mm
@@ -789,11 +797,14 @@ class ZaberStage(StageBase):
                                  wait_until_idle=True)
 
     def get_position(self) -> float:
-        """Position in mm from the `pos` setting.
+        """Position in mm, as the library reports it (Zaber's `pos`).
 
-        This is the app's coordinate frame; position_fault() is what tells you
-        whether to believe it. Deliberately NOT encoder.pos — that has its own
-        origin, and switching would silently re-reference every saved zero.
+        On a stepper that is the trajectory counter, not a measurement: after a
+        completed move it returns what was commanded whether or not the carriage
+        got there. This is the app's coordinate frame; position_fault() is what
+        tells you whether to believe it. Deliberately NOT encoder.pos — that has
+        its own origin, and switching would silently re-reference every saved
+        zero.
         """
         return float(self._axis.get_position(self._Units.LENGTH_MILLIMETRES))
 
@@ -869,7 +880,11 @@ class PiezoJenaStage(StageBase):
 
     "wr" only sets the target — the controller settles on its own — so
     _move_to_raw() polls "rd" until the readback is within tolerance, with a
-    hard deadline so a wedged controller raises instead of hanging the GUI.
+    hard deadline (SETTLE_TIMEOUT_S per attempt) so a wedged controller is
+    reported rather than hanging the GUI. How it is reported is the point of
+    "Recovering from a confused controller" below: a move that never lands
+    LATCHES the reason in position_fault() instead of raising. It raises only
+    when no readback succeeded at all, i.e. when there is no position to report.
 
     backlash_mm stays 0: a closed-loop flexure piezo has no screw and therefore
     no backlash, and "rd" is a real measurement rather than a step counter, so
@@ -1593,8 +1608,11 @@ class StitchedSpectrometer(SpectrometerBase):
     for the exposures it was recorded at, and the GUI discards it otherwise.
 
     max_counts is None on purpose: counts on the common grid mix two detectors
-    and two calibrations, so no single ADC full scale applies. Saturation goes
-    unchecked unless the user sets a Full scale override.
+    and two calibrations, so no single ADC full scale applies to the merged
+    curve. Saturation is still checked — just per member rather than here. Each
+    device's RAW frame (last_member_raw, below) is judged against that device's
+    own max_counts, live and during a scan, so either detector clipping trips
+    its own alarm. See scan.py's FrogScanWorker.run.
     """
     def __init__(self, spec_a: SpectrometerBase, spec_b: SpectrometerBase):
         wl_a = np.asarray(spec_a.wavelengths, float)
@@ -2373,12 +2391,17 @@ if __name__ == "__main__":
     stage._move_to_raw = (lambda f: lambda mm: (raw.__setitem__(0, raw[0] + 1), f(mm))[1]
                           )(stage._move_to_raw)
     stage.move_to(47.0)
-    assert raw[0] == 10, f"expected 10 sub-moves for 47 mm, got {raw[0]}"
+    n_long = raw[0]
+    assert n_long == 10, f"expected 10 sub-moves for 47 mm, got {n_long}"
     assert stage.get_position() == 47.0, stage.get_position()
     raw[0] = 0
     stage.move_to(45.0)
-    assert raw[0] == 1, f"expected 1 move for 2 mm, got {raw[0]}"
-    print(f"  long-move split: 47 mm -> {10} steps of <=5 mm, 2 mm -> 1 step")
+    n_short = raw[0]
+    assert n_short == 1, f"expected 1 move for 2 mm, got {n_short}"
+    # The MEASURED counts, not literals, so the line cannot disagree with what
+    # the split actually did.
+    print(f"  long-move split: 47 mm -> {n_long} steps of <=5 mm, "
+          f"2 mm -> {n_short} step")
 
     # Tagged spectrometer ids. All of this runs with no vendor SDK installed
     # and no hardware attached — which is the point: enumeration must degrade

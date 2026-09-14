@@ -3,11 +3,17 @@ scan.py — FROG delay-scan engine
 ================================
 Two layers in one file:
 
-  1. A pure, Qt-free core — delay<->position conversion, the delay grid,
-     autocorrelation/FWHM, and the FrogScanConfig / FrogResult dataclasses.
-     This is the part you unit-test and that a future retrieval step consumes.
+  1. A GUI-free core — delay<->position conversion, the delay grid,
+     autocorrelation/FWHM, the file writers, and the FrogScanConfig /
+     FrogResult dataclasses. None of it touches Qt or any device, so this is
+     the part you unit-test and that a future retrieval step consumes.
   2. A thin FrogScanWorker(QThread) that drives a StageBase + SpectrometerBase
      through a scan, emitting columns live for the build-up plot.
+
+Note that layer 2's `from PySide6.QtCore import ...` is module level, so
+IMPORTING this module needs PySide6 installed even to reach layer 1. No window,
+no QApplication and no hardware — but not a Qt-free import. Splitting the two
+layers into separate modules is what would buy that, if it is ever wanted.
 
 Unit conventions: delays in fs, stage positions in MICROMETRES (um). The
 master unit for the FROG axis is fs; positions are um everywhere user-facing.
@@ -15,7 +21,7 @@ pylablib reports the LTS300 in mm, so that one boundary is isolated in the
 _um_to_stage / _stage_to_um helpers below — flip them to identity if the
 stage adapter is ever changed to report um directly.
 
-    python scan.py     # self-test of the pure core (no Qt, no hardware)
+    python scan.py     # self-test — no hardware, no GUI (needs PySide6 installed)
 """
 
 from __future__ import annotations
@@ -30,8 +36,10 @@ from hardware import C_NM_PER_FS, StageBase, SpectrometerBase
 
 
 # The stage adapter speaks mm (pylablib native); the engine works in um.
-# These two functions are the ONLY place mm appears — change them to identity
-# if the adapter is ever switched to report um.
+# These two functions are the only place the CONVERSION lives — change them to
+# identity if the adapter is ever switched to report um. (mm still appears as
+# attribute names read straight off the adapter — backlash_mm, travel_mm,
+# travel_min_mm in run() below — and those would need converting too.)
 def _um_to_stage(um):
     return um / 1000.0          # um -> mm, for stage.move_to
 
@@ -91,8 +99,11 @@ def autocorrelation(trace, baseline_subtract=True):
 
 
 def fwhm(x, y):
-    """FWHM of a single-peaked curve y(x), linearly interpolated at half-max.
-    Returns NaN if it can't be bracketed."""
+    """Full width of a single-peaked curve y(x) at its half level, linearly
+    interpolated. The level is halfway between y.min() and y.max(), which is
+    half-MAX only when the baseline is already at zero — as it is for the
+    autocorrelation above, which baseline-subtracts by default. Returns NaN if
+    it can't be bracketed."""
     x = np.asarray(x, float)
     y = np.asarray(y, float)
     if y.size < 3 or not np.any(y > 0):
