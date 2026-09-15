@@ -2100,6 +2100,99 @@ def _build_two_color(t, tau0):
             + _fourier_shift(A, t, +0.5 * sep) * np.exp(-1j * dw * t))
 
 
+# ── "Bird": a measured broadband MIR continuum ──────────────────────────────
+# The presets above are analytic shapes that keep their character at any pulse
+# duration. This one does not: it is a specific beam — a near-single-cycle
+# 2.4 um continuum out of a MIR OPA — so its landmarks (the water-vapour
+# notches, the band edges) sit at absolute wavelengths and it declares its own
+# carrier and duration in PULSE_SHAPES["bird"]["sim"]. Only the spectral PHASE
+# is written in units of tau0, so the beam still behaves sensibly if someone
+# builds it at another duration.
+_BIRD_LAMBDA0_NM = 2400.0       # carrier: the peak of the measured spectrum
+_BIRD_TAU0_FS    = 4.5          # sech tau0 of the ~8 fs retrieved pulse
+
+# Smooth envelope of the measured spectrum as (wavelength um, relative dB)
+# control points — a measurement is a table, not a formula. The ripples, the
+# water notches and the spectral phase are added analytically on top.
+_BIRD_SPECTRUM_DB = np.array([
+    (0.90, -48.0), (0.95, -40.0), (1.00, -32.0), (1.05, -24.0), (1.10, -17.5),
+    (1.15, -14.5), (1.20, -13.5), (1.30, -11.5), (1.40, -10.4), (1.50, -10.0),
+    (1.60,  -9.6), (1.70,  -9.3), (1.80,  -9.0), (1.90,  -9.4), (2.00, -11.0),
+    (2.10,  -7.5), (2.20,  -3.5), (2.30,  -1.2), (2.42,   0.0), (2.50,  -0.5),
+    (2.60,  -2.0), (2.70,  -5.0), (2.80,  -9.5), (2.90, -15.0), (3.00, -21.0),
+    (3.10, -27.0), (3.20, -33.0), (3.35, -45.0), (3.50, -60.0),
+])
+
+
+def _bird_envelope(um: np.ndarray) -> np.ndarray:
+    """Relative spectral INTENSITY at wavelengths `um` (micrometres).
+
+    The control points are interpolated in dB (the axis they were read off)
+    and then smoothed, because straight-line segments in dB leave visible
+    kinks exactly where the log plot is most read.
+    """
+    grid = np.arange(0.85, 3.60, 0.005)
+    db   = np.interp(grid, _BIRD_SPECTRUM_DB[:, 0], _BIRD_SPECTRUM_DB[:, 1])
+    kern = np.exp(-0.5 * (np.arange(-12, 13) / 4.0) ** 2)
+    db   = np.convolve(np.pad(db, 12, mode="edge"), kern / kern.sum(),
+                       mode="valid")
+    # Hard zero outside the table: extrapolating a dB slope would put spurious
+    # signal on the detectors at wavelengths the beam never reaches.
+    return 10.0 ** (np.interp(um, grid, db, left=-90.0, right=-90.0) / 10.0)
+
+
+def _build_bird(t, tau0):
+    """A ~1.0-3.2 um continuum compressed to ~8 fs — the busiest beam here.
+
+    Structure at every scale, which is the point of it: an octave and a half of
+    bandwidth, a shoulder ~10 dB below the main 2.4 um band carrying a
+    modulation ripple, water-vapour notches at 1.38 and 1.93 um, and enough
+    residual GDD/TOD to put a satellite ahead of the main peak.
+
+    SHG of a spectrum this wide lands anywhere from ~500 to ~1400 nm — more
+    than any one detector covers, which is why this beam ships with a
+    spectrometer PAIR (see SIM_SPECTROMETERS). The cross-terms between the
+    2.4 um band and the shoulder are the bright part at 800-1100 nm; they exist
+    only where the two spectral regions also overlap in time, so the blue
+    spectrometer is genuinely measuring something the red one cannot see.
+    """
+    dt    = t[1] - t[0]
+    Om    = 2 * np.pi * np.fft.fftfreq(t.size, d=dt)
+    omega = 2 * np.pi * C_NM_PER_FS / _BIRD_LAMBDA0_NM + Om
+    ok    = omega > 0
+    # Wavelength of every grid point, in um. Non-positive frequencies get a
+    # placeholder far outside the table (and are masked out below) rather than
+    # inf, which would poison the sin() ripple with NaNs.
+    um = np.where(ok, 2 * np.pi * C_NM_PER_FS / np.where(ok, omega, 1.0) * 1e-3,
+                  1e3)
+
+    S = _bird_envelope(um)
+    # Modulation ripple across the shoulder — the fingerprint of a continuum
+    # generated from two overlapping processes. Its 0.185 um period is what
+    # puts the echo at ~60 fs in the trace, so it sets the scan range.
+    win = np.exp(-0.5 * ((um - 1.75) / 0.60) ** 4)
+    S   = S * (1.0 + 0.20 * np.sin(2 * np.pi * (um - 1.02) / 0.185) * win)
+    # Water vapour in the beam path (1.38 and 1.93 um) and a CO2/OH edge near
+    # 2.72 um: (centre um, depth, width um).
+    for centre, depth, width in ((1.93, 0.55, 0.030),
+                                 (1.38, 0.30, 0.022),
+                                 (2.72, 0.30, 0.045)):
+        S = S * (1.0 - depth * np.exp(-0.5 * ((um - centre) / width) ** 2))
+    amp = np.sqrt(np.clip(S, 0.0, None) * ok)
+
+    # Uncompensated residual: a little GDD, a little TOD, plus a shallow
+    # sinusoidal ripple of the kind a chirped mirror pair leaves behind. Takes
+    # the ~5.1 fs transform limit to ~8.1 fs and hangs a satellite off the
+    # leading edge.
+    phi = (0.5 * (0.45 * tau0 ** 2) * Om ** 2
+           + (0.25 * tau0 ** 3) * Om ** 3 / 6.0
+           + 0.20 * np.sin(3.4 * tau0 * Om + 0.6))
+    # Built in the frequency domain, so the pulse lands at index 0 — fftshift
+    # moves it to the middle of the time grid where every other builder puts it.
+    A = np.fft.fftshift(np.fft.ifft(amp * np.exp(1j * phi)))
+    return A / np.abs(A).max()
+
+
 def _misaligned_efficiency(tau, tau0):
     """Delay-dependent conversion efficiency of a MISALIGNED correlator.
 
@@ -2127,6 +2220,17 @@ def _misaligned_efficiency(tau, tau0):
 
 
 # Ordered simple -> structured; the GUI builds its picker straight from this.
+#
+# Optional keys, all of them describing something OTHER than the field itself:
+#   exposure        — drive the detector this many times harder ("saturated")
+#   efficiency      — callable(tau, tau0), a delay-dependent conversion
+#                     efficiency of the correlator ("misaligned")
+#   sim             — SimulatedSpectrometer constructor defaults the BEAM owns
+#                     (carrier, duration, time grid). An explicit argument
+#                     still wins; everything else falls back to the module
+#                     defaults in SIM_BEAM_DEFAULTS.
+#   spectrometers   — keys into SIM_SPECTROMETERS: the pair of devices this
+#                     beam is measured with, for the simulated stitched pair.
 PULSE_SHAPES: dict[str, dict] = {
     "tl_sech": {
         "label": "Transform-limited sech²",
@@ -2178,6 +2282,23 @@ PULSE_SHAPES: dict[str, dict] = {
         "desc":  "Two sub-pulses at different colours and different times. SHG "
                  "mixes them into three off-diagonal bands.",
     },
+    "bird": {
+        "label": "Bird (broadband MIR continuum)",
+        "build": _build_bird,
+        # The beam's own carrier and duration, and a time grid to match: a
+        # near-single-cycle pulse on an octave and a half of bandwidth needs
+        # the finer spectral sampling (2048 fs of window) to put more than one
+        # simulated sample on a NIRQuest pixel.
+        "sim": {"lambda0_nm": _BIRD_LAMBDA0_NM, "tau0_fs": _BIRD_TAU0_FS,
+                "n_time": 8192, "t_max_fs": 2048.0},
+        "spectrometers": ("ocean_sr", "ocean_nirquest"),
+        "desc":  "A measured 1.0–3.2 µm OPA continuum compressed to ~8 fs "
+                 "(5.1 fs transform limit): a 2.4 µm main band over a rippled "
+                 "shoulder 10 dB down, water notches at 1.38 and 1.93 µm, and "
+                 "a satellite ahead of the main peak. Its SHG covers 500–"
+                 "1400 nm, so Stitched pair gives you the real Ocean SR + "
+                 "NIRQuest bench rather than two halves of one band.",
+    },
     "misaligned": {
         "label": "Misaligned correlator (asymmetric)",
         "build": _build_tl_sech,
@@ -2207,6 +2328,93 @@ PULSE_SHAPES: dict[str, dict] = {
 
 DEFAULT_PULSE = "tl_sech"
 
+# SimulatedSpectrometer arguments a BEAM may own, and what they are when
+# neither the caller nor the preset says. A 1030 nm, 30 fs pulse on a +/-1024
+# fs grid — the pulse the simulator has always defaulted to.
+SIM_BEAM_DEFAULTS: dict[str, float | int] = {
+    "lambda0_nm": 1030.0, "tau0_fs": 30.0, "n_time": 4096, "t_max_fs": 1024.0,
+}
+
+
+# ---------------------------------------------------------------------------
+# Simulated spectrometers modelled on real devices
+# ---------------------------------------------------------------------------
+# Enough of a real spectrometer to make a simulated stitched pair behave like
+# the bench: where its pixels are, how many, what the detector's response does
+# across them, and how much dark and read noise it carries. The two here are
+# the pair this app was written for, and their `response` curves are the
+# reciprocal of the calibration files shipped in calibration_files/ — so
+# loading SR_New / Niquest_New onto the simulated devices flattens them the
+# same way it flattens the real ones.
+#
+# `response` shapes the counts and is applied AFTER normalisation (see
+# SimulatedSpectrometer.acquire), so it really does cost signal: a beam sitting
+# where a detector has gone deaf reads at the noise floor, which is what makes
+# the dead edges of an overlap dead.
+
+def _response_curve(wl_nm, relative):
+    """A detector response as a lookup on a coarse table, held flat outside it
+    (never extrapolated to zero or to nonsense at the band edges)."""
+    wl, rel = np.asarray(wl_nm, float), np.asarray(relative, float)
+    return lambda w: np.interp(np.asarray(w, float), wl, rel)
+
+
+SIM_SPECTROMETERS: dict[str, dict] = {
+    "ocean_sr": {
+        "name": "simulated Ocean SR (Si, 350–1050 nm)",
+        # Stem of the calibration file in calibration_files/ that inverts this
+        # device's response, loaded by the GUI when the file is there.
+        "calibration": "SR_New",
+        "device": dict(
+            wl_start=350.0, wl_end=1050.0, n_pixels=2048,
+            # Silicon: broad and flat through the visible, then off a cliff
+            # past 950 nm. Nothing but noise by 1050, which is exactly where
+            # this pair's overlap sits — hence the 25 nm sampling through the
+            # roll-off, where a coarser table would stop being the reciprocal
+            # of the calibration file.
+            response=_response_curve(
+                (350, 400, 450, 500, 550, 600, 650, 700, 750, 800, 850, 875,
+                 900, 925, 950, 975, 1000, 1025, 1050),
+                (0.253, 0.315, 0.465, 0.682, 0.837, 0.949, 0.982, 0.994,
+                 0.926, 0.801, 0.750, 0.688, 0.727, 0.660, 0.556, 0.424,
+                 0.296, 0.174, 0.059)),
+            peak_counts=25000.0, read_noise=8.0, background_counts=250.0),
+    },
+    "ocean_nirquest": {
+        "name": "simulated Ocean NIRQuest512 (InGaAs, 900–1700 nm)",
+        "calibration": "Niquest_New",
+        "device": dict(
+            wl_start=900.0, wl_end=1700.0, n_pixels=512,
+            # InGaAs: cutting on hard at the blue end of its range and flat
+            # from ~1.3 um. Four times the pixel pitch of the Si unit and a
+            # much larger dark — the reason the two want separate exposures.
+            response=_response_curve(
+                (900, 925, 950, 975, 1000, 1025, 1050, 1100, 1150, 1200, 1250,
+                 1300, 1350, 1400, 1450, 1500, 1550, 1600, 1650, 1700),
+                (0.225, 0.351, 0.411, 0.468, 0.499, 0.516, 0.530, 0.618,
+                 0.687, 0.716, 0.766, 0.852, 0.912, 0.898, 0.930, 0.979,
+                 0.992, 0.968, 0.968, 0.968)),
+            peak_counts=25000.0, read_noise=30.0, background_counts=1400.0),
+    },
+}
+
+
+def sim_spectrometer_pair(pulse: str, gate: str = "shg"
+                          ) -> tuple[str, str] | None:
+    """The (blue, red) SIM_SPECTROMETERS keys a beam is measured with, or None
+    when the simulated halves should just split the beam's own band.
+
+    A named pair is a pair of real detectors, so it only applies where the
+    signal really lands on them: on the SECOND HARMONIC. Under a PG gate the
+    signal sits at the fundamental — for "bird" that is 1.0-3.2 um, past the
+    red end of any silicon or InGaAs spectrometer — so the generic halves take
+    over rather than handing the operator two dead devices.
+    """
+    if gate != "shg":
+        return None
+    models = PULSE_SHAPES.get(pulse, {}).get("spectrometers")
+    return tuple(models) if models else None
+
 
 class SimulatedSpectrometer(SpectrometerBase):
     """Synthetic FROG spectrometer for offline testing.
@@ -2221,22 +2429,27 @@ class SimulatedSpectrometer(SpectrometerBase):
     the envelope is complex, the spectral phase is what shapes the trace —
     that is the whole point of the chirp / TOD / SPM presets.
 
+    `response` is the DEVICE's relative sensitivity, callable(wl_nm) -> factor.
+    It shapes the counts after the beam has been normalised, so unlike
+    everything else here it describes the detector rather than the light — see
+    SIM_SPECTROMETERS, and acquire() for where it lands.
+
     Gate-agnostic by design:
         shg : E_sig = E(t)·E(t-tau)        -> signal at 2*omega0
         pg  : E_sig = E(t)·|E(t-tau)|^2    -> signal at  omega0
     """
     def __init__(self, stage: StageBase, position_to_delay=None,
-                 gate: str = "shg", lambda0_nm: float = 1030.0,
-                 tau0_fs: float = 30.0, pulse=DEFAULT_PULSE,
+                 gate: str = "shg", lambda0_nm: float | None = None,
+                 tau0_fs: float | None = None, pulse=DEFAULT_PULSE,
                  wl_start: float | None = None, wl_end: float | None = None,
-                 n_pixels: int = 1024, n_time: int = 4096,
-                 t_max_fs: float = 1024.0,
+                 n_pixels: int = 1024, n_time: int | None = None,
+                 t_max_fs: float | None = None,
                  peak_counts: float = 4000.0, read_noise: float = 15.0,
                  background_counts: float = 0.0,
-                 max_counts: float | None = 65535.0):
+                 max_counts: float | None = 65535.0,
+                 response=None):
         self.stage             = stage
         self.gate              = gate
-        self.tau0              = tau0_fs
         self.read_noise        = read_noise
         # 16-bit full scale, like the Ocean Optics units. Pass None for the old
         # unbounded behaviour (nothing ever clips, nothing ever warns).
@@ -2247,15 +2460,13 @@ class SimulatedSpectrometer(SpectrometerBase):
         self.background_counts = background_counts
         self.integration_ms    = 100.0
 
-        # Kept because the measurement-side hooks below are scaled in units of
-        # the pulse's own duration.
-        self.tau0_fs = float(tau0_fs)
         if callable(pulse):
             self.pulse, build   = "custom", pulse
             self.pulse_label    = getattr(pulse, "__name__", "custom pulse")
             self.pulse_desc     = ""
             self.exposure       = 1.0
             self._efficiency    = None
+            beam: dict          = {}
         else:
             if pulse not in PULSE_SHAPES:
                 raise KeyError(f"Unknown pulse {pulse!r}. "
@@ -2269,6 +2480,24 @@ class SimulatedSpectrometer(SpectrometerBase):
             # Read before _norm is computed below, so the normalisation is of
             # the trace as actually measured rather than of an ideal one.
             self._efficiency    = shape.get("efficiency")
+            # Carrier, duration and time grid the BEAM asks for ("bird" is a
+            # specific 2.4 um pulse, not a shape that scales).
+            beam                = dict(shape.get("sim", {}))
+
+        def _beam_arg(name, given):
+            """Explicit argument, else what the preset asks for, else the
+            module default. Three sources, one order, no silent surprises."""
+            if given is not None:
+                return given
+            return beam.get(name, SIM_BEAM_DEFAULTS[name])
+
+        lambda0_nm = float(_beam_arg("lambda0_nm", lambda0_nm))
+        tau0_fs    = float(_beam_arg("tau0_fs",    tau0_fs))
+        n_time     = int(_beam_arg("n_time",       n_time))
+        t_max_fs   = float(_beam_arg("t_max_fs",   t_max_fs))
+        # Kept because the measurement-side hooks below are scaled in units of
+        # the pulse's own duration.
+        self.tau0 = self.tau0_fs = tau0_fs
         # Presets may ask to be driven harder than full scale (see "saturated").
         self.peak_counts = peak_counts * self.exposure
         self.name = f"simulated {gate}-FROG — {self.pulse_label}"
@@ -2308,10 +2537,21 @@ class SimulatedSpectrometer(SpectrometerBase):
         auto_lo, auto_hi = self._spectral_extent()
         self._wl = np.linspace(auto_lo if wl_start is None else wl_start,
                                auto_hi if wl_end is None else wl_end, n_pixels)
+        # Per-pixel detector sensitivity, 1 everywhere on an ideal device.
+        self._pixel_response = (
+            None if response is None
+            else np.clip(np.asarray(response(self._wl), float), 0.0, None))
 
         # peak_counts is the peak of the whole TRACE — for a double pulse the
         # brightest column is not the one at zero delay.
-        norm = max(self._raw_column(tau).max() for tau in self._delay_samples())
+        #
+        # Measured over the WHOLE signal band, not over this device's window:
+        # otherwise a device covering a dim corner of the spectrum would
+        # renormalise that corner up to full brightness, and two members of a
+        # stitched pair would arrive with an unknowable factor between them
+        # instead of the honest ratio of what each one can actually see.
+        norm = max(self._raw_column(tau, np.linspace(auto_lo, auto_hi, n_pixels)
+                                    ).max() for tau in self._delay_samples())
         self._norm = norm if norm > 0 else 1.0
 
     @property
@@ -2340,10 +2580,21 @@ class SimulatedSpectrometer(SpectrometerBase):
         lo, hi = _energy_window(self._lam_sorted[finite], marg[finite], frac)
         mid, half = 0.5 * (hi + lo), 0.5 * (hi - lo)
         half = max(half * (1.0 + pad), 2.0)                 # never absurdly tight
-        return mid - half, mid + half
+        # Kept inside a couple of octaves of the carrier. Wavelength is 1/omega,
+        # so a beam broad enough to carry weight near zero frequency — an
+        # octave-spanning pulse under the PG gate, where the gate |E|^2 pushes
+        # the signal down towards DC — otherwise produces a window stretching
+        # to tens of microns and out the far side into NEGATIVE wavelengths.
+        # Every ordinary preset sits well inside these bounds and is untouched.
+        lam_c = 2 * np.pi * C_NM_PER_FS / self.carrier
+        return (max(mid - half, 0.3 * lam_c), min(mid + half, 3.0 * lam_c))
 
-    def _raw_column(self, tau: float) -> np.ndarray:
-        col = np.interp(self._wl, self._lam_sorted, self._signal_spectrum(tau),
+    def _raw_column(self, tau: float, wl: np.ndarray | None = None
+                    ) -> np.ndarray:
+        """The signal on `wl` (this device's pixels by default), before the
+        detector's own response and before any scaling to counts."""
+        col = np.interp(self._wl if wl is None else wl,
+                        self._lam_sorted, self._signal_spectrum(tau),
                         left=0.0, right=0.0)
         if self._efficiency is not None:
             # Scales the whole column, never its shape: a geometric overlap
@@ -2360,6 +2611,12 @@ class SimulatedSpectrometer(SpectrometerBase):
                   if self.stage is not None else 0.0)
         scale  = self.integration_ms / 100.0                     # signal ∝ integ. time
         counts = self._raw_column(tau) / self._norm * self.peak_counts * scale
+        if self._pixel_response is not None:
+            # The detector's own sensitivity, applied to the light and NOT to
+            # the dark below it — a pixel where the detector has gone deaf
+            # still carries its full pedestal and read noise, which is exactly
+            # what makes the dead edge of an overlap band worthless to a fit.
+            counts = counts * self._pixel_response
         counts = counts + self.background_counts * scale
         counts = np.random.poisson(np.clip(counts, 0, None)).astype(float)
         counts += np.random.normal(0.0, self.read_noise, size=counts.shape)  # read noise: fixed
@@ -2484,10 +2741,10 @@ if __name__ == "__main__":
     print("  calibration loader: clean ok, 1 ragged line skipped, junk refused")
 
     # ── Stitching: crossfade, band, and the dark-aware fit ───────────────────
-    # Two windows onto ONE analytic spectrum, so the true ratio between the
-    # members is exactly their gain ratio. SimulatedSpectrometer normalises
-    # each instance against its own window's peak, which would put an unknown
-    # factor between the halves and leave nothing to check the fit against.
+    # Two windows onto ONE analytic spectrum with a KNOWN gain between them, so
+    # the fit has an exact answer to be checked against — which a pair of
+    # SimulatedSpectrometers, whose ratio comes out of the beam and the two
+    # detector responses, could only be compared with approximately.
     def _true_spectrum(wl):
         return 4000.0 * np.exp(-0.5 * ((np.asarray(wl, float) - 950.0) / 120.0) ** 2)
 
@@ -2567,6 +2824,63 @@ if __name__ == "__main__":
         pass
     else:
         raise AssertionError("a mismatched dark must be refused")
+
+    # ── A beam measured on its own pair of real instruments ("bird") ─────────
+    models = sim_spectrometer_pair("bird")
+    assert models == ("ocean_sr", "ocean_nirquest"), models
+    # PG puts the signal at the fundamental, past the red end of both, so the
+    # pair must NOT be claimed for it.
+    assert sim_spectrometer_pair("bird", "pg") is None
+    assert sim_spectrometer_pair("tl_sech") is None
+
+    bench = []
+    for key in models:
+        model = SIM_SPECTROMETERS[key]
+        dev = SimulatedSpectrometer(SimulatedStage(), gate="shg", pulse="bird",
+                                    **model["device"])
+        dev.name = model["name"]
+        bench.append(dev)
+    sr, nq = bench
+    assert sr.n_pixels == 2048 and nq.n_pixels == 512
+    # The response really costs signal rather than being normalised away: at
+    # 1050 nm the silicon unit is 17x less sensitive than at its peak, so its
+    # reddest pixels sit near the dark whatever the light is doing there.
+    ideal = SimulatedSpectrometer(SimulatedStage(), gate="shg", pulse="bird",
+                                  wl_start=1040.0, wl_end=1050.0, n_pixels=32,
+                                  peak_counts=25000.0, read_noise=0.0)
+    deaf = SimulatedSpectrometer(SimulatedStage(), gate="shg", pulse="bird",
+                                 wl_start=1040.0, wl_end=1050.0, n_pixels=32,
+                                 peak_counts=25000.0, read_noise=0.0,
+                                 response=SIM_SPECTROMETERS["ocean_sr"]
+                                 ["device"]["response"])
+    assert deaf.acquire().max() < 0.2 * ideal.acquire().max(), "response unapplied"
+
+    bird_pair = StitchedSpectrometer(sr, nq)
+    glo, ghi = bird_pair.geometric_overlap
+    assert abs(glo - 900.0) < 1.0 and abs(ghi - 1050.0) < 1.0, (glo, ghi)
+    raw_fit = bird_pair.fit_stitch_factor()
+    raw_residual = bird_pair.stitch_residual
+    # Uncalibrated, one scalar cannot reconcile a silicon roll-off with an
+    # InGaAs cut-on across the same 150 nm — which is the whole reason the
+    # devices carry calibration files.
+    assert raw_residual > 0.2, raw_residual
+    cal_dir = Path(__file__).resolve().parent / "calibration_files"
+    files = {k: cal_dir / f"{SIM_SPECTROMETERS[k]['calibration']}.txt"
+             for k in models}
+    if all(f.is_file() for f in files.values()):
+        for dev, key in zip(bench, models):
+            dev.set_calibration(files[key])
+        cal_fit = bird_pair.fit_stitch_factor()
+        assert bird_pair.stitch_residual < 0.5 * raw_residual, \
+            (raw_residual, bird_pair.stitch_residual)
+        print(f"  bird on the Ocean pair: {sr.n_pixels}+{nq.n_pixels} px, "
+              f"overlap {glo:.0f}–{ghi:.0f} nm, fit {raw_fit:.2f} at "
+              f"{raw_residual * 100:.0f}% raw -> {cal_fit:.2f} at "
+              f"{bird_pair.stitch_residual * 100:.0f}% calibrated")
+    else:
+        print(f"  bird on the Ocean pair: {sr.n_pixels}+{nq.n_pixels} px, "
+              f"overlap {glo:.0f}–{ghi:.0f} nm, fit {raw_fit:.2f} at "
+              f"{raw_residual * 100:.0f}% raw (no calibration files to load)")
 
     # ── Piezo Jena: recovering from a controller that lost the plot ──────────
     class _FakePiezoSerial:

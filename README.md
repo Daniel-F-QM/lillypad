@@ -24,9 +24,10 @@ everything with nothing plugged in.
 
 - **Live spectrum and live trace** — the trace builds up column by column while
   the scan runs.
-- **Ten simulated pulse shapes**, from a clean transform-limited pulse to a
-  chirped one, a double pulse, fibre output, a deliberately over-exposed one and
-  a deliberately misaligned one.
+- **Eleven simulated pulse shapes**, from a clean transform-limited pulse to a
+  chirped one, a double pulse, fibre output, a deliberately over-exposed one, a
+  deliberately misaligned one, and *Bird* — a measured 1.0–3.2 µm continuum
+  that comes with its own pair of simulated Ocean spectrometers.
 - **Saturation warnings** — clipped pixels counted per column, shown on a lamp,
   with an optional automatic stop.
 - **Three alignment views** for finding a misaligned or chirped beam without
@@ -81,6 +82,11 @@ Lillypad starts with **nothing connected**, and says so. To take it for a spin,
 open **Simulation** in the toolbar and press **Spectrometer** and **Stage** (or
 **Stitched pair** for two). Then press **Measure FROG**. The same window is
 where you choose the pulse shape.
+
+For the busiest version of that, pick the **Bird** beam and press **Stitched
+pair**: a 1.0–3.2 µm continuum measured on a simulated Ocean SR + NIRQuest
+bench, which is the one combination that exercises nearly every diagnostic in
+the app at once (see [The *Bird* beam](#two-spectrometers-at-once)).
 
 Simulated devices appear *only* there — never in the Spectrometer or Stage
 windows — so nothing that looks like a hardware control can hand you fake data.
@@ -465,6 +471,27 @@ alarm.
 **Simulated pair.** *Stitched pair* in the Simulation window fills both slots
 with simulated devices covering overlapping two-thirds of the band, so there is
 a genuine blue-only / shared / red-only geometry for Auto-stitch to work on.
+
+**The *Bird* beam.** One simulated beam brings its own instruments instead. Its
+SHG covers 500–1400 nm — more than any one detector — so *Stitched pair* gives
+you a simulated **Ocean SR** (silicon, 350–1050 nm, 2048 pixels) and a simulated
+**NIRQuest512** (InGaAs, 900–1700 nm, 512 pixels), each with that detector's own
+response curve, dark level and read noise. They share 900–1050 nm, where the
+silicon unit is falling off its red end and the InGaAs one has barely cut on —
+the awkward overlap a real bench has, rather than two halves of one band.
+
+It is the beam to pick for exercising the stitching tools, because every step
+visibly moves the residual:
+
+| | Auto-stitch residual |
+| --- | --- |
+| Raw counts, no calibration | ~40% — one number cannot reconcile two responses |
+| With `SR_New` / `Niquest_New` loaded (done for you, if they are in `calibration_files`) | ~9% |
+| After **Record Dark** | ~5% |
+| After narrowing the *Overlap band* to 915–1000 nm | ~4% |
+
+Switch to the per-spectrometer view to watch it happen, and to **RAW** after a
+scan to see what the two detectors actually recorded underneath.
 
 ---
 

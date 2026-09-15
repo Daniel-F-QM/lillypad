@@ -95,7 +95,8 @@ from hardware import (SimulatedStage, SimulatedSpectrometer,
                       open_spectrometer,
                       avantes_trigger_options,
                       load_calibration_file, SEABREEZE_BACKENDS,
-                      PULSE_SHAPES, DEFAULT_PULSE)
+                      PULSE_SHAPES, DEFAULT_PULSE,
+                      SIM_SPECTROMETERS, sim_spectrometer_pair)
 from scan import (FrogScanConfig, FrogScanWorker, fwhm,
                   position_to_delay_fs, delay_to_position_um,
                   write_dwc, write_npz, write_csv,
@@ -1930,9 +1931,10 @@ class SimulationDialog(_ConnectDialog):
         grid.addWidget(b_spec, 0, 0); grid.addWidget(b_stage, 0, 1)
         b_pair = QPushButton("Stitched pair"); b_pair.setObjectName("accent")
         b_pair.setToolTip(
-            "Two simulated spectrometers covering overlapping halves of the "
-            "band, connected as one stitched device — the only way to "
-            "exercise multi-spectrometer mode without two on the bench")
+            "Two simulated spectrometers connected as one stitched device — "
+            "the only way to exercise multi-spectrometer mode without two on "
+            "the bench. Overlapping halves of the band, or the pair of real "
+            "instruments the beam names (see the description above)")
         b_pair.clicked.connect(lambda: self._do(self.main._use_sim_pair))
         grid.addWidget(b_pair, 1, 0, 1, 2)
         lay.addLayout(grid)
@@ -1964,6 +1966,13 @@ class SimulationDialog(_ConnectDialog):
         if isinstance(spec, SimulatedSpectrometer):
             desc += (f"\nSuggested scan: ±{spec.suggested_delay_fs:.0f} fs   ·   "
                      f"{spec.wavelengths[0]:.0f}–{spec.wavelengths[-1]:.0f} nm")
+        models = sim_spectrometer_pair(self.main.sim_pulse, self.main.sim_gate)
+        if models is not None:
+            # Named here rather than only in the tooltip: which two instruments
+            # Stitched pair is about to stand in for is part of the beam.
+            desc += ("\nStitched pair: "
+                     + " + ".join(SIM_SPECTROMETERS[m]["name"]
+                                  .replace("simulated ", "") for m in models))
         self.lbl_beam.setText(desc)
 
 
@@ -5236,6 +5245,39 @@ class FrogWindow(QMainWindow):
             position_to_delay=lambda pos_mm: position_to_delay_fs(
                 _stage_to_um(pos_mm), self.scan_cfg.zero_pos_um, self.scan_cfg.pass_factor))
 
+    def _make_sim_device(self, half):
+        """One member of the simulated pair, modelled on a REAL spectrometer.
+
+        Used for a beam that names a pair in PULSE_SHAPES (see "bird", whose
+        SHG covers 500–1400 nm and needs the Si + InGaAs bench to be measured
+        at all). Unlike the two halves below, these devices have their own
+        pixel grids, detector responses, darks and noise, so the two curves
+        differ for the reasons two real spectrometers differ — and the fit that
+        matches them has something real to absorb.
+
+        The matching calibration file is loaded when it is on disk: it is the
+        reciprocal of the device's simulated response, exactly as the shipped
+        files are for the hardware they were measured on. Without it the pair
+        still connects, and Auto-stitch then reports the large residual an
+        uncalibrated Si/InGaAs overlap really does have.
+        """
+        model = SIM_SPECTROMETERS[
+            sim_spectrometer_pair(self.sim_pulse, self.sim_gate)[half]]
+        sim = SimulatedSpectrometer(
+            self.stage, gate=self.sim_gate, pulse=self.sim_pulse,
+            position_to_delay=lambda pos_mm: position_to_delay_fs(
+                _stage_to_um(pos_mm), self.scan_cfg.zero_pos_um,
+                self.scan_cfg.pass_factor),
+            **model["device"])
+        sim.name = model["name"]
+        cal = CALIBRATION_DIR / f"{model['calibration']}.txt"
+        if cal.is_file():
+            try:
+                sim.set_calibration(cal)
+            except Exception:
+                pass        # raw counts is a fine fallback; nothing is wrong yet
+        return sim
+
     def _make_sim_member(self, half):
         """A simulated spectrometer covering one half of the simulated signal
         band, for use as a stitched-pair member.
@@ -5247,7 +5289,11 @@ class FrogWindow(QMainWindow):
         known to a constructed simulator (it is sized from the signal), hence
         the throwaway probe; construction touches no hardware and costs a
         handful of FFTs.
+
+        A beam that names its own pair of instruments gets those instead.
         """
+        if sim_spectrometer_pair(self.sim_pulse, self.sim_gate) is not None:
+            return self._make_sim_device(half)
         probe = self._make_sim_spectrometer()
         wl = np.asarray(probe.wavelengths, float)
         lo, hi = float(wl[0]), float(wl[-1])
@@ -5515,10 +5561,17 @@ class FrogWindow(QMainWindow):
         the bench — _open_slot_device matches the SIM_SLOT_DEVICES sentinels to
         the half-band simulators, so this is the ordinary pair path with the
         slots filled in for you.
+
+        The slot labels follow what the sentinels will actually open: the two
+        named instruments when the beam brings a pair of its own, the two
+        halves of its band otherwise.
         """
+        models = sim_spectrometer_pair(self.sim_pulse, self.sim_gate)
         for slot, (ident, label) in enumerate(SIM_SLOT_DEVICES):
             self._multi["serials"][slot] = ident
-            self._multi["labels"][slot]  = label
+            self._multi["labels"][slot]  = (
+                label if models is None
+                else SIM_SPECTROMETERS[models[slot]]["name"])
         return self._connect_multi_pair()
 
     def _disconnect_spectrometer(self):
