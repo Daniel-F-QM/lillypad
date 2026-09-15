@@ -143,8 +143,24 @@ integration time throws it away and says why. Record it again.
 
 # Alignment tools
 
-Three diagnostic views. **None of them change your data** — the saved result and
+Four diagnostic views. **None of them change your data** — the saved result and
 every export are exactly what they would have been without them.
+
+### + — before and after
+
+*Top-right of the Spectrum panel.* Freezes the spectrum currently on the panel
+and keeps it as a **grey curve underneath the live one**, so you can make an
+adjustment and see exactly what it changed rather than trying to remember the
+shape.
+
+An **eye** button appears beside the **+** to hide and show the reference.
+Pressing **+** again replaces it with the current spectrum; right-clicking **+**
+drops it altogether.
+
+With two spectrometers the shape of the reference follows the view it was taken
+in: freeze the combined curve and you get one grey curve, freeze the split view
+and you get one per spectrometer. It then **stays on the panel whichever view
+you switch to** — grey counts against wavelength read the same either way.
 
 ### Δ — is the pulse symmetric in time?
 

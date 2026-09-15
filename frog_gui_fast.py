@@ -231,13 +231,6 @@ def _make_check_icon(color, tag):
 HDR_BTN = 24
 HDR_GAP = 4
 HDR_PAD = 6
-# Width of a header button carrying a WORD rather than a mark. Sized against
-# the WIDEST plausible rendering, not the expected one: "log" at #overlay[word]'s
-# 13px/600 is ~24px in Segoe UI but measures 39 on a wide fallback face, and a
-# clipped three-letter label is the one failure mode this button cannot absorb.
-# Nothing bounds it from above any more — the group sits after the title, where
-# _position_panel_buttons' clamp handles a narrow panel.
-HDR_LBL = 44
 # Space after a panel title before the buttons that qualify it, and the clear
 # span that separates that group from the right-aligned row. The second is much
 # the larger of the two: it is the only thing telling the eye these are two
@@ -251,13 +244,14 @@ HDR_ICON = 14
 
 
 def _glyph_icon(kind, color, px=HDR_ICON):
-    """A play/stop glyph as a QIcon, drawn in `color`.
+    """A play / stop / plus glyph as a QIcon, drawn in `color`.
 
-    Generated rather than loaded from icons/ because this one button has to
-    re-colour itself twice over: once for its state (accent while stopped,
-    danger while running) and once for the theme. A PNG can do neither, and the
-    four files it would otherwise take would still be wrong the moment either
-    palette changes. Same QPainter approach as the spinbox arrows above.
+    Generated rather than loaded from icons/ because these buttons have to
+    re-colour themselves twice over: once for their state (the feed's accent
+    while stopped, danger while running) and once for the theme. A PNG can do
+    neither, and the files it would otherwise take would still be wrong the
+    moment either palette changes. Same QPainter approach as the spinbox arrows
+    above.
 
     Rendered at the screen's device pixel ratio: at 150% Windows scaling a
     logical-size pixmap is upscaled by the compositor, which both softens the
@@ -283,6 +277,16 @@ def _glyph_icon(kind, color, px=HDR_ICON):
         x0 = c - w / 3.0
         p.drawPolygon(QPolygonF([QPointF(x0, c - h / 2), QPointF(x0, c + h / 2),
                                  QPointF(x0 + w, c)]))
+    elif kind == "plus":
+        # Two filled bars, not a stroked cross: the same NoPen/brush path as the
+        # other two marks, so all three land on the pixel grid the same way at
+        # any device ratio. Arms nearly the full icon, like the glyphs in the
+        # PNG buttons beside it — a small plus in a 24 px button reads as a
+        # decoration rather than as the control.
+        arm, th = 0.78 * n, 0.16 * n
+        r = th / 2.0
+        p.drawRoundedRect(QRectF(c - arm / 2, c - th / 2, arm, th), r, r)
+        p.drawRoundedRect(QRectF(c - th / 2, c - arm / 2, th, arm), r, r)
     else:
         s = 0.56 * n
         p.drawRoundedRect(QRectF(c - s / 2, c - s / 2, s, s), 0.10 * n, 0.10 * n)
@@ -335,12 +339,6 @@ QPushButton#overlay:pressed {{ background-color:{pal['accent']}; color:{pal['bg'
    thicker accent border reads as pressed-in while leaving the mark on top. */
 QPushButton#overlay:checked {{ background-color:{pal['border_hover']};
     border:2px solid {pal['accent']}; }}
-/* A header button whose whole content is a WORD, not a mark. One step up from
-   #overlay's 12px: the icon buttons beside it fill their 24px with a glyph
-   drawn to the edges, and 12px lettering next to those reads as a caption
-   rather than a control. Inherits everything else from #overlay above — Qt
-   applies both rules, this one only overriding what it names. */
-QPushButton#overlay[word="true"] {{ font-size:13px; font-weight:600; }}
 QPushButton#overlay:checked:hover {{ background-color:{pal['accent']};
     color:{pal['bg']}; }}
 /* The "no spectrometer connected" message centred on an empty spectrum panel.
@@ -521,6 +519,15 @@ LOCKED_ICON   = {"dark":  resource_path("icons", "locked_dark.png"),
 # mode-icon convention: one mark, one file per theme's accent.
 REFRESH_ICON = {"dark":  resource_path("icons", "refresh_dark.png"),
                 "light": resource_path("icons", "refresh_light.png")}
+# Frozen-reference visibility, beside the + that created it. A two-state PAIR,
+# so it follows SPLIT_ICON/MERGE_ICON rather than the padlock: each icon shows
+# the view a click GIVES you — the open eye puts the reference back, the struck
+# -through one takes it away. (The + itself is a generated glyph, not a file;
+# see _glyph_icon.)
+SHOW_ICON = {"dark":  resource_path("icons", "show_dark.png"),
+             "light": resource_path("icons", "show_light.png")}
+HIDE_ICON = {"dark":  resource_path("icons", "hide_dark.png"),
+             "light": resource_path("icons", "hide_light.png")}
 # Symmetry mode, on the FROG trace panel's header. ONE file for both themes —
 # the mark is a mirror line, which reads the same either way.
 SYMMETRY_ICON = resource_path("icons", "symmetry.png")
@@ -2931,6 +2938,10 @@ _AC_YLIM = (0.0, 1.05)
 # Title offsets in inches, so the gaps are DPI- and resize-independent.
 _TITLE_ABOVE_IN  = 6 / 72   # centres the 12 pt title in the header band
 _TITLE_INSET_IN  = (0.08, 0.06)   # (right, down) from the axes' top-left corner
+# Strip an INSIDE title occupies, measured down from the axes' top spine: the
+# inset above the text, the 12 pt line itself, and a little air under it. A
+# panel titled this way keeps its curves below the band — see _title_band_frac.
+_TITLE_BAND_IN   = _TITLE_INSET_IN[1] + 12 / 72 + 4 / 72
 
 # The rest of the panel header band (HDR_BTN and friends) is defined up with
 # the other Qt chrome constants — _glyph_icon needs HDR_ICON at import time.
@@ -3100,6 +3111,7 @@ class FrogCanvas(FigureCanvasQTAgg):
     fold_dragged = Signal(float)     # symmetry fold line moved to this delay
     fold_reset_requested = Signal()  # double-click on it → back to the AC peak
     axis_edit_failed = Signal(str)   # typed axis bound rejected → status bar
+    reference_changed = Signal()     # reference frozen, dropped, hidden, shown
 
     def __init__(self):
         self.fig = Figure(facecolor=PALETTE["plot_bg"])
@@ -3180,6 +3192,36 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.band_span.set_visible(False)
         self._band = None
         self._overlay = False
+        # ── The frozen reference ──────────────────────────────────────────
+        # One artist per curve the panel is able to show, since a snapshot taken
+        # in the pair view is two curves and one taken in the combined view is
+        # a single curve. Which of the two it is depends only on the view it was
+        # FROZEN in: a reference stays on screen across a split/unsplit toggle,
+        # because grey counts against wavelength say the same thing whichever
+        # live curves are drawn over them, and a reference that disappeared
+        # every time the view moved would be no reference at all.
+        #
+        # Grey — the theme's dim text colour, the one thing on the panel that is
+        # neither accent nor a member colour — so "then" is separable from "now"
+        # at a glance in EITHER view, and re-themed in apply_palette because a
+        # grey that carries on one background does not on the other. Slightly
+        # transparent on top of that: at full strength the light theme's grey is
+        # dark enough to read as the MORE important curve of the two, which is
+        # the one thing a reference must never do.
+        #
+        # Under the live curves, and deliberately NOT animated: a reference
+        # moves only when it is frozen, hidden, shown or dropped, and every one
+        # of those ends in the _request_full() that bakes it into the blit
+        # background. Animating it would cost each live frame three draw_artist
+        # calls to put back curves that never changed.
+        ref_kw = dict(color=PALETTE["text_dim"], lw=1, alpha=0.75, zorder=1.5)
+        (self.ref_spec,) = self.ax_spec.plot([], [], **ref_kw)
+        (self.ref_m1,)   = self.ax_spec.plot([], [], **ref_kw)
+        (self.ref_m2,)   = self.ax_spec.plot([], [], **ref_kw)
+        for ln in (self.ref_spec, self.ref_m1, self.ref_m2):
+            ln.set_visible(False)
+        self._ref = None          # [(x, y), …]: one entry, or one per member
+        self._ref_shown = True    # the eye toggle
         # Alignment mode: the two symmetry-difference curves, on their OWN panel
         # rather than over the spectrum. They used to share ax_spec, which put
         # two quantities that happen to share an axis and a unit on one set of
@@ -3323,6 +3365,9 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._ylim_t      = 0.0    # monotonic stamp of the last filter step
         self._ylim_fast   = False  # latched: contracting onto a real change
         self._dev_xlim_cache = None           # mirrors _xlim_cache when open
+        # The last y range _autoscale_dev fitted, so a resize can tell its own
+        # view from one the user has since zoomed by hand.
+        self._dev_ylim_auto = None
         self._ac_xlim_cache = (-1.0, 1.0)     # the empty-state ranges set above
         self._ac_ylim_cache = _AC_YLIM
         self._trace_xlim_cache = None
@@ -3471,6 +3516,14 @@ class FrogCanvas(FigureCanvasQTAgg):
             self.ax_ac.set_position([L, BOT, R - L, h_ac])
             # Only the top row is split — the autocorrelation spans both columns.
             split_bot = BOT + h_ac + rgap
+        # The deviation panel reserves a strip of its y range for the title it
+        # carries inside itself, and that strip is a fixed height in inches —
+        # so a panel that just changed height needs the fit done again. Only
+        # when the view is still the one the fit produced: a hand-drawn zoom is
+        # the user's, and a resize is no reason to throw it away.
+        if self._dev_on and self._dev_ylim_auto is not None \
+                and self.ax_dev.get_ylim() == self._dev_ylim_auto:
+            self._autoscale_dev()
         # The gap's centre line, over the rows the two sides actually share.
         self._split_band = (right_x - cgap / 2.0, split_bot, TOP)
         self._position_split_handle()
@@ -3538,6 +3591,19 @@ class FrogCanvas(FigureCanvasQTAgg):
         except (ValueError, RuntimeError):
             return left
         return max(bb.x1 / self.devicePixelRatioF(), left)
+
+    def _title_band_frac(self, ax):
+        """Fraction of `ax`'s height taken by a title drawn INSIDE it.
+
+        In inches like the title offsets themselves, so the band stays the same
+        strip of screen however the window is resized, and clamped so a panel
+        squeezed very short hands the title a slice rather than its whole y
+        range.
+        """
+        h_in = ax.get_position().height * float(self.fig.get_figheight())
+        if h_in <= 0.0:
+            return 0.0
+        return min(_TITLE_BAND_IN / h_in, 0.4)
 
     def panel_rect_px(self, ax):
         """`ax` as a QRect in canvas widget pixels — what an overlay widget
@@ -3682,6 +3748,12 @@ class FrogCanvas(FigureCanvasQTAgg):
         # follow the theme. The ghost fills are drawn in DIFF_COLORS too, so
         # they need no re-colouring either.
         self.diff_zero.set_color(pal["text_dim"])
+        # The reference curves DO follow the theme, unlike the member curves
+        # they can be drawn beneath: their whole job is to read as "not live",
+        # which takes a grey that recedes into the plot background it is on —
+        # and the greys that do that on white and on near-black are different.
+        for ln in (self.ref_spec, self.ref_m1, self.ref_m2):
+            ln.set_color(pal["text_dim"])
         self._style()   # re-applies axes/tick/label/grid colors from PALETTE
         self._apply_cmap()   # masked pixels must follow the new background
         self._split.update()  # a Qt child: draw_idle would not repaint it
@@ -4245,6 +4317,10 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.line_ac.set_linewidth(lw)
         self.line_m1.set_linewidth(lw)
         self.line_m2.set_linewidth(lw)
+        # The reference is a spectrum like any other — a frozen curve drawn at
+        # a width the live ones are not would read as a different kind of thing.
+        for ln in (self.ref_spec, self.ref_m1, self.ref_m2):
+            ln.set_linewidth(lw)
         self.draw_idle()
 
     # ── Spectrum panel: combined curve vs one curve per spectrometer ──────
@@ -4268,6 +4344,9 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.band_span.set_visible(overlay and self._band is not None)
         for ln in ((self.line_spec,) if overlay else (self.line_m1, self.line_m2)):
             ln.set_data([], [])
+        # The frozen reference is deliberately NOT touched here: it stays on the
+        # panel across the toggle, in the shape it was frozen in.
+        #
         # Switching views is rare and changes which curves exist on screen; a
         # full draw re-caches both blit backgrounds, so nothing from the
         # previous view can survive in them. _request_full (not draw_idle)
@@ -4316,6 +4395,76 @@ class FrogCanvas(FigureCanvasQTAgg):
         self.clear_members()
         self.line_spec.set_data([], [])
         self._request_full()
+
+    # ── Spectrum panel: the frozen reference ──────────────────────────────
+    # A grey copy of the spectrum as it was at some moment, kept under the live
+    # curves so an adjustment can be judged against what preceded it. Nothing
+    # here touches the recorded data or any export: it is a second set of
+    # artists on the panel and nothing else.
+    def freeze_reference(self):
+        """Snapshot the curves now on the spectrum panel. False if it is empty.
+
+        Takes what is PLOTTED rather than a frame from upstream. That is the one
+        description of the panel already correct in both views and under every
+        correction applied to get there (dark, calibration, stitch factor), so
+        a reference can never disagree with the curve it was taken from.
+
+        Copied, not referenced: set_data keeps whatever array it was handed, and
+        the next frame is free to reuse that buffer — a reference quietly
+        tracking the live signal is the one failure this must not have.
+        """
+        src = (self.line_m1, self.line_m2) if self._overlay else (self.line_spec,)
+        curves = [(np.array(ln.get_xdata(), dtype=float),
+                   np.array(ln.get_ydata(), dtype=float)) for ln in src]
+        if not all(x.size for x, _ in curves):
+            return False
+        self._ref = curves
+        self._ref_shown = True     # freezing something you cannot see is a trap
+        self._sync_reference()
+        return True
+
+    def clear_reference(self):
+        """Drop the snapshot entirely — the panel keeps no memory of it."""
+        self._ref = None
+        self._sync_reference()
+
+    def set_reference_visible(self, on):
+        self._ref_shown = bool(on)
+        self._sync_reference()
+
+    def has_reference(self):
+        return self._ref is not None
+
+    def reference_shown(self):
+        return self._ref is not None and self._ref_shown
+
+    def _sync_reference(self):
+        """Put the reference artists in step with the snapshot and the eye
+        toggle, then re-cache the background.
+
+        Which artists carry it follows the shape of the SNAPSHOT, not the view
+        on the panel: a reference frozen apart stays two curves, and a combined
+        one stays a single curve, whichever way the live spectrum is being
+        drawn over them.
+
+        Data is CLEARED off whichever artists go dark rather than only hidden,
+        for the reason in _set_spec_mode: relim() is called with
+        visible_only=True, so an array left on a hidden line is invisible to the
+        auto-scale right up until it is shown again and is not.
+        """
+        curves = self._ref if self._ref_shown and self._ref is not None else ()
+        targets = (self.ref_m1, self.ref_m2) if len(curves) == 2 else (self.ref_spec,)
+        live = set()
+        for ln, (x, y) in zip(targets, curves):
+            ln.set_data(x, y)
+            ln.set_visible(True)
+            live.add(id(ln))
+        for ln in (self.ref_spec, self.ref_m1, self.ref_m2):
+            if id(ln) not in live:
+                ln.set_data([], [])
+                ln.set_visible(False)
+        self._request_full()      # static artist: it lives in the blit cache
+        self.reference_changed.emit()
 
     # ── Alignment mode: the deviation panel ───────────────────────────────
     def set_dev_visible(self, on):
@@ -4413,7 +4562,18 @@ class FrogCanvas(FigureCanvasQTAgg):
         if hi <= lo:                     # an all-zero difference: show a band
             lo, hi = lo - 1.0, hi + 1.0
         pad = 0.05 * (hi - lo)
-        self.ax_dev.set_ylim(lo - pad, hi + pad)
+        lo, hi = lo - pad, hi + pad
+        # This panel's title is drawn INSIDE its top-left corner — the spectrum
+        # sits flush above it, so there is no header band to put it in — and a
+        # symmetry difference is usually one-sided, which parks the zero line
+        # and the flat wings of both curves in exactly that spot. So the fit
+        # above is given only the part of the panel BELOW the title band, and
+        # the view stretched back out around it.
+        frac = self._title_band_frac(self.ax_dev)
+        if frac > 0.0:
+            hi = lo + (hi - lo) / (1.0 - frac)
+        self.ax_dev.set_ylim(lo, hi)
+        self._dev_ylim_auto = (lo, hi)
 
     def clear_diff(self):
         """Empty the deviation panel — both curves and the remembered sweep.
@@ -5221,6 +5381,11 @@ class FrogWindow(QMainWindow):
                 self.canvas.clear_spectrum()
             else:
                 self.canvas.clear_members()  # a dead pair's curves can't linger
+            # And the reference with them, in both cases: it is a spectrum from
+            # the outgoing device, on that device's pixel grid, and comparing
+            # the incoming one against it would be meaningless where it was not
+            # simply misleading.
+            self.canvas.clear_reference()
             # Same for both halves of alignment mode: a difference and a raw
             # trace describe the device that measured them, right down to the
             # pixel grid they sit on.
@@ -5576,13 +5741,16 @@ class FrogWindow(QMainWindow):
         # The text is the CURRENT scale, matching the padlock beside it rather
         # than the "icon shows what a click gives you" rule the pair toggles
         # use. Both of these read as a readout of the axis' state.
+        #
+        # Square like every other header button, not widened for its label: at
+        # #overlay's 12px/600 "log" measures 18 px in Segoe UI and 21 on the
+        # widest face in FONT_STACK, against the 22 px this button's content box
+        # gives it — so the word fits as it is, and a lone oblong in the row was
+        # the only thing that had ever made it look like a different kind of
+        # control.
         self.btn_logscale = QPushButton(self.canvas)
         self.btn_logscale.setObjectName("overlay")
-        # Selects the larger type in build_stylesheet — see #overlay[word].
-        # A dynamic property rather than a second objectName, so the button
-        # still picks up every #overlay rule (hover, pressed, the lot).
-        self.btn_logscale.setProperty("word", "true")
-        self.btn_logscale.setFixedSize(HDR_LBL, HDR_BTN)
+        self.btn_logscale.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_logscale.show()
         # Through the checkbox, not canvas.set_log_scale: chk_log is the single
         # source of truth for the scale (it is what gets persisted, and what the
@@ -5618,6 +5786,43 @@ class FrogWindow(QMainWindow):
         self.btn_feed.show()
         self.btn_feed.toggled.connect(self._toggle_feed)
         self._refresh_feed_button()
+
+        # Freeze the spectrum as a grey reference, next to the feed whose newest
+        # frame it captures. A generated glyph rather than a pair of PNGs, like
+        # that neighbour: a plus is two bars, and drawing it from the live
+        # PALETTE saves two files that would be wrong the moment an accent moved.
+        self.btn_freeze = QPushButton(self.canvas)
+        self.btn_freeze.setObjectName("overlay")
+        self.btn_freeze.setFixedSize(HDR_BTN, HDR_BTN)
+        self.btn_freeze.setIconSize(QSize(HDR_ICON, HDR_ICON))
+        self._refresh_freeze_icon()
+        self.btn_freeze.setToolTip(
+            "Freeze the spectrum as a grey reference under the live curve — "
+            "make an adjustment, and you can see exactly what it changed.\n"
+            "Press again to replace the reference with the current spectrum, "
+            "or right-click to drop it.")
+        self.btn_freeze.show()
+        self.btn_freeze.clicked.connect(self._freeze_reference)
+        # Dropping a reference has no button of its own: it is the rare half of
+        # a pair whose common half (hide) is beside it already, and a third
+        # header button for it would cost every session the room to say so.
+        self.btn_freeze.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.btn_freeze.customContextMenuRequested.connect(
+            lambda _pos: self._clear_reference())
+
+        # …and the reference's own hide/show. Pair-only in the same sense as the
+        # alignment sweep's re-run button: it exists exactly as long as there is
+        # something for it to act on, so _refresh_reference_button owns both its
+        # visibility and its icon.
+        self.btn_refshow = QPushButton(self.canvas)
+        self.btn_refshow.setObjectName("overlay")
+        self.btn_refshow.setFixedSize(HDR_BTN, HDR_BTN)
+        self.btn_refshow.setIconSize(QSize(HDR_ICON, HDR_ICON))
+        # Not checkable: the eye already shows the state by showing the action,
+        # and a checked frame around it would be a second readout of the same
+        # bit — one that says "on" while the eye says "hide".
+        self.btn_refshow.hide()
+        self.btn_refshow.clicked.connect(self._toggle_reference)
 
         # Per-spectrometer view toggle. Only meaningful for a stitched pair, so
         # it stays hidden otherwise; its icon and tooltip are set by
@@ -5702,6 +5907,13 @@ class FrogWindow(QMainWindow):
 
         self.canvas.axes_relaid.connect(self._position_panel_buttons)
         self._position_panel_buttons()
+
+        # The reference's toggle is an INDICATOR as much as a control, and the
+        # canvas is what owns the state — a freeze from the button, a drop from
+        # a device swap. One connection covers every way in, so the eye cannot
+        # end up describing a reference that is not there.
+        self.canvas.reference_changed.connect(self._refresh_reference_button)
+        self._refresh_reference_button()
 
         self._refresh_layout_button()    # needs the canvas for the current mode
 
@@ -6410,7 +6622,7 @@ class FrogWindow(QMainWindow):
         # _travel_range_um falls back to 300 mm of travel, and _apply_stage
         # calls this again with the real numbers on every connect.
         self._update_stage_unit_ranges()
-        self.spin_step.setValue(100.0)     # after ranges: default 100 fs jog
+        self.spin_step.setValue(10.0)      # after ranges: default 10 fs jog
         self._sync_backlash_ui()
 
         self.btn_connect_stage = QPushButton("Connect Stage")
@@ -6448,8 +6660,8 @@ class FrogWindow(QMainWindow):
         self.spin_start = DoubleSpinBox()
         self.spin_stop  = DoubleSpinBox()
         self.spin_step_fs = DoubleSpinBox()
-        cell(0, 0, "Start", self.spin_start, " fs", 1, -1e6, 1e6, -500.0)
-        cell(0, 2, "Stop",  self.spin_stop,  " fs", 1, -1e6, 1e6,  500.0)
+        cell(0, 0, "Start", self.spin_start, " fs", 1, -1e6, 1e6, -250.0)
+        cell(0, 2, "Stop",  self.spin_stop,  " fs", 1, -1e6, 1e6,  250.0)
         # The um equivalents move under their own boxes — as a full-width pair
         # they would push the group back out to three rows.
         self.eq_start = QLabel(""); self.eq_start.setObjectName("dim")
@@ -6514,6 +6726,8 @@ class FrogWindow(QMainWindow):
         self._refresh_autofit_icon()     # …and the auto-fit mark
         self._refresh_autostitch_icon()  # …as does this one
         self._refresh_autoscale_icon()   # …and this one
+        self._refresh_freeze_icon()      # …the + is drawn from PALETTE too
+        self._refresh_reference_button() # …and the eye has one file per theme
         self._size_moving_label()        # its font came from the stylesheet
         self.pnl_no_spec.refresh_theme()  # …and its watermark is tinted live
         self.status.showMessage(f"{name.capitalize()} mode.", 2000)
@@ -7376,7 +7590,8 @@ class FrogWindow(QMainWindow):
                 x += b.width() + HDR_GAP
 
         spec_right = pack(
-            c.ax_spec, [self.btn_autofit, self.btn_feed, self.btn_autostitch,
+            c.ax_spec, [self.btn_autofit, self.btn_feed, self.btn_freeze,
+                        self.btn_refshow, self.btn_autostitch,
                         self.btn_overlay, self.btn_align_spec,
                         self.btn_align_refresh])
         pack(c.ax_trace, [self.btn_align_trace, self.btn_symmetry])
@@ -7416,6 +7631,62 @@ class FrogWindow(QMainWindow):
         else:
             self.btn_autoscale.setIcon(QIcon())
             self.btn_autoscale.setText("🔓" if on else "🔒")
+
+    def _refresh_freeze_icon(self):
+        """The + mark, drawn from the live PALETTE so a theme switch reruns it
+        — same arrangement as the feed button's play/stop glyph."""
+        self.btn_freeze.setIcon(_glyph_icon("plus", PALETTE["accent"]))
+
+    def _freeze_reference(self):
+        """Capture the spectrum panel as it stands.
+
+        Replaces any reference already held rather than refusing: this button is
+        reached for after every adjustment, and making that "drop, then freeze"
+        would be two presses for the one thing anyone ever wants.
+        """
+        if not self.canvas.freeze_reference():
+            self.status.showMessage(
+                "Nothing on the spectrum panel to freeze yet.", 4000)
+            return
+        self.status.showMessage(
+            "Spectrum frozen as a grey reference — press + again to replace "
+            "it, the eye to hide it, or right-click + to drop it.", 6000)
+
+    def _toggle_reference(self):
+        self.canvas.set_reference_visible(not self.canvas.reference_shown())
+
+    def _clear_reference(self):
+        """Right-click on +. Silent when there is nothing held: a right-click
+        that reports having done nothing is just noise."""
+        if self.canvas.has_reference():
+            self.canvas.clear_reference()
+            self.status.showMessage("Reference spectrum dropped.", 3000)
+
+    def _refresh_reference_button(self):
+        """Visibility, icon and tooltip of the reference's hide/show toggle.
+
+        The icon shows the ACTION its two files were drawn for (see SHOW_ICON):
+        a reference on screen offers the struck-through eye, a hidden one the
+        open eye.
+        """
+        c = self.canvas
+        have = c.has_reference()
+        self.btn_refshow.setVisible(have)
+        if have:
+            shown = c.reference_shown()
+            icon = (HIDE_ICON if shown else SHOW_ICON)[self._theme]
+            if icon.exists():
+                self.btn_refshow.setIcon(QIcon(str(icon)))
+                self.btn_refshow.setText("")
+            else:
+                self.btn_refshow.setIcon(QIcon())
+                self.btn_refshow.setText("◉" if shown else "○")
+            self.btn_refshow.setToolTip(
+                "Hide the frozen reference spectrum" if shown else
+                "Show the frozen reference spectrum")
+        # Its visibility just changed, and the header row is packed
+        # right-to-left around whatever is showing.
+        self._position_panel_buttons()
 
     def _refresh_logscale_button(self):
         """Label and tooltip of the log/linear toggle. Reads the checkbox, not
