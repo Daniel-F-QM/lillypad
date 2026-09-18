@@ -183,6 +183,30 @@ Easy to mix up:
 A dark is only valid for the exposure it was taken at, so changing the
 integration time throws it away and says why. Record it again.
 
+**What the trace panel shows.** Every panel is drawn with the pedestal taken
+off. While a scan runs that is the recorded dark, sampled once when the scan
+starts so the whole trace is corrected the same way — unticking **Subtract
+Dark** mid-scan therefore applies to the *next* one. When the scan finishes the
+panel switches to the scan's own bracketed background, which was measured with
+the beam blocked and already contains the dark, so the two are never subtracted
+together. With **Background** unticked it stays on the dark; with neither, the
+trace is drawn as measured.
+
+This matters most on a **stitched pair**, where it is the difference between a
+readable trace and a mystery. The two detectors have very different dark
+levels, the blue one's is multiplied by the stitch factor, and the calibration
+multiplies both — hardest right where a detector's response dies. An
+uncorrected merged frame therefore carries a *step* across the crossfade band,
+at the same wavelengths in every column, which draws as a hard horizontal line
+across the whole FROG trace.
+
+All of this is display only. `result.trace`, the `.npz` and the exports are
+untouched: the `.dwc` and `.csv` have always been written background-subtracted
+(the panel now agrees with them), and the `.npz` still archives raw counts with
+both background frames kept separately. One thing has *not* followed: the
+`fwhm_ac_fs` field inside the `.npz` metadata is still computed from the raw
+trace, so it can differ slightly from the **AC FWHM** shown on the panel.
+
 ---
 
 # Alignment tools

@@ -97,7 +97,7 @@ from hardware import (SimulatedStage, SimulatedSpectrometer,
                       load_calibration_file, SEABREEZE_BACKENDS,
                       PULSE_SHAPES, DEFAULT_PULSE,
                       SIM_SPECTROMETERS, sim_spectrometer_pair)
-from scan import (FrogScanConfig, FrogScanWorker, fwhm,
+from scan import (FrogScanConfig, FrogScanWorker, fwhm, autocorrelation,
                   position_to_delay_fs, delay_to_position_um,
                   write_dwc, write_npz, write_csv,
                   _um_to_stage, _stage_to_um)
@@ -5325,6 +5325,17 @@ class FrogWindow(QMainWindow):
         # without touching self.spec from the GUI thread while the worker is
         # inside acquire().
         self._scan_wl      = None
+        # The pedestal the running scan's columns are drawn against, sampled
+        # once when it starts (see _start_scan). None = draw them as measured.
+        self._scan_dark    = None
+        # The finished scan as the panels show it — pedestal removed — and its
+        # autocorrelation. Every view of a finished trace (the trace itself,
+        # the symmetry fold, the width readout) is built from these two rather
+        # than from result.trace, so none of them can disagree with the others
+        # or with the exported file. Both are None until a scan finishes;
+        # result.trace itself is never modified.
+        self._result_view  = None
+        self._result_ac    = None
         # ── Alignment mode ────────────────────────────────────────────────
         # Diagnostic views only: none of this reaches the FrogResult or any
         # export. _align_worker runs the four-point symmetry measurement;
@@ -7617,6 +7628,37 @@ class FrogWindow(QMainWindow):
         # raw-ADC property, the calibration is display/data physics.
         return self.spec.calibrate(spectrum)
 
+    def _display_dark(self):
+        """The pedestal to take off a MERGED, CALIBRATED frame before drawing
+        it — or None when there is nothing to take off.
+
+        The trace panel's counterpart to _corrected_spectrum, which cannot use
+        that function: a scan column arrives already merged and calibrated and
+        there are no per-column member frames to rebuild it from, so the dark
+        has to be pushed through the same merge instead of being taken off each
+        member first. StitchedSpectrometer.combined_dark is that push, at the
+        CURRENT stitch factor and band, which is what lands this on the same
+        baseline the live spectrum was drawn against. A single device's dark is
+        raw counts, so it takes the calibration the column already carries.
+
+        Returning None rather than raising on a mismatch is deliberate: an
+        uncorrected trace is honest, a trace with somebody else's pedestal
+        subtracted is not.
+        """
+        if not self.chk_dark.isChecked():
+            return None
+        if self._pair_live():
+            darks = self.background_members
+            if darks is None:
+                return None
+            try:
+                return self.spec.combined_dark(darks)
+            except Exception:
+                return None        # mismatched shapes: better raw than wrong
+        if self.background is None:
+            return None
+        return self.spec.calibrate(self.background)
+
     def _warn_dark_mismatch(self):
         """Say once that a recorded dark does not fit the live pair.
 
@@ -8278,8 +8320,7 @@ class FrogWindow(QMainWindow):
         """The symmetry view of the finished scan, or None if there is none."""
         if self.result is None:
             return None
-        return self._symmetry_view(self.result.trace,
-                                   self.result.autocorrelation(),
+        return self._symmetry_view(self._result_view, self._result_ac,
                                    self.result.delays_fs)
 
     def _show_symmetry(self):
@@ -8301,11 +8342,9 @@ class FrogWindow(QMainWindow):
         be work with nothing to show for it."""
         if self.result is None or not self._symmetry_on:
             return
-        before = self._symmetry_center(self.result.autocorrelation(),
-                                       self.result.delays_fs)
+        before = self._symmetry_center(self._result_ac, self.result.delays_fs)
         self._fold_fs = float(x_fs)
-        after = self._symmetry_center(self.result.autocorrelation(),
-                                      self.result.delays_fs)
+        after = self._symmetry_center(self._result_ac, self.result.delays_fs)
         if after != before:
             self._show_symmetry()
 
@@ -8388,7 +8427,7 @@ class FrogWindow(QMainWindow):
     def _restore_trace_view(self):
         """Put the ordinary trace back after a display mode is switched off."""
         if self.result is not None:
-            self.canvas.update_trace(self.result.trace)
+            self.canvas.update_trace(self._result_view)
         elif self._scan_trace is not None:
             self.canvas.update_trace(self._scan_trace, self._scan_peak)
 
@@ -8967,6 +9006,23 @@ class FrogWindow(QMainWindow):
         self._scan_trace  = np.zeros((wl.size, delays.size))
         self._scan_delays = delays
         self._scan_wl     = wl
+        # The pedestal every column of THIS scan is drawn against, sampled once
+        # here rather than per column or per render.
+        #
+        # Once, because a trace assembled from columns corrected two different
+        # ways is not a picture of anything — and because the alternative,
+        # subtracting at render time, is a pass over the whole trace on every
+        # display tick (measured: 12 ms on a 4000 x 1000 trace, against the
+        # 4 ms the row pooling already costs), where doing it as each column
+        # lands is one 4000-element subtract.
+        #
+        # Nothing it depends on can move mid-scan in any case: the worker owns
+        # the device, so no dark can be recorded and Auto-stitch cannot re-fit,
+        # and the Spectrometer window (the band) is locked out for the
+        # duration. The one thing an operator CAN still do is untick Subtract
+        # Dark, and that now takes effect on the next scan rather than striping
+        # this one.
+        self._scan_dark   = self._display_dark()
         # Running reductions _on_column keeps current, so the per-column render
         # never has to walk the trace. Reallocated with the trace: an aborted
         # scan leaves these sized to the OLD delay axis.
@@ -9023,7 +9079,14 @@ class FrogWindow(QMainWindow):
         Every column is RECORDED here (the data path must never drop), but
         rendering is deferred to _display_tick so a slow machine skips
         intermediate redraws instead of queuing them up.
+
+        `col` is corrected on the way in. _scan_trace is a DISPLAY buffer — the
+        FrogResult is assembled by the worker from its own array, and nothing
+        here reaches a file — so this is the one place the correction has to
+        happen for the trace, the running peak, the autocorrelation sum and the
+        spectrum panel to agree about what a column contains.
         """
+        col = self._corrected_column(col)
         self._scan_trace[:, i] = col
         # The raw member frames are interpolated and cut ONCE, here, rather
         # than kept per column and re-derived at render time: that keeps the
@@ -9083,8 +9146,9 @@ class FrogWindow(QMainWindow):
             if self._scan_wl is not None:
                 if not (self._overlay_on
                         and self._render_overlay(self._scan_members_raw)):
-                    self.canvas.update_spectrum(self._scan_wl,
-                                                self._scan_col_corrected())
+                    # Already corrected, in _on_column, along with the column
+                    # that went into the trace beside this panel.
+                    self.canvas.update_spectrum(self._scan_wl, self._scan_col)
             if self._align_trace_on and self._align_trace is not None:
                 self.canvas.update_trace(self._align_trace_view(), 1.0)
             else:
@@ -9094,33 +9158,23 @@ class FrogWindow(QMainWindow):
             # repaint is the same blit the three updates above share.
             self.canvas.set_fwhm(fwhm(self._scan_delays[:i + 1], ac))
 
-    def _scan_col_corrected(self):
-        """The scan column to plot, with the dark removed.
+    def _corrected_column(self, col):
+        """One scan column with this scan's pedestal removed.
 
-        A scan column arrives already merged and calibrated, and there are no
-        per-column member frames to rebuild it from, so a stitched pair takes
-        the DERIVED merged dark — the member darks pushed through the current
-        factor and band. That lands on the same baseline the live view used.
-        A single device's dark is raw counts and needs the calibration applied
-        to it first, since the worker's column already carries one.
+        A new array, never a write into `col`: the worker built that one and
+        the raw member frames beside it are what the RAW alignment view is
+        assembled from.
+
+        Clipped at zero like every other correction in the program
+        (prepare_pair, _corrected_spectrum): below the pedestal there is no
+        signal to show, and the trace panel has no way to draw a negative
+        count. The autocorrelation is unaffected by the floor — it subtracts
+        its own baseline (scan.autocorrelation).
         """
-        col = self._scan_col
-        if not self.chk_dark.isChecked():
+        bg = self._scan_dark
+        if bg is None or np.shape(bg) != np.shape(col):
             return col
-        if self._pair_live():
-            darks = self.background_members
-            if darks is None:
-                return col
-            try:
-                bg = self.spec.combined_dark(darks)
-            except Exception:
-                return col          # mismatched shapes: better raw than wrong
-            if bg.shape != np.shape(col):
-                return col
-            return np.clip(col - bg, 0, None)
-        if self.background is None:
-            return col
-        return np.clip(col - self.spec.calibrate(self.background), 0, None)
+        return np.clip(col - bg, 0, None)
 
     def _on_background(self, which, spectrum):
         self.status.showMessage(f"Background ({which}) captured.", 2500)
@@ -9161,8 +9215,40 @@ class FrogWindow(QMainWindow):
         if self._pair_live():
             self.lamp2.set_state("sat")
 
+    def _finished_trace_view(self, result):
+        """The finished scan as it should be DRAWN — pedestal removed.
+
+        Prefers the scan's OWN bracketed background over the recorded dark, and
+        never uses both: the background frames were taken through this very
+        pipeline with the beam blocked, so they already carry the dark along
+        with whatever stray light was on the bench, and subtracting the dark as
+        well would take the pedestal off twice. This is also exactly what
+        .dwc and .csv are written from (FrogResult.corrected_trace), so the
+        panel and the file finally agree.
+
+        Falls back to the dark when the scan ran with Background unticked, and
+        to the raw trace when there is neither — a trace with no pedestal
+        removed, which is what every finished scan used to show.
+
+        Display only. result.trace is untouched, and the .npz still archives
+        the raw counts with both background frames kept separately.
+        """
+        if result.background() is not None:
+            return np.clip(result.corrected_trace(), 0, None)
+        bg = self._scan_dark
+        if bg is None or np.shape(bg)[0] != np.shape(result.trace)[0]:
+            return result.trace
+        return np.clip(np.asarray(result.trace, float) - bg[:, None], 0, None)
+
     def _on_finished(self, result):
         self.result = result
+        # Cached, not recomputed per view: the symmetry fold and the RAW toggle
+        # both re-render from it, and it is a trace-sized subtraction.
+        self._result_view = self._finished_trace_view(result)
+        # From the SAME array the panel shows, so the curve and the width
+        # readout describe the picture above them. They used to come off
+        # result.trace, i.e. off the pedestal-bearing counts.
+        self._result_ac = autocorrelation(self._result_view)
         # The final render below supersedes any pending intermediate tick.
         self._scan_dirty = False
         if self._align_trace_on and self._align_trace is not None:
@@ -9170,10 +9256,10 @@ class FrogWindow(QMainWindow):
             # must not silently drop the operator back to the calibrated trace.
             self.canvas.update_trace(self._align_trace_view(), 1.0)
         else:
-            self.canvas.update_trace(result.trace)
-        ac = result.autocorrelation()
+            self.canvas.update_trace(self._result_view)
+        ac = self._result_ac
         self.canvas.update_ac(result.delays_fs, ac)
-        self.canvas.set_fwhm(result.fwhm_fs())
+        self.canvas.set_fwhm(fwhm(result.delays_fs, ac))
         self.progress.setValue(100)
         n_bad = int(result.faulted_columns().size)
         if n_bad:
