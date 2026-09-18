@@ -69,7 +69,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QLabel, QDoubleSpinBox, QSpinBox, QCheckBox, QPushButton,
     QProgressBar, QFrame, QScrollArea, QSizePolicy, QStatusBar, QFileDialog,
     QDialog, QToolBar, QSlider, QLineEdit, QMenu, QComboBox, QRubberBand,
-    QMessageBox, QInputDialog, QAbstractSpinBox
+    QMessageBox, QInputDialog, QAbstractSpinBox, QRadioButton
 )
 from PySide6.QtCore import (Qt, QTimer, QThread, Signal, QPointF, QSize, QRect,
                             QRectF, QPoint, QSignalBlocker, QObject)
@@ -475,6 +475,11 @@ ICON_ICO_PATH = resource_path("icons", "Lilypad.ico")
 ICON_PATH    = resource_path("icons", "Lilypad.png")   # README / large uses
 SUN_ICON     = resource_path("icons", "sun.png")
 MOON_ICON    = resource_path("icons", "moon.png")
+# Save the plots as a PNG, on the main toolbar between the theme and layout
+# toggles. An ACTION with no second state to depict, so it follows the
+# ALIGN_ICON/RESCALE_ICON convention: one mark, one file per theme's accent.
+PICTURE_ICON = {"dark":  resource_path("icons", "save_picture_dark.png"),
+                "light": resource_path("icons", "save_picture_light.png")}
 # One-shot auto-fit, on the spectrum panel's header. An ACTION, and the mark is
 # the same in both files — only the accent differs — so it follows the
 # ALIGN_ICON/STITCH_ICON convention rather than the two-state pairs'.
@@ -2952,6 +2957,20 @@ _TITLE_INSET_IN  = (0.08, 0.06)   # (right, down) from the axes' top-left corner
 # panel titled this way keeps its curves below the band — see _title_band_frac.
 _TITLE_BAND_IN   = _TITLE_INSET_IN[1] + 12 / 72 + 4 / 72
 
+# Resolution the toolbar's camera prints at (FrogCanvas.save_picture). The
+# figure is printed at the size it is ON SCREEN, so this is purely a detail
+# multiplier over the dpi the canvas is drawn at (100, times the display's
+# device-pixel ratio): every line, font and gap keeps exactly the proportion it
+# has in the window, and only the pixel count goes up. 300 dpi is what a
+# journal asks for.
+PICTURE_DPI = 300
+# …but the page's pixel size is the WINDOW's size times that ratio, and a
+# maximized window on a 4K panel would ask for ~10000 px of trace image —
+# tens of megabytes, and seconds of it on the GUI thread, for detail no
+# screen or printer will ever resolve. Past this the dpi is reduced to fit;
+# a page that big is already a long side of 20 inches at 300 dpi.
+PICTURE_MAX_PX = 6000
+
 # The rest of the panel header band (HDR_BTN and friends) is defined up with
 # the other Qt chrome constants — _glyph_icon needs HDR_ICON at import time.
 
@@ -3364,6 +3383,11 @@ class FrogCanvas(FigureCanvasQTAgg):
         self._batch = False
         self._want_blit = False
         self._want_full = False
+        # Set only for the duration of save_picture, which prints this very
+        # figure at a different size and dpi. Everything that caches something
+        # measured in SCREEN pixels — the blit backgrounds, the trace's row
+        # pooling — consults it and stands aside.
+        self._exporting = False
         self._clim_peak = None     # last clim top actually applied to the image
         # Cache last-applied limits so we only force a full redraw when they
         # actually move (autoscale otherwise re-sets identical limits each frame).
@@ -3774,6 +3798,13 @@ class FrogCanvas(FigureCanvasQTAgg):
         animated artists on top so they survive resizes and forced redraws."""
         if event is not None and event.canvas is not self:
             return
+        # A print draw (save_picture) runs at another dpi through another
+        # renderer, so its buffer is neither the size nor the content of the
+        # one on screen. Caching it would hand every later blit a background
+        # that does not fit the canvas it is restored into; save_picture ends
+        # in a draw_idle() that re-takes both caches honestly.
+        if self._exporting:
+            return
         self._bg = self.copy_from_bbox(self.fig.bbox)
         self._bg_static = None       # figure changed; recomposite lazily
         for ax, art in self._animated:
@@ -3883,6 +3914,73 @@ class FrogCanvas(FigureCanvasQTAgg):
 
     def _on_first_draw(self, _event):   # retained for API parity; unused
         pass
+
+    # ── Printing the figure ───────────────────────────────────────────────
+    def save_picture(self, path, dpi=PICTURE_DPI):
+        """Write the plots to `path` as a print-resolution PNG.
+
+        The LIVE figure is printed, not a second one assembled from the same
+        data: every curve, limit, colour, colormap and readout the window is
+        showing is already on it, and a parallel figure would be a second place
+        for all of that to be got right — and to drift out of step the next time
+        one of them moves. Three things are therefore borrowed for the duration
+        and handed straight back in the finally:
+
+          * the blitted artists' `animated` flag. Figure.draw SKIPS animated
+            artists — that is what makes blitting possible — so printed as it
+            stands the page would come out with no spectrum, no trace and no
+            autocorrelation, which is to say without the three things it is a
+            picture of.
+          * the layout mode, and the alignment panel if it is open. The page is
+            always the horizontal arrangement (full-height spectrum on the
+            left, trace over the autocorrelation on the right) whichever mode
+            the window happens to be in, and never the alignment sweep — that
+            panel is an aid for adjusting the beam, not part of a result.
+          * the trace image's row pooling — see _display_decimation.
+
+        The figure keeps its on-screen SIZE in inches and only gains dpi, so the
+        page is the window's own layout at more detail rather than a
+        re-proportioned one: the margins and gaps are fractions of the figure
+        and the fonts are in points, so both land exactly where they look like
+        they should. Returns the (width, height) it wrote, in pixels.
+
+        Runs on the GUI thread, unlike the data exports: this is the figure the
+        live feed draws into, and handing it to a worker would put two threads
+        in matplotlib at once. A full-window page costs a few hundred ms.
+        """
+        # A big window is already a big page — see PICTURE_MAX_PX.
+        w_in, h_in = self.fig.get_size_inches()
+        dpi = min(dpi, PICTURE_MAX_PX / max(w_in, h_in))
+        prev_mode = self._layout_mode
+        prev_dev  = self._dev_on
+        prev_anim = [art.get_animated() for _ax, art in self._animated]
+        self._exporting = True
+        try:
+            for _ax, art in self._animated:
+                art.set_animated(False)
+            if prev_dev:
+                self.set_dev_visible(False)
+            self.set_layout_mode("horizontal")
+            self._render_trace()         # unpooled, at the page's resolution
+            # facecolor explicitly rather than by rcParam: the plot background
+            # is a theme colour held in PALETTE, and a page saved in dark mode
+            # on a white sheet would be unreadable.
+            self.fig.savefig(path, dpi=dpi, facecolor=self.fig.get_facecolor())
+        finally:
+            self._exporting = False
+            for (_ax, art), was in zip(self._animated, prev_anim):
+                art.set_animated(was)
+            self.set_layout_mode(prev_mode)
+            if prev_dev:
+                self.set_dev_visible(True)
+            self._render_trace()         # …and back to the panel's resolution
+            # Both caches were taken against a geometry (and a renderer) the
+            # lines above have been moving; the draw re-takes them.
+            self._bg = self._bg_static = None
+            self.draw_idle()
+        # int(), not round(): this has to be the size actually written, and Agg
+        # truncates the figure's pixel bbox when it sizes the renderer.
+        return int(w_in * dpi), int(h_in * dpi)
 
     # ── Mouse interaction ─────────────────────────────────────────────────
     def _disp_to_qt(self, x, y):
@@ -4864,6 +4962,11 @@ class FrogCanvas(FigureCanvasQTAgg):
         leave `nearest` free to drop half the blocks — and with them any narrow
         line that happened to fall in one.
         """
+        # Printing: the page has three times the window's pixels (PICTURE_DPI),
+        # so the panel's screen height is the wrong budget entirely — hand the
+        # printer every row there is and let the resampler pick.
+        if self._exporting:
+            return 1
         try:
             h = self.ax_trace.get_window_extent().height
         except Exception:
@@ -4979,9 +5082,9 @@ class FrogCanvas(FigureCanvasQTAgg):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main window
+# Export
 # ─────────────────────────────────────────────────────────────────────────────
-# Export formats offered by the header menu: key -> (menu label, suffix,
+# Export formats offered by the Export window: key -> (label, suffix,
 # file-dialog filter, writer(path, result)). .dwc is the default; only the
 # npz carries the raw counts, background frames and metadata.
 EXPORT_FORMATS = {
@@ -4990,7 +5093,164 @@ EXPORT_FORMATS = {
     "csv": ("CSV table  (.csv)",     ".csv", "CSV table (*.csv)",     write_csv),
 }
 
+# Stem the Save dialog opens on until someone types their own. Deliberately not
+# a date and not a counter: the date is the checkbox's job below, and a counter
+# would have to be kept per folder to mean anything.
+DEFAULT_EXPORT_NAME = "frog_scan"
 
+
+class ExportDialog(QDialog):
+    """Format, file name and the one button that writes the last scan.
+
+    A window rather than the drop-down menu it replaces. That menu could offer
+    exactly one thing — a format — and it both SET the format and wrote the file
+    on the same click, so there was nowhere to put a name, and no way to change
+    your mind about the format without writing a file to find out. Here the
+    format is a choice you leave sitting, the name is editable and shown as it
+    will land, and exactly one button writes anything.
+
+    Non-modal (Qt.Tool) like the other pop-ups: a file name is usually typed
+    against something on screen — the scan it is for.
+    """
+
+    # Characters Windows will not put in a file name. Replaced rather than
+    # rejected: this field feeds a Save dialog's DEFAULT, and a dialog opened on
+    # a name it cannot use is worse than one opened on a lightly-corrected one.
+    # A separator is in the list on purpose — "scan/2" naming a subfolder that
+    # may not exist is not what anyone means by it.
+    _ILLEGAL = '<>:"/\\|?*'
+
+    def __init__(self, win):
+        super().__init__(win, Qt.Tool)
+        self.win = win
+        self.setWindowTitle("Export")
+        self.setFixedWidth(330)
+        lay = QVBoxLayout(self); lay.setSpacing(10)
+        lay.setContentsMargins(14, 14, 14, 14)
+
+        lay.addWidget(self._hdr("Format"))
+        # Auto-exclusive by sharing this dialog as their parent, so no
+        # QButtonGroup is needed; the dict is how _set_export_fmt finds the one
+        # to tick when the format is set from somewhere else (startup, mainly).
+        self.radios = {}
+        for key, (label, _suffix, _filt, _writer) in EXPORT_FORMATS.items():
+            rb = QRadioButton(label)
+            # `on and …`: a click also un-toggles the radio that HELD the
+            # choice, and that second signal must not report the old format as
+            # a new one.
+            rb.toggled.connect(lambda on, k=key: on and win._set_export_fmt(k))
+            lay.addWidget(rb)
+            self.radios[key] = rb
+        hint = QLabel(
+            "Only the .npz keeps the raw counts, both background frames and the "
+            "metadata. The two text formats have fixed layouts that cannot "
+            "carry the extras, so they get the background-subtracted trace.")
+        hint.setObjectName("dim"); hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        lay.addWidget(_hline())
+
+        lay.addWidget(self._hdr("File name"))
+        self.edit_name = QLineEdit(DEFAULT_EXPORT_NAME)
+        self.edit_name.setPlaceholderText(DEFAULT_EXPORT_NAME)
+        self.edit_name.setToolTip(
+            "The name the Save dialog opens on — for this window, for the side "
+            "panel's Save, and for the toolbar's camera, which puts .png on the "
+            "same stem. The suffix comes from the format above, and the Save "
+            "dialog can still be typed over: this is the starting point, not a "
+            "lock.")
+        lay.addWidget(self.edit_name)
+        self.chk_date = QCheckBox("Date prefix?")
+        self.chk_date.setChecked(True)
+        self.chk_date.setToolTip(
+            "Put today's date in front of the name as YYYY-MM-DD_ . ISO order, "
+            "so a folder of exports sorts into chronological order by name.")
+        lay.addWidget(self.chk_date)
+        # What the two controls above actually produce, spelled out: the date
+        # is not in the field being typed into, and the suffix is not in it
+        # either, so neither is guessable from the field alone.
+        self.lbl_preview = QLabel()
+        self.lbl_preview.setObjectName("dim")
+        self.lbl_preview.setWordWrap(True)
+        lay.addWidget(self.lbl_preview)
+        self.edit_name.textChanged.connect(self.refresh_preview)
+        self.chk_date.toggled.connect(self.refresh_preview)
+
+        lay.addWidget(_hline())
+
+        # Disabled until there is a scan. The window owns that state for both
+        # this button and the side panel's — see FrogWindow._set_save_enabled.
+        self.btn_save = QPushButton("Save…")
+        self.btn_save.setMinimumHeight(30)
+        self.btn_save.setEnabled(False)
+        self.btn_save.setToolTip("Choose where to write the scan")
+        self.btn_save.clicked.connect(win._export_now)
+        lay.addWidget(self.btn_save)
+        btn = QPushButton("Close"); btn.clicked.connect(self.hide)
+        lay.addWidget(btn)
+
+        # Signals blocked: the window's _export_fmt already says "dwc", and a
+        # toggled() reporting it back would reach _set_export_fmt before the
+        # side panel's Save button it writes to exists.
+        first = next(iter(EXPORT_FORMATS))
+        with QSignalBlocker(self.radios[first]):
+            self.radios[first].setChecked(True)
+        self.refresh_preview()
+
+    def _hdr(self, text):
+        l = QLabel(text); l.setObjectName("hdr")
+        return l
+
+    # ── The name ──────────────────────────────────────────────────────────
+    def active_key(self):
+        """The format key whose radio is ticked."""
+        for key, rb in self.radios.items():
+            if rb.isChecked():
+                return key
+        return next(iter(EXPORT_FORMATS))
+
+    def stem(self):
+        """The file name to open the Save dialog on, without its suffix.
+
+        An empty (or all-illegal) field falls back to DEFAULT_EXPORT_NAME
+        rather than producing a file called ".dwc" — a name the operator cannot
+        see in a folder listing and Windows treats as an extension.
+        """
+        text = "".join("-" if c in self._ILLEGAL else c
+                       for c in self.edit_name.text()).strip(" .")
+        if not text:
+            text = DEFAULT_EXPORT_NAME
+        if self.chk_date.isChecked():
+            text = f"{time.strftime('%Y-%m-%d')}_{text}"
+        return text
+
+    def file_name(self, suffix=None):
+        """The stem with a suffix on it — the active format's unless told."""
+        if suffix is None:
+            suffix = EXPORT_FORMATS[self.active_key()][1]
+        return self.stem() + suffix
+
+    def refresh_preview(self):
+        self.lbl_preview.setText(f"Saves as   {self.file_name()}")
+
+    def show_format(self, key):
+        """Tick `key`'s radio without reporting it back as a fresh choice —
+        this is the path FROM the window, so the window already knows."""
+        with QSignalBlocker(self.radios[key]):
+            self.radios[key].setChecked(True)
+
+    def toggle(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            # The preview carries a date, and a session can outlive one.
+            self.refresh_preview()
+            self.show(); self.raise_()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main window
+# ─────────────────────────────────────────────────────────────────────────────
 class FrogWindow(QMainWindow):
     # Raised by the stage layer (StageBase.warn_cb) when it has to do something
     # the operator should know about — currently only a long move being split.
@@ -5113,6 +5373,11 @@ class FrogWindow(QMainWindow):
 
         self.dlg_settings = AcquisitionSettingsDialog(self)
         self.dlg_align    = AlignmentDialog(self)
+        # Built here with the other pop-ups, but note it reaches back into the
+        # window on construction (the format radios call _set_export_fmt): it
+        # must come after _export_fmt above and before _build_ui, which is what
+        # puts the toolbar button that opens it on screen.
+        self.dlg_export   = ExportDialog(self)
         self.dlg_spec     = SpectrometerDialog(self, self)
         self.dlg_stage    = StageDialog(self, self)
         self.dlg_sim      = SimulationDialog(self, self)
@@ -5692,7 +5957,13 @@ class FrogWindow(QMainWindow):
                            "button over the spectrum measures at")
         b_align.clicked.connect(self.dlg_align.toggle)
         tb.addWidget(b_align)
-        tb.addWidget(self._build_export_button())
+        # A window, like its neighbours — not the drop-down of formats it used
+        # to be. See ExportDialog for why.
+        self.btn_export = QPushButton("Export")
+        self.btn_export.setToolTip(
+            "Save the last scan — pick the format and the file name")
+        self.btn_export.clicked.connect(self.dlg_export.toggle)
+        tb.addWidget(self.btn_export)
         tb.addWidget(self._build_calibration_button())
         # Vendor-specific, so it is HIDDEN rather than disabled when there is
         # no Avantes attached — the toolbar already carries six buttons, and a
@@ -5723,6 +5994,17 @@ class FrogWindow(QMainWindow):
                                   else "Switch to light mode")
         self.btn_theme.clicked.connect(self._toggle_theme)
         tb.addWidget(self.btn_theme)
+        # Save the plots as a picture, between the two controls that decide what
+        # those plots LOOK like — the theme and the layout. It belongs with them
+        # rather than beside Export: Export writes the measurement, in formats
+        # another program reads, while this writes the figure, for a slide or a
+        # page. Icon from _refresh_picture_icon (one file per theme).
+        self.btn_picture = QPushButton()
+        self.btn_picture.setIconSize(QSize(18, 18))
+        self.btn_picture.setFixedWidth(42)
+        self._refresh_picture_icon()
+        self.btn_picture.clicked.connect(self._save_picture)
+        tb.addWidget(self.btn_picture)
         # Plot layout toggle; icon and tooltip come from _refresh_layout_button.
         self.btn_layout = QPushButton()
         self.btn_layout.setIconSize(QSize(18, 18))
@@ -6011,27 +6293,6 @@ class FrogWindow(QMainWindow):
         self.status.showMessage(
             "No hardware connected — connect a spectrometer and a stage, or "
             "open Simulation to run without either.", 0)
-
-    def _build_export_button(self):
-        """Header export control — a drop-down of the output formats. Picking
-        one makes it the active format and saves straight away; the sidebar
-        Save button follows the same choice."""
-        menu = QMenu(self)
-        group = QActionGroup(self)
-        group.setExclusive(True)
-        self._export_actions = {}
-        for key, (label, _suffix, _filt, _writer) in EXPORT_FORMATS.items():
-            act = QAction(label, self)
-            act.setCheckable(True)
-            act.setChecked(key == self._export_fmt)
-            act.triggered.connect(lambda _checked=False, k=key: self._export_as(k))
-            group.addAction(act)
-            menu.addAction(act)
-            self._export_actions[key] = act
-        self.btn_export = QPushButton("Export")
-        self.btn_export.setToolTip("Save the last scan — pick the output format")
-        self.btn_export.setMenu(menu)
-        return self.btn_export
 
     # ── Calibration menu ──────────────────────────────────────────────────────
     def _build_calibration_button(self):
@@ -6744,7 +7005,10 @@ class FrogWindow(QMainWindow):
         self.btn_save = QPushButton(f"Save ({EXPORT_FORMATS[self._export_fmt][1]})")
         self.btn_save.setEnabled(False)
         self.btn_save.setMinimumHeight(30)
-        self.btn_save.clicked.connect(lambda: self._export_as(self._export_fmt))
+        # Straight to the write, in the format and under the name the Export
+        # window is showing — this button is the shortcut past that window, not
+        # a second set of choices.
+        self.btn_save.clicked.connect(self._export_now)
         arow.addWidget(self.btn_save, 2)
         lay.addLayout(arow)
 
@@ -6781,6 +7045,7 @@ class FrogWindow(QMainWindow):
         self._refresh_autoscale_icon()   # …and this one
         self._refresh_freeze_icon()      # …the + is drawn from PALETTE too
         self._refresh_reference_button() # …and the eye has one file per theme
+        self._refresh_picture_icon()     # …as does the camera
         self._size_moving_label()        # its font came from the stylesheet
         self.pnl_no_spec.refresh_theme()  # …and its watermark is tinted live
         self.status.showMessage(f"{name.capitalize()} mode.", 2000)
@@ -6824,6 +7089,65 @@ class FrogWindow(QMainWindow):
             "and FROG trace" if horiz else
             "Horizontal layout: FROG trace above the autocorrelation, sharing "
             "one delay axis, beside a full-height spectrum")
+
+    # ── Picture of the figure ────────────────────────────────────────────────
+    def _refresh_picture_icon(self):
+        """Per-theme camera on the picture button, with the same text fallback
+        every other icon button carries. Only the icon is re-read here — unlike
+        its two neighbours this button has one state, so its tooltip is fixed
+        and set once."""
+        icon = PICTURE_ICON[self._theme]
+        if icon.exists():
+            self.btn_picture.setIcon(QIcon(str(icon)))
+            self.btn_picture.setText("")
+        else:
+            self.btn_picture.setIcon(QIcon())
+            self.btn_picture.setText("PNG")
+        self.btn_picture.setToolTip(
+            "Save the plots as a high-resolution PNG — the FROG trace with the "
+            "autocorrelation below it and the spectrum beside them, in the "
+            "current theme. Opens on the Export window's file name.")
+
+    def _save_picture(self):
+        """Ask for a file and print the plots into it.
+
+        Opens on the Export window's file name — same stem, same date prefix,
+        only the suffix differs — so a scan and the picture of it land side by
+        side in a folder listing under one name instead of needing the two to be
+        matched up by timestamp afterwards.
+
+        Deliberately NOT gated on self.result the way the data exports are: a
+        picture of the live spectrum, or of a trace still filling in, is a
+        perfectly good thing to want — there is always something on the panels
+        worth a picture, which is not true of a scan file.
+        """
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save figure as PNG", self.dlg_export.file_name(".png"),
+            "PNG image (*.png)")
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        self.status.showMessage(f"Saving figure → {path} …", 0)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        # repaint(), not the usual deferred update: the save below runs on this
+        # thread and holds the event loop for as long as it takes, so a message
+        # left for the next paint would first appear once it was already stale.
+        self.status.repaint()
+        try:
+            w, h = self.canvas.save_picture(path)
+        except Exception as e:
+            # Broad: matplotlib raises OSError for a path it cannot write and
+            # ValueError for a format it will not, and neither is worth a
+            # traceback to a console this build does not have.
+            self.status.showMessage(f"Figure save failed: {e}", 8000)
+        else:
+            # The size is reported because it is not simply PICTURE_DPI times a
+            # fixed page: it follows the window, and above PICTURE_MAX_PX the
+            # dpi gives way instead of the page growing.
+            self.status.showMessage(f"Saved → {path}  ({w} × {h} px)", 5000)
+        finally:
+            QApplication.restoreOverrideCursor()
 
     # ── Saturation indicator ─────────────────────────────────────────────────
     def _set_lamp(self, state, text, obj, which=0):
@@ -8664,7 +8988,7 @@ class FrogWindow(QMainWindow):
 
         self.btn_scan.setObjectName("danger"); self.btn_scan.setText("Abort Scan")
         self.btn_scan.style().unpolish(self.btn_scan); self.btn_scan.style().polish(self.btn_scan)
-        self.btn_save.setEnabled(False)
+        self._set_save_enabled(False)
 
         self._worker = FrogScanWorker(self.stage, self.spec, c)
         self._worker.progress.connect(self._on_progress)
@@ -8863,7 +9187,7 @@ class FrogWindow(QMainWindow):
         else:
             self.status.showMessage(
                 f"Scan complete — {result.trace.shape[1]} columns.", 5000)
-        self.btn_save.setEnabled(True)
+        self._set_save_enabled(True)
         self._reset_scan_ui()
 
     def _on_error(self, msg):
@@ -8886,39 +9210,52 @@ class FrogWindow(QMainWindow):
             self._feed.resume()
 
     # ── Save ──────────────────────────────────────────────────────────────────
+    def _set_save_enabled(self, on):
+        """Enable or disable both ways in to an export at once — the side
+        panel's Save button and the Export window's. They write the same file
+        from the same data, so a state that applies to one applies to both."""
+        self.btn_save.setEnabled(on)
+        self.dlg_export.btn_save.setEnabled(on)
+
     def _set_export_fmt(self, key):
         """Make `key` the active export format, without writing anything.
 
-        Split out of _export_as so a restored format can be applied at startup:
-        _export_as goes on to announce 'no scan to save yet', which would land
-        on the status bar over the 'no hardware connected' banner.
+        The single writer of _export_fmt: the Export window's radios come here,
+        and so does a format restored from settings at startup. It writes back
+        to the radios as well, so the two can never disagree — that path is
+        blocked at the widget (see ExportDialog.show_format) rather than guarded
+        here, which keeps this function one-directional.
         """
         _label, suffix, _filt, _writer = EXPORT_FORMATS[key]   # bad key: KeyError
         self._export_fmt = key
-        self._export_actions[key].setChecked(True)
+        self.dlg_export.show_format(key)
+        self.dlg_export.refresh_preview()      # the suffix in it just changed
         self.btn_save.setText(f"Save ({suffix})")
 
-    def _export_as(self, key):
-        """Make `key` the active export format and write the last scan in it.
-        With no scan yet this only switches the format."""
-        self._set_export_fmt(key)
-        _label, suffix, filt, writer = EXPORT_FORMATS[key]
+    def _export_now(self):
+        """Write the last scan in the active format.
+
+        Both Save buttons land here, and neither can be pressed without a scan
+        (_set_save_enabled), so there is no 'nothing to save yet' branch — that
+        message existed because picking a format from the old menu also tried
+        to save. The guard below is for the one case the buttons cannot cover:
+        a second press while the first export is still running.
+        """
         if self.result is None:
-            self.status.showMessage(f"Export format: {suffix} — no scan to save yet.", 4000)
             return
         if self._export_worker is not None and self._export_worker.isRunning():
             self.status.showMessage("An export is already in progress.", 3000)
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save FROG scan",
-                                              f"frog_scan{suffix}", filt)
+        _label, suffix, filt, writer = EXPORT_FORMATS[self._export_fmt]
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save FROG scan", self.dlg_export.file_name(suffix), filt)
         if not path:
             return
         if not path.lower().endswith(suffix):
             path += suffix
         # Formatting a full trace takes seconds — write it on a worker thread so
         # the window keeps painting (and the live feed keeps running).
-        self.btn_save.setEnabled(False)
-        self.btn_export.setEnabled(False)
+        self._set_save_enabled(False)
         self.status.showMessage(f"Saving → {path} …", 0)
         # Deliberately NOT parented to the window: a QThread child of a window
         # that lives for the session is never destroyed, so rebinding
@@ -8945,8 +9282,9 @@ class FrogWindow(QMainWindow):
         self.status.showMessage(f"Save failed: {msg}", 8000)
 
     def _end_export(self):
-        self.btn_export.setEnabled(True)
-        self.btn_save.setEnabled(self.result is not None)
+        # btn_export is left alone: it opens the Export window now rather than
+        # writing anything, so there is nothing to lock out while a write runs.
+        self._set_save_enabled(self.result is not None)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
     def _scan_join_timeout_ms(self):
@@ -9021,6 +9359,14 @@ class FrogWindow(QMainWindow):
             ("line_width",    lambda: float(c._lw),
                               lambda v: g.spin_lw.setValue(float(v))),
             ("export_format", lambda: self._export_fmt, self._set_export_fmt),
+            # The name as TYPED, not the composed file name: the date prefix is
+            # the checkbox's doing and is re-made from today's date on every
+            # save, so storing it would bring back the day this was written.
+            ("export_name", self.dlg_export.edit_name.text,
+                            lambda v: self.dlg_export.edit_name.setText(str(v))),
+            ("export_date_prefix", self.dlg_export.chk_date.isChecked,
+                                   lambda v: self.dlg_export.chk_date.setChecked(
+                                       _as_bool(v))),
 
             ("avg_per_point",      d.spin_avg.value,
                                    lambda v: d.spin_avg.setValue(int(v))),
@@ -9204,6 +9550,7 @@ class FrogWindow(QMainWindow):
         self.dlg_settings.close(); self.dlg_spec.close()
         self.dlg_stage.close(); self.dlg_sim.close()
         self.dlg_graphics.close(); self.dlg_avantes.close()
+        self.dlg_export.close()
         super().closeEvent(event)
 
 

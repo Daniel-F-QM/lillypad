@@ -99,7 +99,8 @@ windows — so nothing that looks like a hardware control can hand you fake data
 
 **Toolbar:** Acquisition Settings · Spectrometer · Stage · Simulation ·
 Graphics Settings · Alignment · Export · Calibration · *Avantes* (only when one
-is connected) · light/dark toggle.
+is connected) · light/dark toggle · camera (save the plots as a picture) ·
+layout toggle.
 
 **Panels:** the live **Spectrum** on one side; the **FROG Trace** and its
 **autocorrelation** on the other. Small buttons in the top corners of each plot
@@ -115,7 +116,8 @@ are the view controls — log scale, axis lock, and the alignment views.
    **Set Position as 0 fs**.
 4. **Set the range** — start, stop and step in femtoseconds — and press
    **Measure FROG**.
-5. **Export** from the toolbar.
+5. **Export** from the toolbar, or **Save** on the side panel — same file
+   either way.
 
 When a scan finishes Lillypad drives the stage back to zero delay, so the next
 thing you do starts on signal rather than on a dark frame. It skips that if the
@@ -131,6 +133,42 @@ stage reported a fault, since "zero" would no longer mean anything.
 
 If you want untouched numbers, use `.npz`. The two text formats have fixed
 layouts that cannot carry the extras, so they get the subtracted trace.
+
+**Export** opens a window holding the format, the file name and the Save
+button. The name is a starting point — the Save dialog can still be typed over
+— and with **Date prefix?** ticked (it is by default) today's date goes in front
+of it as `YYYY-MM-DD_`, so a folder of exports sorts chronologically by name.
+It is the name every save in the program starts from, the toolbar's camera
+included. The line under the field shows exactly what the Save dialog will open
+on:
+
+> Saves as   2026-09-15_frog_scan.dwc
+
+The format and the name are both remembered between sessions; the date is not
+— it is made fresh from today's date on every save. **Save** on the side panel
+skips the window and writes with whatever it is set to.
+
+## Saving the picture
+
+The **camera** in the toolbar writes the plots themselves to a PNG at 300 dpi —
+the FROG trace with the autocorrelation under it and the spectrum full height
+beside them, in whichever theme and colour map you are looking at. It is always
+that arrangement, whichever layout the window is in, and it leaves the alignment
+panel out; it is a figure for a slide or a page, not a record of the
+measurement. Export is what writes the numbers.
+
+The page takes the window's own proportions, so a wider window gives a wider
+picture — and a very large one prints at a little under 300 dpi, to keep the
+file sane. The status bar reports the size it wrote.
+
+It opens on the same file name as **Export**, date prefix and all, with `.png`
+on the end — so a scan and the picture of it sit together in a folder listing
+under one name.
+
+Everything on the panels goes into it as it stands — the axis limits you have
+dialled in, the log scale, the AC width, a frozen reference curve, the symmetry
+fold. There is no need to wait for a scan: the live spectrum prints just as
+well.
 
 ## Two kinds of "background"
 
@@ -568,8 +606,9 @@ the spectrometer is not carrying.
 
 Lillypad writes a `settings.json` next to the program and reads it back on the
 next launch. It holds the theme, window size and position, colour map, line
-width, export format, and your acquisition settings — scan range and step,
-averaging, saturation threshold and the two abort switches.
+width, the export format and file name (date prefix included), and your
+acquisition settings — scan range and step, averaging, saturation threshold and
+the two abort switches.
 
 So the defaults described here are what you get on a *fresh* install, and
 **deleting `settings.json` is a clean factory reset**. It is plain text and safe
