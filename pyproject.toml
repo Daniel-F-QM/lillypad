@@ -1,0 +1,31 @@
+# Tool configuration only — deliberately no [project] or [build-system] table.
+#
+# Lillypad is never pip-installed: it is run from the repository and frozen from
+# the repository by Lillypad.spec. Adding packaging metadata would give the
+# frozen build a second opinion about where the source lives, and an editable
+# install would put a second copy on sys.path that PyInstaller might resolve
+# instead of this one.
+#
+# pythonpath = ["."] is what makes `import hardware` / `import lillypad` work in
+# the tests with no install step.
+#
+# Dev dependencies live in requirements-dev.txt, NOT requirements.txt —
+# see that file's header for why the build lockfile stays untouched.
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+# No test in this suite touches hardware or opens a window, so none of them has
+# any business taking seconds. A sim scan that regresses into a real settle wait
+# should fail, not hang.
+timeout = 120
+
+filterwarnings = [
+    "error::DeprecationWarning",
+    # numpy 2.x emits this for np.loadtxt on an empty file, which the
+    # calibration loader deliberately provokes and handles.
+    "default:loadtxt:UserWarning",
+]

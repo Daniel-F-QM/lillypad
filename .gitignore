@@ -10,6 +10,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
+# Test artifacts
+.pytest_cache/
+
 # Measurement output — data belongs in a data store, not in git
 *.dwc
 *.npz
