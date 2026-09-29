@@ -17,8 +17,8 @@ import ctypes
 
 import pytest
 
-import avantes
-from avantes import (ADC_FULL_SCALE_14BIT, ADC_FULL_SCALE_16BIT,
+from lillypad.hardware.vendor import avaspec as avantes  # the vendor DLL wrapper
+from lillypad.hardware.vendor.avaspec import (ADC_FULL_SCALE_14BIT, ADC_FULL_SCALE_16BIT,
                      ADC_HIGH_RES_FACTOR, ERROR_CODES, MAX_INTEGRATION_MS,
                      MIN_INTEGRATION_MS, SENSOR_TYPES, AvantesError,
                      DeviceConfigHeadType, _assert_struct_sizes, _candidate_paths,

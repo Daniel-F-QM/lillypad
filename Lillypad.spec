@@ -11,7 +11,7 @@ import os
 # only the .dll. PyInstaller's import analysis therefore pulls in every
 # zaber_motion .py file and none of the actual library, and the frozen app dies
 # with "Could not find library zaber-motion-core-windows-amd64.dll" the moment
-# hardware.ZaberStage imports it.
+# lillypad.hardware.stages.zaber imports it.
 #
 # zaber_motion/bindings.py resolves the library as
 #     dirname(zaber_motion/bindings.py)/../zaber_motion_bindings/<lib name>
@@ -30,7 +30,8 @@ if not _zaber_libs:
                      'reinstall zaber_motion.')
 
 # libusb-1.0.dll ships as data inside the libusb_package wheel, which
-# hardware._ensure_libusb_dll() resolves via libusb_package.get_library_path()
+# lillypad.hardware.spectrometers.seabreeze._ensure_libusb_dll() resolves via
+# libusb_package.get_library_path()
 # — seabreeze's pyseabreeze backend (the default; the only one supporting the
 # newer Ocean Insight models) is dead without it. PyInstaller does not collect
 # in-package binaries by itself, so put the DLL back inside the package dir.
@@ -57,14 +58,19 @@ if not _libusb_dlls:
 #     and it comes with the same package, so bundling removes no install step.
 #   * Pinning one DLL version into the bundle would override whatever the
 #     operator installed for their own spectrometer.
-# avantes.py resolves the DLL at runtime (LILLYPAD_AVASPEC_DLL, then next to
+# lillypad/hardware/vendor/avaspec.py resolves the DLL at runtime
+# (LILLYPAD_AVASPEC_DLL, then the folder the adapter registers, then next to
 # the .exe, then the versioned install folder, then PATH), so dropping a
 # specific DLL beside Lillypad.exe remains available if a self-contained
 # folder is wanted.
 #
-# No hiddenimports entry is needed for avantes.py: PyInstaller's analysis scans
-# function bodies, so the lazy `import avantes` inside AvantesSpectrometer is
-# found the same way the lazy zaber_motion import is.
+# No hiddenimports entry is needed for the vendor wrapper: PyInstaller's analysis
+# scans function bodies, so the lazy `from lillypad.hardware.vendor import
+# avaspec` inside the Avantes adapter is found the same way the lazy
+# zaber_motion import is. That is also why registry.py maps a vendor tag to an
+# adapter with a literal if/elif over imported classes rather than a dict of
+# module names — a string-keyed lookup would drop every driver from this build
+# and fail only on the bench.
 a = Analysis(
     ['frog_gui_fast.py'],
     pathex=[],

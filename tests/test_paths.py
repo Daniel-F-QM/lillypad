@@ -142,7 +142,7 @@ class TestAvantesSearchDirInjection:
     anchor as the load-bearing path."""
 
     def test_add_search_dir_puts_the_directory_ahead_of_the_install_folders(self):
-        import avantes
+        from lillypad.hardware.vendor import avaspec as avantes
         probe = Path(r"C:\some\program\folder")
         try:
             avantes.add_search_dir(probe)
@@ -157,7 +157,7 @@ class TestAvantesSearchDirInjection:
             avantes._extra_dirs.clear()
 
     def test_add_search_dir_is_idempotent(self):
-        import avantes
+        from lillypad.hardware.vendor import avaspec as avantes
         try:
             avantes.add_search_dir(r"C:\x")
             avantes.add_search_dir(r"C:\x")
@@ -166,7 +166,7 @@ class TestAvantesSearchDirInjection:
             avantes._extra_dirs.clear()
 
     def test_the_env_override_still_outranks_it(self, monkeypatch):
-        import avantes
+        from lillypad.hardware.vendor import avaspec as avantes
         monkeypatch.setenv(avantes._ENV_VAR, r"C:\mine\AvaSpecX64.dll")
         try:
             avantes.add_search_dir(r"C:\program")
@@ -177,7 +177,7 @@ class TestAvantesSearchDirInjection:
     def test_the_adapter_registers_the_program_folder(self, monkeypatch):
         """hardware._avantes_module() is the single place that does it, so every
         Avantes entry point gets it without having to remember."""
-        import avantes
+        from lillypad.hardware.vendor import avaspec as avantes
         import hardware
         try:
             avantes._extra_dirs.clear()

@@ -1,11 +1,15 @@
 """
-avantes.py — ctypes wrapper for the Avantes AvaSpec-DLL
+avaspec.py — ctypes wrapper for the Avantes AvaSpec-DLL
 =======================================================
 A self-contained Python API for Avantes AvaSpec spectrometers, written against
-the vendor's C DLL. Nothing in here knows about Lillypad; `hardware.py` wraps
-the `AvaSpec` class below in a `SpectrometerBase` adapter.
+the vendor's C DLL. Nothing in here knows about Lillypad — where this module
+needs to be told something about its host, such as where the program is
+installed, the host calls add_search_dir rather than this file importing
+upwards. lillypad/hardware/spectrometers/avantes.py is the adapter that wraps
+the AvaSpec class below in a SpectrometerBase.
 
-    python avantes.py          # self-test: struct layout + whatever is attached
+    python -m lillypad.hardware.vendor.avaspec
+        # self-test: struct layout + whatever is attached
 
 Getting the DLL
 ---------------
@@ -1698,7 +1702,7 @@ class AvaSpec:
 # Self-test
 # ===========================================================================
 if __name__ == "__main__":
-    print("avantes.py self-test")
+    print("avaspec.py self-test")
 
     # 1. Struct layout. This is the part that MUST hold, runs without a DLL,
     #    and is the only thing standing between a packing slip and a silently
