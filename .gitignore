@@ -17,6 +17,11 @@ __pycache__/
 *.dwc
 *.npz
 data/
+# …except the simulator baselines, which are test fixtures rather than
+# measurements: tests/test_golden_sim.py regenerates them and asserts they come
+# back bit-identical, which is what proves a refactor of the simulation physics
+# or the scan loop changed nothing.
+!tests/golden/*.npz
 
 # Runtime preferences, written next to the program (see SETTINGS_PATH)
 settings.json
