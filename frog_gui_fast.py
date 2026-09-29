@@ -50,30 +50,25 @@ and shared with frog_gui.py via hardware.py / scan.py.
     python frog_gui_fast.py
 """
 
-import os
 import gc
 import sys
 import math
 import time
 import shutil
-import tempfile
-import threading
-import tracemalloc
 import numpy as np
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from pathlib import Path
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QGroupBox, QLabel, QDoubleSpinBox, QSpinBox, QCheckBox, QPushButton,
-    QProgressBar, QFrame, QScrollArea, QSizePolicy, QStatusBar, QFileDialog,
-    QDialog, QToolBar, QSlider, QLineEdit, QMenu, QComboBox, QRubberBand,
+    QGroupBox, QLabel, QCheckBox, QPushButton,
+    QProgressBar, QScrollArea, QSizePolicy, QStatusBar, QFileDialog,
+    QDialog, QToolBar, QSlider, QLineEdit, QMenu, QRubberBand,
     QMessageBox, QInputDialog, QAbstractSpinBox, QRadioButton
 )
-from PySide6.QtCore import (Qt, QTimer, QThread, Signal, QPointF, QSize, QRect,
-                            QRectF, QPoint, QSignalBlocker, QObject)
-from PySide6.QtGui import (QPalette, QColor, QFont, QIcon, QPixmap, QPainter,
-                           QPen, QPolygonF, QAction, QActionGroup)
+from PySide6.QtCore import (Qt, QTimer, Signal, QSize, QRect, QPoint,
+                            QSignalBlocker)
+from PySide6.QtGui import QFont, QIcon, QAction, QActionGroup
 # FIRST, above every other matplotlib import: importing this selects the QtAgg
 # backend and installs the global rcParams. See lillypad.design.mpl_style.
 # `import matplotlib` on its own would NOT be enough — the backend has to be
@@ -92,7 +87,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.transforms import ScaledTranslation
 
-from lillypad.paths import CALIBRATION_DIR, resource_path, seed_calibration_dir
+from lillypad.paths import CALIBRATION_DIR, seed_calibration_dir
 from lillypad.settings import (SETTINGS_VERSION, as_bool, load_settings,
                                save_settings)
 # The design layer. No colour, font size or icon path is defined in this file any
@@ -100,19 +95,24 @@ from lillypad.settings import (SETTINGS_VERSION, as_bool, load_settings,
 # importing the name here follows a runtime theme switch.
 from lillypad.design.geometry import (HDR_BTN, HDR_GAP, HDR_GROUP_GAP, HDR_ICON,
                                       HDR_PAD, HDR_TITLE_GAP)
-from lillypad.design.icons import (ALIGN_ICON, DISCONNECTED_ICON, HIDE_ICON,
-                                   HORIZ_ICON, ICON_ICO_PATH, ICON_PATH,
+from lillypad.design.icons import (ALIGN_ICON, HIDE_ICON,
+                                   HORIZ_ICON,
                                    LOCKED_ICON, MERGE_ICON, MOON_ICON,
                                    PICTURE_ICON, REFRESH_ICON, RESCALE_ICON,
                                    SHOW_ICON, SPLIT_ICON, STITCH_ICON, SUN_ICON,
                                    SYMMETRY_ICON, UNLOCKED_ICON, VERT_ICON,
                                    app_icon)
-from lillypad.design.icons_runtime import (glyph_icon as _glyph_icon,
-                                          make_arrow_icons as _make_arrow_icons,
-                                          make_check_icon as _make_check_icon)
+from lillypad.design.icons_runtime import glyph_icon as _glyph_icon
 from lillypad.design.theme import install_theme, startup_theme
-from lillypad.design.tokens import (DARK_PALETTE, DIFF_COLORS, FONT_STACK,
-                                    LIGHT_PALETTE, MEMBER_COLORS,
+from lillypad.gui.perf import PERF, install_probe, perf_tick
+from lillypad.gui.widgets import (SAT_WARN_FRACTION, AxisBoundEditor, ComboBox,
+                                  DoubleSpinBox, NoDeviceOverlay, PlotSplitHandle,
+                                  Slider, SpinBox, StatusLamp, _hline)
+from lillypad.gui.workers import (FEED_BUSY_MSG, MAX_UI_EXPOSURE_MS,
+                                  _ORPHANED_THREADS, AlignmentWorker,
+                                  ExportWorker, LiveFeedWorker, _exposure_bounds,
+                                  _exposure_ms)
+from lillypad.design.tokens import (DIFF_COLORS, MEMBER_COLORS,
                                     OVERLAP_BAND_ALPHA, OVERLAP_BAND_COLOR,
                                     PALETTE)
 from hardware import (SimulatedStage, SimulatedSpectrometer,
@@ -146,20 +146,6 @@ SIM_SLOT_DEVICES = (("__sim_blue__", "Simulated — blue half"),
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Value widgets that ignore the mouse wheel. Scrolling a panel must never edit
-# a setting: ev.ignore() propagates the wheel event to the enclosing
-# QScrollArea, so the panel under the cursor still scrolls. Keyboard, arrows
-# and typing are untouched. Qt stylesheet type selectors match subclasses, so
-# the QDoubleSpinBox/QSpinBox rules in build_stylesheet still apply.
-class _NoWheel:
-    def wheelEvent(self, ev):
-        ev.ignore()
-
-
-class SpinBox(_NoWheel, QSpinBox):             pass
-class DoubleSpinBox(_NoWheel, QDoubleSpinBox): pass
-class ComboBox(_NoWheel, QComboBox):           pass
-class Slider(_NoWheel, QSlider):               pass
 
 
 # resource_path(), app_dir() and the settings reader/writer now live in
@@ -202,442 +188,48 @@ def _ease(current, target, dt, tau):
     return target + (current - target) * math.exp(-dt / tau)
 
 
-def _hline():
-    f = QFrame(); f.setObjectName("sep")
-    f.setFrameShape(QFrame.HLine); f.setFixedHeight(1)
-    return f
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Performance probe (opt-in: LILLYPAD_PERF=1)
 # ─────────────────────────────────────────────────────────────────────────────
-# Exists to answer "which render path is slow, and is anything growing?" with
-# numbers instead of guesses. Off by default and reduced to a nullcontext() when
-# off, so the instrumented paths cost nothing in normal use.
-PERF = bool(os.environ.get("LILLYPAD_PERF"))
 
 
-class _PerfProbe:
-    """Collects per-path frame times and session-growth counters.
-
-    Frame times are kept as raw samples and reduced to percentiles at report
-    time: a mean would hide exactly what we are looking for, since the symptom
-    is occasional long frames (a full redraw escaping the blit path, or a GC
-    pause), not a uniformly slower loop.
-    """
-    def __init__(self, window):
-        self._w = window
-        self._samples = {}          # name -> list[ms], cleared each report
-        tracemalloc.start()
-        self._snap = tracemalloc.take_snapshot()
-
-    @contextmanager
-    def tick(self, name):
-        t = time.perf_counter()
-        try:
-            yield
-        finally:
-            self._samples.setdefault(name, []).append(
-                (time.perf_counter() - t) * 1000.0)
-
-    def report(self):
-        for name, xs in sorted(self._samples.items()):
-            xs.sort()
-            print(f"[perf] {name:12s} n={len(xs):4d} "
-                  f"p50={xs[len(xs) // 2]:7.2f}ms "
-                  f"p95={xs[min(int(len(xs) * 0.95), len(xs) - 1)]:7.2f}ms "
-                  f"max={xs[-1]:7.2f}ms", file=sys.stderr)
-        self._samples.clear()
-        snap = tracemalloc.take_snapshot()
-        grown = sum(s.size_diff for s in snap.compare_to(self._snap, "filename"))
-        self._snap = snap
-        # objects/qt_children are the leak detectors: both must plateau. A
-        # rising qt_children with a flat objects count is a Qt-side leak (a
-        # C++ child never destroyed), which is exactly the menu/worker case.
-        print(f"[perf] objects={len(gc.get_objects()):8d} "
-              f"qt_children={len(self._w.findChildren(QObject)):6d} "
-              f"tracemalloc_delta={grown / 1e6:+.1f}MB", file=sys.stderr)
 
 
-# Module-level singleton: FrogCanvas and FrogWindow both instrument themselves
-# and neither should have to carry a probe reference through its constructor.
-_perf = None
-
-
-def perf_tick(name):
-    """Time a block into the probe, or do nothing when the probe is off."""
-    return _perf.tick(name) if _perf is not None else nullcontext()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Live-feed acquisition worker (FIX 2 + 3)
 # ─────────────────────────────────────────────────────────────────────────────
-class LiveFeedWorker(QThread):
-    """Continuously acquires spectra off the GUI thread and emits them.
-
-    FIX 2 — spectrometer.acquire() blocks for the integration time; running it
-    here keeps the UI responsive even at long integrations.
-    FIX 3 — each loop is paced to the integration time (with a small floor) so
-    we never spin faster than the hardware actually produces frames.
-
-    `pause()` blocks until any in-flight acquire has finished, so the scan can
-    safely take over the shared stage/spectrometer.
-    """
-    spectrum_ready = Signal(object, object)   # (wavelengths, raw counts)
-    # A device that has started refusing to acquire. Emitted on the first
-    # failure and then at most every FAIL_REPORT_S while it persists, because
-    # the alternative — the loop quietly retrying forever — is indistinguishable
-    # from "the setting I just changed did nothing": the plot simply stops
-    # updating and holds the last good frame.
-    acquire_failed = Signal(str)
-    FAIL_REPORT_S = 3.0
-
-    def __init__(self, get_spec, min_interval_ms=30, parent=None):
-        super().__init__(parent)
-        self._get_spec = get_spec
-        self._min = float(min_interval_ms)
-        self._last_fail_report = 0.0
-        self._run = True
-        self._paused = True
-        self._idle = threading.Event()   # set whenever not mid-acquire
-        self._idle.set()
-        # Guards `_paused` together with the matching set/clear of `_idle`.
-        # The pair has to move as one: pause() decides it is safe to hand the
-        # device over by reading `_idle`, and run() decides to acquire by
-        # reading `_paused`, so the two decisions must not interleave. Held
-        # only for those few statements — never across an acquire or a wait.
-        self._lock = threading.Lock()
-        # Measured worst-case time for one loop iteration. pause() sizes its
-        # timeout from this instead of a flat 2 s, which a long integration
-        # would otherwise blow through before the loop could possibly park.
-        self._last_cycle_ms = float(min_interval_ms)
-
-    def run(self):
-        while self._run:
-            # Reading `_paused` and publishing the answer in `_idle` is one
-            # atomic step. Clearing `_idle` after an unlocked check of
-            # `_paused` left a window where pause() could set `_paused`, see
-            # the still-set `_idle` from the previous park, and report the
-            # device free — while this thread was already on its way into
-            # acquire(). Two threads in one vendor driver is exactly what
-            # _device_lock exists to prevent.
-            with self._lock:
-                parked = self._paused
-                if parked:
-                    self._idle.set()
-                else:
-                    self._idle.clear()
-            if parked:
-                self.msleep(15)
-                continue
-            spec = self._get_spec()
-            if spec is None:
-                # No device to hold: safe to report idle without the lock,
-                # since the loop goes back to the top (and re-checks `_paused`
-                # under it) before it could touch anything.
-                self._idle.set()
-                self.msleep(30)
-                continue
-            try:
-                t0 = time.monotonic()
-                raw = np.asarray(spec.acquire(), float)
-                wl  = np.asarray(spec.wavelengths, float)
-                elapsed_ms = (time.monotonic() - t0) * 1000.0
-            except Exception as e:
-                now = time.monotonic()
-                if now - self._last_fail_report >= self.FAIL_REPORT_S:
-                    self._last_fail_report = now
-                    if self._run and not self._paused:
-                        self.acquire_failed.emit(str(e))
-                self.msleep(50)
-                continue
-            self._last_fail_report = 0.0     # recovered — report the next one
-            if self._run and not self._paused:
-                self.spectrum_ready.emit(wl, raw)
-            # Pace to the integration time; acquire already consumed `elapsed_ms`
-            # of it on real hardware, so only sleep the remainder.
-            target = max(self._min, float(getattr(spec, "integration_ms", self._min)))
-            # Whichever of the two actually dominates the cycle is what a
-            # pause() may have to sit through before we come round the top.
-            self._last_cycle_ms = max(target, elapsed_ms)
-            self.msleep(int(max(0.0, target - elapsed_ms)))
-
-    def resume(self):
-        with self._lock:
-            self._paused = False
-
-    def join_timeout_ms(self):
-        """How long to allow the loop to reach its next park.
-
-        One acquire plus one pacing sleep, with margin, measured rather than
-        assumed: acquire() blocks for the whole exposure, which the UI allows
-        up to MAX_UI_EXPOSURE_MS, so a flat 2 s would expire while the device
-        was still perfectly healthy.
-
-        The measured cycle only exists once an acquire has COMPLETED, so the
-        device's own integration time is taken into account as well — the very
-        first frame, and the first frame after the exposure is raised, would
-        otherwise be judged against a stale (or default) figure.
-        """
-        cycle = self._last_cycle_ms
-        try:
-            spec = self._get_spec()
-        except Exception:
-            spec = None
-        if spec is not None:
-            cycle = max(cycle, float(getattr(spec, "integration_ms", 0.0)))
-        return max(2000.0, 3.0 * cycle + 500.0)
-
-    def pause(self, wait_ms=None):
-        """Stop acquiring; block until the current acquire (if any) returns.
-
-        Returns True once the loop has parked in the idle branch — only then is
-        it safe to hand the stage/spectrometer to another thread. False means
-        the timeout expired with an acquire STILL in flight; callers must treat
-        that as "device not available" rather than ignoring it.
-
-        `_paused` is set under the lock, so from here on run() cannot clear
-        `_idle` — it only ever does that after reading `_paused` as False under
-        the same lock. A set `_idle` therefore means the device is free and
-        will stay free until resume(), which is what makes the True honest.
-        """
-        with self._lock:
-            self._paused = True
-        if wait_ms is None:
-            wait_ms = self.join_timeout_ms()
-        return self._idle.wait(wait_ms / 1000.0)
-
-    def stop(self):
-        self._run = False
-        with self._lock:
-            self._paused = True
 
 
-# Shown whenever a device operation has to be refused because the live feed did
-# not release the hardware in time.
-FEED_BUSY_MSG = ("Live feed is still mid-acquisition — try again in a moment "
-                 "(or stop the feed first).")
-
-# Workers that would not stop before the window closed. Parked here so their
-# QThread objects outlive the window: destroying one while its run() is still
-# inside a vendor call is a hard crash, not a warning, and at this point the
-# process is on its way out anyway. Deliberately never emptied.
-_ORPHANED_THREADS = []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Exposure-box plumbing
 # ─────────────────────────────────────────────────────────────────────────────
-# Longest exposure the integration box will offer, whatever the device claims.
-# A GUI policy, not a hardware limit: acquire() blocks for the whole exposure,
-# so a device that will happily take its documented 600 s would leave the app
-# looking hung, with the feed unable to park and every dialog answering
-# FEED_BUSY_MSG. Type-in of a longer value is not something the app needs.
-MAX_UI_EXPOSURE_MS = 10_000.0
 
 
-def _exposure_ms(spec) -> float:
-    """What the integration box should SHOW for `spec`.
-
-    The exposure, never the frame time: the box writes set_integration_time(),
-    so seeding it from a frame cost that folds in on-board averaging would
-    make every later edit multiply the exposure by the average count.
-    """
-    return float(getattr(spec, "exposure_ms",
-                         getattr(spec, "integration_ms", 10.0)))
 
 
-def _exposure_bounds(spec) -> tuple[float, float]:
-    """(min, max) exposure in ms the integration box may offer for `spec`."""
-    lo = float(getattr(spec, "min_integration_ms", 1.0))
-    hi = float(getattr(spec, "max_integration_ms", MAX_UI_EXPOSURE_MS))
-    return lo, min(hi, MAX_UI_EXPOSURE_MS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Saturation indicator
 # ─────────────────────────────────────────────────────────────────────────────
-# Fraction of full scale at which the lamp goes amber. Deliberately well below
-# the saturation threshold itself (FrogScanConfig.saturation_fraction, which
-# both the scan worker and the live lamp use): most detectors go nonlinear
-# before they actually clip, so by the time pixels are pinned at full scale the
-# spectrum around them is already wrong.
-SAT_WARN_FRACTION = 0.90
-
-# Colormaps offered for the FROG trace. All perceptually uniform, so equal
-# steps in count map to equal steps in apparent brightness — a trace read off
-# a non-uniform map (jet and friends) shows structure the data does not have.
-# First entry is the default.
 
 
-class StatusLamp(QWidget):
-    """Round go/no-go indicator for detector headroom.
-
-    Painted rather than styled: a QLabel with a border-radius cannot draw the
-    soft halo, and the halo is what makes a 13 px dot readable at a glance in
-    the corner of the status bar.
-
-    States — unknown (grey, no full-scale reported), ok (green), warn (amber,
-    close to clipping), sat (red, pixels pinned at full scale).
-    """
-    COLORS = {"unknown": "text_disabled", "ok": "good",
-              "warn": "warn", "sat": "danger"}
-
-    def __init__(self, diameter=12, parent=None):
-        super().__init__(parent)
-        self._d = diameter
-        self._state = "unknown"
-        self.setFixedSize(diameter + 8, diameter + 8)
-
-    def set_state(self, state):
-        if state not in self.COLORS:
-            raise ValueError(f"unknown lamp state {state!r}")
-        if state != self._state:
-            self._state = state
-            self.update()
-
-    def state(self):
-        return self._state
-
-    def paintEvent(self, _event):
-        # PALETTE is read at paint time, so a theme switch only needs update().
-        color = QColor(PALETTE[self.COLORS[self._state]])
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        cx, cy, r = self.width() / 2.0, self.height() / 2.0, self._d / 2.0
-        if self._state != "unknown":
-            halo = QColor(color)
-            halo.setAlpha(70)
-            p.setPen(Qt.NoPen); p.setBrush(halo)
-            p.drawEllipse(QPointF(cx, cy), r + 3.0, r + 3.0)
-        p.setPen(QPen(color.darker(150), 1.0))
-        p.setBrush(color)
-        p.drawEllipse(QPointF(cx, cy), r, r)
-        p.end()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Export worker — writing a full trace is far too slow for the GUI thread
 # ─────────────────────────────────────────────────────────────────────────────
-class ExportWorker(QThread):
-    """Writes a FrogResult to disk off the GUI thread.
-
-    write_dwc formats on the order of 1.7M values for a full trace, which froze
-    the window for the whole save. A finished FrogResult is never mutated again,
-    so the worker can read it without any locking — and because a later scan
-    rebinds `self.result` rather than modifying it, an in-flight export keeps
-    writing the snapshot it was handed.
-    """
-    done  = Signal(str)
-    error = Signal(str)
-
-    def __init__(self, writer, path, result, parent=None):
-        super().__init__(parent)
-        self._writer = writer
-        self._path   = path
-        self._result = result
-
-    def run(self):
-        try:
-            self._writer(self._path, self._result)
-        except Exception as e:
-            self.error.emit(str(e))
-        else:
-            self.done.emit(self._path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Alignment worker — the four-point symmetry check
 # ─────────────────────────────────────────────────────────────────────────────
-class AlignmentWorker(QThread):
-    """Measures one spectrum at each of -2x, -x, +x, +2x fs and comes back.
-
-    A thread rather than the blocking _stage_action path: four moves plus
-    n_average frames each takes seconds, and the window must stay alive.
-
-    The offsets are RELATIVE to wherever the stage is standing when the worker
-    starts — the operator parks at the delay whose symmetry they want to judge
-    (usually zero) and presses the button, so no marked zero is required.
-
-    The four points are visited in increasing order, exactly like a scan, so
-    every one of them is approached from the same side and the mechanical
-    backlash cancels out of the +/- comparison. Whatever happens, the stage is
-    put back where it started.
-
-    Frames are returned RAW: the window applies the same dark/calibration path
-    the live spectrum uses, so the differences sit on the displayed baseline
-    instead of a second, drifting derivation of it.
-
-    Signals:
-      progress(done, total)
-      done([(raw, member_frames_or_None)] x 4)   # in offset order
-      error(message)
-    """
-    progress = Signal(int, int)
-    done     = Signal(object)
-    error    = Signal(str)
-
-    def __init__(self, stage, spectrometer, config, step_fs, parent=None):
-        super().__init__(parent)
-        self.stage = stage
-        self.spec  = spectrometer
-        self.cfg   = config
-        self.offsets_fs = (-2.0 * step_fs, -step_fs, step_fs, 2.0 * step_fs)
-
-    def _measure(self):
-        """One averaged raw frame here. Mirrors FrogScanWorker._measure minus
-        the saturation bookkeeping and the calibration."""
-        cfg = self.cfg
-        if cfg.wait_after_move_s:
-            time.sleep(cfg.wait_after_move_s)
-        for _ in range(max(0, cfg.idle_shots)):
-            self.spec.acquire()                    # discard settling frames
-        n     = max(1, cfg.n_average)
-        acc   = None
-        m_acc = None
-        for _ in range(n):
-            s = np.asarray(self.spec.acquire(), float)
-            acc = s if acc is None else acc + s
-            frames = getattr(self.spec, "last_member_raw", None)
-            if frames is not None:
-                if m_acc is None:
-                    m_acc = [np.asarray(f, float).copy() for f in frames]
-                else:
-                    for a, f in zip(m_acc, frames):
-                        a += f
-        members = None if m_acc is None else tuple(a / n for a in m_acc)
-        return acc / n, members
-
-    def run(self):
-        start_um = None
-        out, err = [], None
-        try:
-            start_um = _stage_to_um(self.stage.get_position())
-            pf = self.cfg.pass_factor
-            for k, off in enumerate(self.offsets_fs):
-                # zero = 0.0 makes this a RELATIVE conversion, as _jog does.
-                d_um = float(delay_to_position_um(off, 0.0, pf))
-                self.stage.move_to(_um_to_stage(start_um + d_um))
-                out.append(self._measure())
-                self.progress.emit(k + 1, len(self.offsets_fs))
-        except Exception as e:
-            err = str(e)
-        # Always come home, including after a failure part-way through: leaving
-        # the stage parked at +2x would silently shift every later jog, move
-        # and scan the operator makes from here.
-        if start_um is not None:
-            try:
-                self.stage.move_to(_um_to_stage(start_um))
-            except Exception as e:
-                if err is None:
-                    err = f"could not return to the start position: {e}"
-        # Reported only once the stage is back: the slot restarts the live feed
-        # and reads the position, and neither may happen while this thread is
-        # still driving the hardware.
-        if err is None:
-            self.done.emit(out)
-        else:
-            self.error.emit(err)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1926,95 +1518,6 @@ class DevicePickerDialog(QDialog):
 # ─────────────────────────────────────────────────────────────────────────────
 # "Nothing connected" plot overlay
 # ─────────────────────────────────────────────────────────────────────────────
-class NoDeviceOverlay(QWidget):
-    """Covers an empty plot panel with a message and a Connect button.
-
-    Sized to the whole panel and painted in the plot's own background colour,
-    so it reads as an empty plot carrying a note rather than a card dropped on
-    top of one — the axes frame and labels still show around it.
-
-    The plug is painted as a WATERMARK rather than stacked in the layout: a
-    third row would push the message and button off the panel's centre, and the
-    mark is meant to be read as background, not as content. It is drawn from
-    the icon's alpha channel and tinted from the live PALETTE, so one file
-    serves both themes and a theme switch needs no new asset — the same trick
-    _glyph_icon uses for the feed button.
-    """
-    ICON_FRAC  = 0.45     # of the panel's shorter side
-    ICON_ALPHA = 0.14     # faint enough to read the message over
-
-    def __init__(self, canvas, message, button_text, on_click):
-        super().__init__(canvas)
-        self._src = (QPixmap(str(DISCONNECTED_ICON))
-                     if DISCONNECTED_ICON.exists() else QPixmap())
-        self._cache = None          # (side, tint) -> tinted pixmap
-        lay = QVBoxLayout(self)
-        lay.setSpacing(14)
-        lay.setContentsMargins(16, 16, 16, 16)
-        lay.addStretch()
-        self.lbl = QLabel(message)
-        self.lbl.setObjectName("nodev")
-        self.lbl.setAlignment(Qt.AlignCenter)
-        self.lbl.setWordWrap(True)
-        lay.addWidget(self.lbl)
-        self.btn = QPushButton(button_text)
-        self.btn.setObjectName("accent")
-        self.btn.clicked.connect(on_click)
-        lay.addWidget(self.btn, 0, Qt.AlignCenter)
-        lay.addStretch()
-
-    def _watermark(self, side):
-        """The plug scaled to `side` px and tinted for the current theme."""
-        tint = PALETTE["text_dim"]
-        if self._cache is not None and self._cache[0] == (side, tint):
-            return self._cache[1]
-        scaled = self._src.scaled(side, side, Qt.KeepAspectRatio,
-                                  Qt.SmoothTransformation)
-        out = QPixmap(scaled.size())
-        out.fill(Qt.transparent)
-        p = QPainter(out)
-        p.drawPixmap(0, 0, scaled)
-        # SourceIn keeps the destination's alpha and replaces its colour, so
-        # this repaints the glyph in the palette colour and leaves the
-        # transparent surround alone.
-        p.setCompositionMode(QPainter.CompositionMode_SourceIn)
-        p.fillRect(out.rect(), QColor(tint))
-        p.end()
-        self._cache = ((side, tint), out)
-        return out
-
-    def paintEvent(self, _event):
-        p = QPainter(self)
-        # The plot's own background, not the window's: blending in is the point.
-        p.fillRect(self.rect(), QColor(PALETTE["plot_bg"]))
-        # Redraw the axes frame this widget is standing on. Covering the panel
-        # rect exactly still eats the spine whenever the screen's device pixel
-        # ratio is above 1: matplotlib centres the spine ON the axes boundary,
-        # so half its width falls on physical rows INSIDE the logical rect and
-        # the border came out thinned at the sides and missing along the
-        # bottom. Drawing it here in the same colour puts a continuous frame
-        # back, at any ratio, without insetting the overlay (which would leave
-        # grid stubs poking out around the edges).
-        pen = QPen(QColor(PALETTE["border"]))
-        pen.setWidth(1)
-        p.setPen(pen)
-        # adjusted: a 1px pen straddles the path, so an un-inset rect would
-        # draw half of each edge outside the widget and get clipped away.
-        p.drawRect(self.rect().adjusted(0, 0, -1, -1))
-        if self._src.isNull():
-            return
-        side = int(min(self.width(), self.height()) * self.ICON_FRAC)
-        if side < 16:
-            return          # a panel this small has no room for a watermark
-        pm = self._watermark(side)
-        p.setOpacity(self.ICON_ALPHA)
-        p.drawPixmap((self.width() - pm.width()) // 2,
-                     (self.height() - pm.height()) // 2, pm)
-
-    def refresh_theme(self):
-        """Repaint against the new PALETTE — the tint is baked into the cache."""
-        self._cache = None
-        self.update()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2369,160 +1872,8 @@ class GraphicsSettingsDialog(QDialog):
 # the other Qt chrome constants — _glyph_icon needs HDR_ICON at import time.
 
 
-class AxisBoundEditor(QLineEdit):
-    """The box that appears over an axis' end tick label when it is clicked.
-
-    A Qt child of the canvas rather than a dialog: the value being changed is
-    the number under the cursor, and a modal box for one float would put a
-    title bar and two buttons in front of the plot it is about. Same reasoning
-    as the rubber band and the split handle — it composites above the canvas
-    and never lands in the cached blit background.
-
-    Commits on Return and cancels on Escape or on losing focus. Cancelling on
-    focus-out (rather than committing) is deliberate: clicking away from a
-    half-typed number is how you abandon it, and the axis limits are not
-    somewhere a stray keystroke should be able to land unnoticed.
-    """
-    PAD = 10          # logical px of slack around the tick label's own width
-    MIN_W = 56
-
-    def __init__(self, canvas):
-        super().__init__(canvas)
-        self._canvas = canvas
-        self._target = None       # (ax, "x"|"y", "lo"|"hi") while open
-        self.setAlignment(Qt.AlignCenter)
-        self.hide()
-        self.returnPressed.connect(self._commit)
-        self.editingFinished.connect(self.cancel)
-
-    def open_on(self, ax, which, end, value, rect):
-        """Start editing `end` of `ax`'s `which` axis, over the tick label at
-        `rect` (canvas-widget pixels)."""
-        self._target = (ax, which, end)
-        # %g, not the tick's own label: the label is rounded for display, and
-        # seeding the box with a rounded number makes "just nudge the max"
-        # silently move the bound the operator did not mean to touch.
-        self.setText(f"{value:g}")
-        w = max(rect.width() + self.PAD, self.MIN_W)
-        self.setGeometry(rect.center().x() - w // 2, rect.top() - 2,
-                         w, rect.height() + 6)
-        self.show()
-        self.raise_()
-        self.setFocus(Qt.OtherFocusReason)
-        self.selectAll()
-
-    def cancel(self):
-        self._target = None
-        self.hide()
-
-    def _commit(self):
-        if self._target is None:
-            return                      # Return after a cancel; nothing to do
-        ax, which, end = self._target
-        text = self.text().strip()
-        # Clear the target BEFORE applying: apply_axis_bound redraws, which can
-        # pull focus and re-enter through editingFinished -> cancel().
-        self._target = None
-        self.hide()
-        try:
-            value = float(text)
-        except ValueError:
-            self._canvas.axis_edit_failed.emit(
-                f"{text!r} is not a number — axis unchanged.")
-            return
-        self._canvas.apply_axis_bound(ax, which, end, value)
-
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.cancel()
-            return
-        super().keyPressEvent(event)
 
 
-class PlotSplitHandle(QWidget):
-    """The divider between the spectrum and the panel(s) beside it: a separator
-    line down the shared height, with a draggable grip at its middle — the
-    Graphics dialog's proportion slider, in reach.
-
-    A Qt child of the canvas rather than a matplotlib artist: hover feedback and
-    drag tracking cost one small widget repaint instead of a figure redraw, and
-    the divider composites above the canvas without ever landing in the cached
-    blit background (the same reason the rubber band is a Qt widget).
-    """
-    W = 13          # logical px: wide enough to grab, narrow enough for the gap
-    GRIP_H = 46     # grip length; the separator line runs the full height
-
-    def __init__(self, canvas):
-        super().__init__(canvas)
-        self._canvas = canvas
-        self._hover = False
-        self._press_x = None      # global x at press
-        self._press_frac = None   # spectrum fraction at press
-        self.setCursor(Qt.SplitHCursor)
-        self.setToolTip("Drag to resize the spectrum panel  ·  "
-                        "double-click for 50 / 50")
-
-    # ── Painting ──────────────────────────────────────────────────────────
-    def paintEvent(self, _event):
-        # PALETTE is read at paint time, so a theme switch only needs update().
-        active = self._hover or self._press_x is not None
-        h, cx = float(self.height()), self.width() / 2.0
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(Qt.NoPen)
-        # Separator: a hairline the full height of the two panels, so they read
-        # as separate panels whether or not anyone ever drags it.
-        p.setBrush(QColor(PALETTE["border"]))
-        p.drawRect(QRectF(cx - 0.5, 0.0, 1.0, h))
-        # Grip: the same line thickened over a short run at the middle. Accent
-        # on hover so it is discoverable without shouting at rest.
-        gw, gh = 5.0, min(self.GRIP_H, h)
-        p.setBrush(QColor(PALETTE["accent"] if active
-                          else PALETTE["border_hover"]))
-        p.drawRoundedRect(QRectF(cx - gw / 2.0, (h - gh) / 2.0, gw, gh),
-                          gw / 2.0, gw / 2.0)
-        # Grip dots punched in the panel colour: they read as a handle at any
-        # size, where a plain bar could pass for a plot decoration.
-        p.setBrush(QColor(PALETTE["plot_bg"]))
-        for dy in (-5.0, 0.0, 5.0):
-            p.drawEllipse(QPointF(cx, h / 2.0 + dy), 0.9, 0.9)
-
-    def enterEvent(self, event):
-        self._hover = True; self.update()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._hover = False; self.update()
-        super().leaveEvent(event)
-
-    # ── Dragging ──────────────────────────────────────────────────────────
-    # Anchored to the press position rather than to the cursor's offset within
-    # the grip, so the split never jumps on the first move.
-    def mousePressEvent(self, event):
-        if event.button() != Qt.LeftButton:
-            return
-        self._press_x = event.globalPosition().x()
-        self._press_frac = self._canvas.spec_fraction()
-        self.update()
-
-    def mouseMoveEvent(self, event):
-        if self._press_x is None:
-            return
-        travel = self._canvas.split_travel_px()
-        if travel <= 0:
-            return
-        self._canvas.set_proportions(
-            self._press_frac + (event.globalPosition().x() - self._press_x) / travel)
-
-    def mouseReleaseEvent(self, event):
-        if event.button() != Qt.LeftButton:
-            return
-        self._press_x = self._press_frac = None
-        self.update()
-
-    def mouseDoubleClickEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._canvas.set_proportions(0.50)
 
 
 class FrogCanvas(FigureCanvasQTAgg):
@@ -4843,11 +4194,10 @@ class FrogWindow(QMainWindow):
         # Opt-in instrumentation (LILLYPAD_PERF=1). Reports to stderr every 10 s.
         self._perf_timer = None
         if PERF:
-            global _perf
-            _perf = _PerfProbe(self)
+            probe = install_probe(self)
             self._perf_timer = QTimer(self)
             self._perf_timer.setInterval(10_000)
-            self._perf_timer.timeout.connect(_perf.report)
+            self._perf_timer.timeout.connect(probe.report)
             self._perf_timer.start()
 
         # Last, because it drives widgets from every group above as well as the

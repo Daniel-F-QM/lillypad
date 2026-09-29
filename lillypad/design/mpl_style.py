@@ -23,9 +23,15 @@ matplotlib.rcParams.update({
     "axes.labelsize": 9,
 })
 
-# Colormaps offered for the FROG trace. "jet" first because it is what the
-# existing traces in the group's records were taken with, and a comparison
-# against those is the common case; the perceptually uniform maps follow.
+# Colormaps offered for the FROG trace; the FIRST ENTRY IS THE DEFAULT, so the
+# order is load-bearing.
+#
+# "jet" leads because it is what the group uses most, NOT because it is the best
+# choice — it is the one entry here that is not perceptually uniform. The other
+# five map equal steps in count to equal steps in apparent brightness; jet does
+# not, so a trace read off it shows structure the data does not have. It is the
+# default because matching what colleagues are used to reading matters more here
+# than the colour science, and that is a deliberate trade, not an oversight.
 TRACE_COLORMAPS = ["jet", "magma", "viridis", "inferno", "plasma", "cividis"]
 
 
