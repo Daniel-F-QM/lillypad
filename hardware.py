@@ -1373,6 +1373,28 @@ class SeabreezeSpectrometer(SpectrometerBase):
             pass
 
 
+def _avantes_module():
+    """The Avantes vendor module, with our program folder registered as a DLL
+    search location.
+
+    Every Avantes entry point goes through here for two reasons. One place means
+    the registration cannot be forgotten at a new call site. And `import avantes`
+    stays a literal statement inside a function body, which is what lets
+    PyInstaller's analysis find the module with no hiddenimports entry — an
+    importlib.import_module here would break the frozen build silently.
+
+    avantes.py deliberately knows nothing about Lillypad, so it cannot work out
+    where we are installed; app_dir() is us telling it. Frozen, that is the
+    folder holding the .exe, which is what the build has always documented as a
+    place to drop a specific DLL — the module's own fallback only ever looked
+    inside the _internal bundle.
+    """
+    import avantes
+    from lillypad.paths import app_dir
+    avantes.add_search_dir(app_dir())
+    return avantes
+
+
 def list_avantes_spectrometers() -> list[tuple[str, str]]:
     """Enumerate attached Avantes spectrometers without adopting any.
     Returns [(model, serial), ...].
@@ -1383,7 +1405,7 @@ def list_avantes_spectrometers() -> list[tuple[str, str]]:
     the operator explicitly asked for an Avantes: it names the package to
     install.
     """
-    import avantes
+    avantes = _avantes_module()
     return [(name, serial) for name, serial, _status in avantes.list_devices()]
 
 
@@ -1396,7 +1418,7 @@ def avantes_trigger_options() -> dict[str, list[tuple[str, int]]]:
     connected, so the lazy import costs nothing on a machine without the DLL —
     and it is what keeps frog_gui_fast from importing avantes directly.
     """
-    import avantes
+    avantes = _avantes_module()
     return {
         "mode": [("Free running", avantes.SW_TRIGGER_MODE),
                  ("Hardware trigger", avantes.HW_TRIGGER_MODE),
@@ -1431,7 +1453,7 @@ class AvantesSpectrometer(SpectrometerBase):
     """
 
     def __init__(self, serial: str | None = None, high_res_adc: bool = True):
-        import avantes
+        avantes = _avantes_module()
         self._spec = avantes.AvaSpec(serial=serial, high_res_adc=high_res_adc)
         try:
             self.serial = self._spec.serial
@@ -2864,7 +2886,7 @@ if __name__ == "__main__":
     # InGaAs cut-on across the same 150 nm — which is the whole reason the
     # devices carry calibration files.
     assert raw_residual > 0.2, raw_residual
-    cal_dir = Path(__file__).resolve().parent / "calibration_files"
+    from lillypad.paths import CALIBRATION_DIR as cal_dir
     files = {k: cal_dir / f"{SIM_SPECTROMETERS[k]['calibration']}.txt"
              for k in models}
     if all(f.is_file() for f in files.values()):

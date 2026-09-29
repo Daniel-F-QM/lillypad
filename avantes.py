@@ -549,6 +549,12 @@ AvsHandle = c_int32 if sys.platform == "win32" else ctypes.c_long
 _ENV_VAR = "LILLYPAD_AVASPEC_DLL"
 _DLL_NAMES = ("AvaSpecX64.dll",) if struct.calcsize("P") == 8 else ("avaspec.dll",)
 
+# Extra directories to search, highest priority after the environment override.
+# This exists so the embedding application can say where its own program folder
+# is WITHOUT this module having to work it out from __file__ — see
+# add_search_dir() for why that matters.
+_extra_dirs: list[str] = []
+
 _lib = None                      # the loaded CDLL/WinDLL, or None
 _lib_path: str | None = None
 # The DLL is not reentrant, and callers drive it from more than one thread (a
@@ -610,12 +616,40 @@ def _version_key(path: str) -> tuple:
     return ([int(n) for n in re.findall(r"\d+", path)], path)
 
 
+def add_search_dir(path) -> None:
+    """Add a directory to the front of the DLL search, after the env override.
+
+    The embedding application calls this with the folder its program lives in, so
+    that dropping a specific AvaSpec DLL beside the executable keeps working.
+    It is a hook rather than an import because this module deliberately knows
+    nothing about Lillypad: a caller that knows where it is installed can say so,
+    and this file stays liftable into another project unchanged.
+
+    It also removes the need to guess. The __file__ fallback below is only
+    correct while this module sits at the top of its project; inside a package it
+    points at the package directory instead, and counting `parents[N]` to fix
+    that breaks again at the next move.
+
+    Idempotent, and ordered first-added-first-searched.
+    """
+    p = str(Path(path))
+    if p not in _extra_dirs:
+        _extra_dirs.append(p)
+
+
 def _candidate_paths() -> list[str]:
     """Where to look for the DLL, in order of decreasing confidence."""
     out: list[str] = []
     env = os.environ.get(_ENV_VAR)
     if env:
         out.append(env)
+    for d in _extra_dirs:
+        for name in _DLL_NAMES:
+            out.append(str(Path(d) / name))
+    # Frozen bundle, then this module's own folder. The _MEIPASS half stays
+    # authoritative wherever the module lives; the __file__ half is a
+    # last-ditch convenience for running this file standalone, and a caller
+    # that cares uses add_search_dir() instead of relying on it.
     here = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     for name in _DLL_NAMES:
         out.append(str(here / name))
