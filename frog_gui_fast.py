@@ -74,13 +74,20 @@ from PySide6.QtCore import (Qt, QTimer, QThread, Signal, QPointF, QSize, QRect,
                             QRectF, QPoint, QSignalBlocker, QObject)
 from PySide6.QtGui import (QPalette, QColor, QFont, QIcon, QPixmap, QPainter,
                            QPen, QPolygonF, QAction, QActionGroup)
+# FIRST, above every other matplotlib import: importing this selects the QtAgg
+# backend and installs the global rcParams. See lillypad.design.mpl_style.
+# `import matplotlib` on its own would NOT be enough — the backend has to be
+# chosen before the figure classes below are imported.
 import matplotlib
-matplotlib.use("QtAgg")
-matplotlib.rcParams.update({
-    "font.family": ["Segoe UI", "DejaVu Sans"],
-    "font.size": 9.0, "axes.titleweight": "bold", "axes.titlesize": 9.5,
-    "axes.labelsize": 9,
-})
+from lillypad.design.mpl_style import (PICTURE_DPI, PICTURE_MAX_PX,
+                                       TRACE_COLORMAPS, _AC_YLIM,
+                                       _GEO_DEV_RATIO, _GEO_GAP_PX, _GEO_H_BOT,
+                                       _GEO_H_COLGAP, _GEO_H_ROWGAP, _GEO_L_MAX,
+                                       _GEO_L_PX, _GEO_R, _GEO_ROW_RATIO,
+                                       _GEO_TOP_MAX, _GEO_TOP_PX, _GEO_V_BOT,
+                                       _GEO_V_COLGAP, _GEO_V_HSPACE,
+                                       _TITLE_ABOVE_IN, _TITLE_BAND_IN,
+                                       _TITLE_INSET_IN)
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from matplotlib.transforms import ScaledTranslation
@@ -88,6 +95,26 @@ from matplotlib.transforms import ScaledTranslation
 from lillypad.paths import CALIBRATION_DIR, resource_path, seed_calibration_dir
 from lillypad.settings import (SETTINGS_VERSION, as_bool, load_settings,
                                save_settings)
+# The design layer. No colour, font size or icon path is defined in this file any
+# more — see lillypad/design/. PALETTE is mutated in place by install_theme, so
+# importing the name here follows a runtime theme switch.
+from lillypad.design.geometry import (HDR_BTN, HDR_GAP, HDR_GROUP_GAP, HDR_ICON,
+                                      HDR_PAD, HDR_TITLE_GAP)
+from lillypad.design.icons import (ALIGN_ICON, DISCONNECTED_ICON, HIDE_ICON,
+                                   HORIZ_ICON, ICON_ICO_PATH, ICON_PATH,
+                                   LOCKED_ICON, MERGE_ICON, MOON_ICON,
+                                   PICTURE_ICON, REFRESH_ICON, RESCALE_ICON,
+                                   SHOW_ICON, SPLIT_ICON, STITCH_ICON, SUN_ICON,
+                                   SYMMETRY_ICON, UNLOCKED_ICON, VERT_ICON,
+                                   app_icon)
+from lillypad.design.icons_runtime import (glyph_icon as _glyph_icon,
+                                          make_arrow_icons as _make_arrow_icons,
+                                          make_check_icon as _make_check_icon)
+from lillypad.design.theme import install_theme, startup_theme
+from lillypad.design.tokens import (DARK_PALETTE, DIFF_COLORS, FONT_STACK,
+                                    LIGHT_PALETTE, MEMBER_COLORS,
+                                    OVERLAP_BAND_ALPHA, OVERLAP_BAND_COLOR,
+                                    PALETTE)
 from hardware import (SimulatedStage, SimulatedSpectrometer,
                       KinesisStage, ZaberStage, PiezoJenaStage,
                       SeabreezeSpectrometer, AvantesSpectrometer,
@@ -106,50 +133,6 @@ from scan import (FrogScanConfig, FrogScanWorker, fwhm, autocorrelation,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Layering: bg (window) < plot_bg (plot panel) < surface (controls/dialogs),
-# each a distinct step so panels and controls read as raised. Dark text is
-# #e6edf3, not near-white — ~13:1 on bg avoids halation from max-contrast text.
-DARK_PALETTE = {
-    "bg": "#0d1117", "surface": "#1c2128", "border": "#363d47",
-    "border_hover": "#444c56",
-    "accent": "#58a6ff", "accent2": "#79c0ff", "text": "#e6edf3",
-    "text_dim": "#b0bcc9", "text_disabled": "#6e7681",
-    "danger": "#ff7b72", "warn": "#f0883e", "good": "#3fb950",
-    "plot_bg": "#161b22", "grid": "#2a3140",
-}
-
-# Neutral gray ramp (no warm cast) so the cool blue accents don't clash.
-LIGHT_PALETTE = {
-    "bg": "#f2f3f5", "surface": "#ffffff", "border": "#d0d7de",
-    "border_hover": "#afb8c1",
-    "accent": "#0969da", "accent2": "#0550ae", "text": "#1f2328",
-    "text_dim": "#57606a", "text_disabled": "#8c959f",
-    "danger": "#cf222e", "warn": "#bc4c00", "good": "#1a7f37",
-    "plot_bg": "#ffffff", "grid": "#d8dee4",
-}
-
-# Mutated in place on theme switch so every runtime PALETTE[...] lookup follows.
-PALETTE = dict(DARK_PALETTE)
-
-# Per-spectrometer curves in multi-spectrometer mode. Okabe-Ito sky blue and
-# orange — the highest-contrast pair in that set. Deliberately NOT palette
-# keys: both read clearly on the dark and the light plot background, and they
-# stay separable under deuteranopia, protanopia and tritanopia (and in
-# greyscale), which the theme accents do not.
-MEMBER_COLORS = ("#56B4E9", "#E69F00")      # SLOT order: (S1, S2)
-
-# Shading for the overlap band in the per-spectrometer view: the stretch the
-# stitch factor is fitted over and the two spectra are crossfaded across. Green
-# because it has to sit UNDER both member curves without being confused for
-# either, and Okabe-Ito's bluish green is the remaining unused hue in that set.
-OVERLAP_BAND_COLOR = "#009E73"
-OVERLAP_BAND_ALPHA = 0.16
-
-# The two symmetry-difference curves of alignment mode, S(+x)-S(-x) and
-# S(+2x)-S(-2x). Okabe-Ito again, and deliberately the two hues MEMBER_COLORS
-# and the overlap band do NOT use: a difference curve can be on screen at the
-# same time as either of those and must never be mistaken for one.
-DIFF_COLORS = ("#D55E00", "#CC79A7")        # (+/-x, +/-2x)
 
 # Simulated members offered alongside real devices in the multi-spectrometer
 # slots, so the mode can be exercised without two spectrometers on the bench.
@@ -160,8 +143,6 @@ DIFF_COLORS = ("#D55E00", "#CC79A7")        # (+/-x, +/-2x)
 # full-band copies.
 SIM_SLOT_DEVICES = (("__sim_blue__", "Simulated — blue half"),
                     ("__sim_red__",  "Simulated — red half"))
-
-FONT_STACK = "'Segoe UI','DejaVu Sans',Arial,sans-serif"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,417 +162,11 @@ class ComboBox(_NoWheel, QComboBox):           pass
 class Slider(_NoWheel, QSlider):               pass
 
 
-def _make_arrow_icons(color, tag):
-    """Render spinbox up/down arrows to PNG files (QSS url() cannot load data
-    URIs, which is why the arrows were missing). Needs a running QApplication.
-    Returns (up_path, down_path) with forward slashes for use in QSS."""
-    icon_dir = Path(tempfile.gettempdir()) / "lillypad_icons"
-    icon_dir.mkdir(exist_ok=True)
-    shapes = {"up": [(4.0, 1.5), (7.5, 6.0), (0.5, 6.0)],
-              "dn": [(0.5, 1.0), (7.5, 1.0), (4.0, 5.5)]}
-    paths = {}
-    for name, pts in shapes.items():
-        pm = QPixmap(8, 7)
-        pm.fill(Qt.transparent)
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(color))
-        p.drawPolygon(QPolygonF([QPointF(x, y) for x, y in pts]))
-        p.end()
-        fp = icon_dir / f"arrow_{name}_{tag}.png"
-        pm.save(str(fp))
-        paths[name] = fp.as_posix()
-    return paths["up"], paths["dn"]
-
-
-def _make_check_icon(color, tag):
-    """Render a checkmark PNG for the checked checkbox indicator (same QSS
-    url() limitation as the arrows). Needs a running QApplication."""
-    icon_dir = Path(tempfile.gettempdir()) / "lillypad_icons"
-    icon_dir.mkdir(exist_ok=True)
-    pm = QPixmap(10, 10)
-    pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    pen = QPen(QColor(color), 2.0)
-    pen.setCapStyle(Qt.RoundCap)
-    pen.setJoinStyle(Qt.RoundJoin)
-    p.setPen(pen)
-    p.drawPolyline(QPolygonF([QPointF(1.5, 5.5), QPointF(4.0, 8.0),
-                              QPointF(8.5, 2.5)]))
-    p.end()
-    fp = icon_dir / f"check_{tag}.png"
-    pm.save(str(fp))
-    return fp.as_posix()
-
-
-# ── Panel header band, in logical pixels ─────────────────────────────────────
-# The overlay buttons above each plot panel (see FrogWindow._position_panel_
-# buttons). Square and small enough that a row of them reads as one line with
-# the panel title beside it; HDR_PAD is the gap between the row's bottom edge
-# and the axes' top spine.
-HDR_BTN = 24
-HDR_GAP = 4
-HDR_PAD = 6
-# Space after a panel title before the buttons that qualify it, and the clear
-# span that separates that group from the right-aligned row. The second is much
-# the larger of the two: it is the only thing telling the eye these are two
-# groups and not one row of eight.
-HDR_TITLE_GAP = 10
-HDR_GROUP_GAP = 28
-# Icon side inside a header button. EVEN, and even after the 1 px border is
-# taken off both sides of HDR_BTN: (24 - 2 - 14) / 2 = 4 exactly, so Qt centres
-# the icon on a whole pixel instead of rounding half a pixel one way.
-HDR_ICON = 14
-
-
-def _glyph_icon(kind, color, px=HDR_ICON):
-    """A play / stop / plus glyph as a QIcon, drawn in `color`.
-
-    Generated rather than loaded from icons/ because these buttons have to
-    re-colour themselves twice over: once for their state (the feed's accent
-    while stopped, danger while running) and once for the theme. A PNG can do
-    neither, and the files it would otherwise take would still be wrong the
-    moment either palette changes. Same QPainter approach as the spinbox arrows
-    above.
-
-    Rendered at the screen's device pixel ratio: at 150% Windows scaling a
-    logical-size pixmap is upscaled by the compositor, which both softens the
-    edges and shifts them by a fraction of a pixel.
-    """
-    app = QApplication.instance()
-    dpr = app.devicePixelRatio() if app is not None else 1.0
-    n = max(1, round(px * dpr))
-    pm = QPixmap(n, n)
-    pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    p.setPen(Qt.NoPen)
-    p.setBrush(QColor(color))
-    c = n / 2.0
-    if kind == "play":
-        # Centred on the triangle's CENTROID, not its bounding box: a
-        # right-pointing triangle whose box is centred reads as sitting too far
-        # right, because most of its area is on the left. The centroid of
-        # (x0,·) (x0,·) (x0+w,·) is at x0 + w/3, so x0 = c - w/3 puts the mass
-        # in the middle of the button.
-        w, h = 0.52 * n, 0.62 * n
-        x0 = c - w / 3.0
-        p.drawPolygon(QPolygonF([QPointF(x0, c - h / 2), QPointF(x0, c + h / 2),
-                                 QPointF(x0 + w, c)]))
-    elif kind == "plus":
-        # Two filled bars, not a stroked cross: the same NoPen/brush path as the
-        # other two marks, so all three land on the pixel grid the same way at
-        # any device ratio. Arms nearly the full icon, like the glyphs in the
-        # PNG buttons beside it — a small plus in a 24 px button reads as a
-        # decoration rather than as the control.
-        arm, th = 0.78 * n, 0.16 * n
-        r = th / 2.0
-        p.drawRoundedRect(QRectF(c - arm / 2, c - th / 2, arm, th), r, r)
-        p.drawRoundedRect(QRectF(c - th / 2, c - arm / 2, th, arm), r, r)
-    else:
-        s = 0.56 * n
-        p.drawRoundedRect(QRectF(c - s / 2, c - s / 2, s, s), 0.10 * n, 0.10 * n)
-    p.end()
-    pm.setDevicePixelRatio(dpr)
-    return QIcon(pm)
-
-
-def build_stylesheet(pal, tag):
-    uri_up, uri_dn = _make_arrow_icons(pal["text"], tag)
-    uri_chk = _make_check_icon(pal["bg"], tag)
-    return f"""
-QMainWindow, QWidget {{ background-color:{pal['bg']}; color:{pal['text']};
-    font-family:{FONT_STACK}; font-size:13px; font-weight:400; }}
-QGroupBox {{ border:1px solid {pal['border']}; border-radius:6px; margin-top:11px;
-    padding:6px 6px 6px 6px; font-size:11px; font-weight:700; color:{pal['text_dim']};
-    letter-spacing:1.5px; text-transform:uppercase; }}
-QGroupBox::title {{ subcontrol-origin:margin; left:8px; padding:0 4px; }}
-QPushButton {{ background-color:{pal['surface']}; border:1px solid {pal['border']};
-    border-radius:5px; padding:5px 12px; color:{pal['text']}; font-size:13px;
-    font-weight:600; }}
-QPushButton:focus {{ border-color:{pal['accent']}; }}
-QPushButton:hover {{ border-color:{pal['accent']}; color:{pal['accent']};
-    background-color:{pal['border_hover']}; }}
-QPushButton:pressed {{ background-color:{pal['accent']}; color:{pal['bg']}; }}
-QPushButton:disabled {{ color:{pal['text_disabled']}; }}
-QPushButton#accent {{ border-color:{pal['accent']}; color:{pal['accent']}; }}
-QPushButton#accent:hover {{ background-color:{pal['accent']}; color:{pal['bg']}; }}
-QPushButton#danger {{ border-color:{pal['danger']}; color:{pal['danger']}; }}
-QPushButton#danger:hover {{ background-color:{pal['danger']}; color:{pal['bg']}; }}
-/* Narrow unit toggle: the default 14px side padding leaves too little text box
-   inside its fixed width, and clipped "um". */
-QPushButton#unit {{ padding:5px 4px; }}
-/* Secondary actions in the side panel — same colours as the default/accent
-   buttons, but on one text line's worth of padding so the panel fits without
-   scrolling. */
-QPushButton#compact {{ padding:4px 10px; font-size:12px; }}
-QPushButton#accentcompact {{ padding:4px 10px; font-size:12px;
-    border-color:{pal['accent']}; color:{pal['accent']}; }}
-QPushButton#accentcompact:hover {{ background-color:{pal['accent']};
-    color:{pal['bg']}; }}
-QPushButton#overlay {{ border-color:{pal['accent']}; color:{pal['accent']};
-    padding:0px; font-size:12px; border-radius:4px; }}
-QPushButton#overlay:hover {{ background-color:{pal['accent']}; color:{pal['bg']}; }}
-QPushButton#overlay:pressed {{ background-color:{pal['accent']}; color:{pal['bg']}; }}
-/* Checked state for the header toggles. NOT the accent fill the hover and
-   pressed rules use: every one of these buttons carries an icon drawn in that
-   same accent, which would disappear into it — an "on" state you can only see
-   by taking the mouse away is no state at all. A raised surface behind a
-   thicker accent border reads as pressed-in while leaving the mark on top. */
-QPushButton#overlay:checked {{ background-color:{pal['border_hover']};
-    border:2px solid {pal['accent']}; }}
-QPushButton#overlay:checked:hover {{ background-color:{pal['accent']};
-    color:{pal['bg']}; }}
-/* The "no spectrometer connected" message centred on an empty spectrum panel.
-   Accent, not danger: nothing is wrong, there is simply nothing connected yet
-   — and the accent is what carries against the plot background it sits on,
-   which the dim text colour was never meant to be read over. Transparent, so
-   NoDeviceOverlay's own painted background (and its watermark) shows through. */
-QLabel#nodev {{ color:{pal['accent']}; background:transparent; font-size:22px;
-    font-weight:600; letter-spacing:0.5px; }}
-/* Same header button, in the stop colour — the live feed's running state. */
-QPushButton#overlaydanger {{ border-color:{pal['danger']}; color:{pal['danger']};
-    padding:0px; font-size:12px; border-radius:4px; }}
-QPushButton#overlaydanger:hover {{ background-color:{pal['danger']};
-    color:{pal['bg']}; }}
-QPushButton#overlaydanger:pressed {{ background-color:{pal['danger']};
-    color:{pal['bg']}; }}
-QPushButton::menu-indicator {{ image: url("{uri_dn}"); width:8px; height:7px;
-    subcontrol-origin:padding; subcontrol-position:center right; right:6px; }}
-QMenu {{ background-color:{pal['surface']}; border:1px solid {pal['border']};
-    border-radius:5px; padding:4px; color:{pal['text']}; font-size:13px;
-    font-weight:400; }}
-QMenu::item {{ padding:6px 14px 6px 26px; border-radius:4px; }}
-QMenu::item:selected {{ background-color:{pal['border_hover']};
-    color:{pal['accent']}; }}
-QMenu::indicator {{ width:12px; height:12px; left:8px; }}
-QDoubleSpinBox, QSpinBox {{ background-color:{pal['surface']};
-    border:1px solid {pal['border']}; border-radius:4px;
-    padding:1px 16px 1px 6px; color:{pal['text']}; font-weight:400;
-    min-height:18px; selection-background-color:{pal['accent']};
-    selection-color:{pal['bg']}; }}
-QDoubleSpinBox:focus, QSpinBox:focus {{ border-color:{pal['accent']}; }}
-QDoubleSpinBox::up-button, QSpinBox::up-button {{
-    subcontrol-origin:border; subcontrol-position:top right;
-    width:14px; border-left:1px solid {pal['border']};
-    border-bottom:1px solid {pal['border']};
-    border-top-right-radius:4px; background:{pal['surface']}; }}
-QDoubleSpinBox::up-button:hover, QSpinBox::up-button:hover {{
-    background:{pal['border_hover']}; }}
-QDoubleSpinBox::up-button:pressed, QSpinBox::up-button:pressed {{
-    background:{pal['accent']}; }}
-QDoubleSpinBox::down-button, QSpinBox::down-button {{
-    subcontrol-origin:border; subcontrol-position:bottom right;
-    width:14px; border-left:1px solid {pal['border']};
-    border-bottom-right-radius:4px; background:{pal['surface']}; }}
-QDoubleSpinBox::down-button:hover, QSpinBox::down-button:hover {{
-    background:{pal['border_hover']}; }}
-QDoubleSpinBox::down-button:pressed, QSpinBox::down-button:pressed {{
-    background:{pal['accent']}; }}
-QDoubleSpinBox::up-arrow, QSpinBox::up-arrow {{
-    image: url("{uri_up}"); width:8px; height:7px; }}
-QDoubleSpinBox::down-arrow, QSpinBox::down-arrow {{
-    image: url("{uri_dn}"); width:8px; height:7px; }}
-QCheckBox {{ spacing:8px; font-weight:400; background:transparent; }}
-QCheckBox::indicator {{ width:15px; height:15px; border:2px solid {pal['border']};
-    border-radius:3px; background:{pal['surface']}; }}
-QCheckBox::indicator:checked {{ background-color:{pal['accent']};
-    border-color:{pal['accent']}; image: url("{uri_chk}"); }}
-QLabel {{ background:transparent; }}
-QLabel#dim {{ color:{pal['text_dim']}; font-size:12px; font-weight:400; }}
-QLabel#value {{ color:{pal['accent']}; font-weight:600; font-size:15px; }}
-QLabel#readout {{ color:{pal['accent']}; font-weight:600; font-size:15px;
-    font-family:'Cascadia Mono','Consolas',monospace; }}
-QLabel#readout_sm {{ color:{pal['accent']}; font-weight:600; font-size:13px;
-    font-family:'Cascadia Mono','Consolas',monospace; }}
-/* The stage state, under its caption in the readout row. Bold in both states
-   so the column keeps one width and does not twitch as it flips; _moving()
-   swaps between the two object names. */
-QLabel#idle {{ color:{pal['text_dim']}; font-size:12px; font-weight:700; }}
-QLabel#moving {{ color:{pal['warn']}; font-size:12px; font-weight:700; }}
-QLabel#hdr {{ color:{pal['text_dim']}; font-weight:700; }}
-QLabel#sat {{ color:{pal['danger']}; font-size:12px; font-weight:600; }}
-QLabel#satok {{ color:{pal['text_dim']}; font-size:12px; font-weight:400; }}
-QLabel#satwarn {{ color:{pal['warn']}; font-size:12px; font-weight:600; }}
-QLabel#ok {{ color:{pal['accent']}; }}
-QLabel#err {{ color:{pal['danger']}; }}
-QProgressBar {{ border:1px solid {pal['border']}; border-radius:4px;
-    text-align:center; background:{pal['surface']}; color:{pal['text']};
-    font-weight:500; }}
-QProgressBar::chunk {{ background-color:{pal['accent']}; border-radius:3px; }}
-QStatusBar {{ background-color:{pal['surface']}; color:{pal['text_dim']};
-    border-top:1px solid {pal['border']}; font-size:12px; font-weight:400; }}
-QToolBar {{ background:{pal['surface']}; border-bottom:1px solid {pal['border']};
-    spacing:6px; padding:4px 8px; }}
-QDialog {{ background:{pal['bg']}; }}
-QScrollArea {{ border:none; background:transparent; }}
-QScrollBar:vertical {{ background:transparent; width:18px; margin:2px;
-    border:none; border-radius:7px; }}
-QScrollBar::handle:vertical {{ background:{pal['border']}; min-height:32px;
-    border-radius:7px; }}
-QScrollBar::handle:vertical:hover {{ background:{pal['border_hover']}; }}
-QScrollBar::handle:vertical:pressed {{ background:{pal['accent']}; }}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0px;
-    width:0px; background:transparent; border:none; }}
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background:transparent; }}
-QScrollBar:horizontal {{ background:transparent; height:18px; margin:2px;
-    border:none; border-radius:7px; }}
-QScrollBar::handle:horizontal {{ background:{pal['border']}; min-width:32px;
-    border-radius:7px; }}
-QScrollBar::handle:horizontal:hover {{ background:{pal['border_hover']}; }}
-QScrollBar::handle:horizontal:pressed {{ background:{pal['accent']}; }}
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width:0px;
-    height:0px; background:transparent; border:none; }}
-QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background:transparent; }}
-QFrame#sep {{ background-color:{pal['border']}; }}
-"""
-
-
-def apply_app_palette(app, pal):
-    qpal = QPalette()
-    qpal.setColor(QPalette.Window, QColor(pal["bg"]))
-    qpal.setColor(QPalette.WindowText, QColor(pal["text"]))
-    qpal.setColor(QPalette.Base, QColor(pal["surface"]))
-    qpal.setColor(QPalette.Text, QColor(pal["text"]))
-    qpal.setColor(QPalette.Button, QColor(pal["surface"]))
-    qpal.setColor(QPalette.ButtonText, QColor(pal["text"]))
-    app.setPalette(qpal)
-
-
 # resource_path(), app_dir() and the settings reader/writer now live in
 # lillypad.paths and lillypad.settings — see the top import block. Read
 # lillypad.paths' docstring before using either path helper: the difference
 # between a bundled, read-only resource and a writable folder beside the program
 # is the thing they exist to keep straight.
-
-
-# Window/taskbar icon: the multi-frame .ico (16→256 px), NOT the 2481² PNG.
-# Windows asks for 16/20/24/32/40/48/64 px depending on the surface (title bar,
-# taskbar, Alt-Tab) and the monitor DPI. A single huge bitmap makes Qt decode
-# ~25 MB and smooth-downscale it on the GUI thread for every one of those, which
-# is slow and lossy; worse, with an explicit AppUserModelID (see main()) the
-# shell no longer falls back to the .exe's own icon, so a window icon that is
-# not ready in time gets cached as a blank taskbar button. Qt's ICO handler
-# reads every frame, so QIcon can hand back the exact size instead.
-ICON_ICO_PATH = resource_path("icons", "Lilypad.ico")
-ICON_PATH    = resource_path("icons", "Lilypad.png")   # README / large uses
-SUN_ICON     = resource_path("icons", "sun.png")
-MOON_ICON    = resource_path("icons", "moon.png")
-# Save the plots as a PNG, on the main toolbar between the theme and layout
-# toggles. An ACTION with no second state to depict, so it follows the
-# ALIGN_ICON/RESCALE_ICON convention: one mark, one file per theme's accent.
-PICTURE_ICON = {"dark":  resource_path("icons", "save_picture_dark.png"),
-                "light": resource_path("icons", "save_picture_light.png")}
-# One-shot auto-fit, on the spectrum panel's header. An ACTION, and the mark is
-# the same in both files — only the accent differs — so it follows the
-# ALIGN_ICON/STITCH_ICON convention rather than the two-state pairs'.
-RESCALE_ICON = {"dark":  resource_path("icons", "rescale_dark.png"),
-                "light": resource_path("icons", "rescale_light.png")}
-# Spectrum-panel view toggle, keyed by theme (the suffix names the theme each
-# icon was drawn for, not what it depicts). The icons advertise the ACTION:
-# the broken one means "split the pair apart", the continuous one "put it back
-# together" — so the button shows the view you get by clicking it.
-SPLIT_ICON = {"dark":  resource_path("icons", "broken_spectrum_dark.png"),
-              "light": resource_path("icons", "broken_spectrum_light.png")}
-MERGE_ICON = {"dark":  resource_path("icons", "continuous_spectrum_dark.png"),
-              "light": resource_path("icons", "continuous_spectrum_light.png")}
-# Plot-layout toggle, same convention as above: each icon DEPICTS the layout you
-# get by clicking it. horizontal_* shows the tall spectrum beside the stacked
-# trace/AC pair, vertical_* the two top panels over a full-width bottom one.
-HORIZ_ICON = {"dark":  resource_path("icons", "horizontal_dark.png"),
-              "light": resource_path("icons", "horizontal_light.png")}
-VERT_ICON  = {"dark":  resource_path("icons", "vertical_dark.png"),
-              "light": resource_path("icons", "vertical_light.png")}
-# Alignment-mode sweep, on the spectrum panel's header. A crosshair: unlike the
-# two pairs above this one depicts a MODE rather than an action, so both files
-# show the same mark and differ only in the accent each theme draws it in.
-ALIGN_ICON = {"dark":  resource_path("icons", "alignment_dark.png"),
-              "light": resource_path("icons", "alignment_light.png")}
-# Auto-stitch, on the spectrum panel's header. Depicts the ACTION — matching
-# the two halves of a pair — so like ALIGN_ICON both files carry the same mark
-# in their own theme's accent.
-STITCH_ICON = {"dark":  resource_path("icons", "autostitch_dark.png"),
-               "light": resource_path("icons", "autostitch_light.png")}
-# Continuous y auto-scale, beside the spectrum's title. A padlock showing the
-# CURRENT state, not the action a click performs: an axis free to follow the
-# data is UNLOCKED, one frozen where it sits is LOCKED. That is the opposite
-# convention to SPLIT_ICON/MERGE_ICON above, and deliberately so — a padlock is
-# read as a condition ("this is locked"), not as an instruction, so showing the
-# lock you would GET by clicking would say exactly the wrong thing.
-UNLOCKED_ICON = {"dark":  resource_path("icons", "unlocked_dark.png"),
-                 "light": resource_path("icons", "unlocked_light.png")}
-LOCKED_ICON   = {"dark":  resource_path("icons", "locked_dark.png"),
-                 "light": resource_path("icons", "locked_light.png")}
-# Re-run the alignment sweep, beside the mode toggle that opened the panel.
-# An ACTION, but one with no second state to depict, so it follows the
-# mode-icon convention: one mark, one file per theme's accent.
-REFRESH_ICON = {"dark":  resource_path("icons", "refresh_dark.png"),
-                "light": resource_path("icons", "refresh_light.png")}
-# Frozen-reference visibility, beside the + that created it. A two-state PAIR,
-# so it follows SPLIT_ICON/MERGE_ICON rather than the padlock: each icon shows
-# the view a click GIVES you — the open eye puts the reference back, the struck
-# -through one takes it away. (The + itself is a generated glyph, not a file;
-# see _glyph_icon.)
-SHOW_ICON = {"dark":  resource_path("icons", "show_dark.png"),
-             "light": resource_path("icons", "show_light.png")}
-HIDE_ICON = {"dark":  resource_path("icons", "hide_dark.png"),
-             "light": resource_path("icons", "hide_light.png")}
-# Symmetry mode, on the FROG trace panel's header. ONE file for both themes —
-# the mark is a mirror line, which reads the same either way.
-SYMMETRY_ICON = resource_path("icons", "symmetry.png")
-# Watermark behind the "nothing connected" message. ONE file for both themes,
-# unlike the pairs above: it is drawn as an alpha mask and tinted from the live
-# PALETTE (see NoDeviceOverlay), so it follows a theme switch by itself.
-DISCONNECTED_ICON = resource_path("icons", "disconnected.png")
-
-
-_APP_ICON = None
-
-
-def app_icon():
-    """The application icon, built once from the multi-resolution .ico.
-
-    Cached lazily rather than at import: a QIcon may not be constructed before
-    the QApplication exists. The pixmap loop realises the sizes Windows asks
-    for while we are still in main(), so the HICON is ready by the time the
-    native window is created and the shell samples the taskbar button."""
-    global _APP_ICON
-    if _APP_ICON is None:
-        src = ICON_ICO_PATH if ICON_ICO_PATH.exists() else ICON_PATH
-        _APP_ICON = QIcon(str(src)) if src.exists() else QIcon()
-        for px in (16, 20, 24, 32, 40, 48, 64, 256):
-            _APP_ICON.pixmap(px, px)
-    return _APP_ICON
-
-
-def startup_theme(data):
-    """The theme to build the whole program in, validated.
-
-    Read straight from the settings dict instead of being restored through
-    _apply_theme like every other setting: PALETTE is sampled at CONSTRUCTION
-    time by the figure and by _build_ui's per-theme icon files, so the palette
-    has to be right before the first widget exists. Restoring it afterwards
-    would mean restyling the entire application at startup and trusting that
-    every widget which read a colour on the way up has a refresh hook.
-    """
-    name = data.get("theme")
-    return name if name in ("dark", "light") else "dark"
-
-
-def install_theme(app, name):
-    """Point the module-level PALETTE at `name` and restyle the application.
-
-    Shared by main()'s startup and _apply_theme's runtime switch, which
-    otherwise carried the same four lines twice — and a startup that styled
-    itself even slightly differently from a toggle is exactly the drift that
-    surfaces later as one stale widget colour.
-    """
-    PALETTE.clear()
-    PALETTE.update(LIGHT_PALETTE if name == "light" else DARK_PALETTE)
-    apply_app_palette(app, PALETTE)
-    app.setStyleSheet(build_stylesheet(PALETTE, name))
 
 
 def _on_a_screen(rect):
@@ -893,7 +468,6 @@ SAT_WARN_FRACTION = 0.90
 # steps in count map to equal steps in apparent brightness — a trace read off
 # a non-uniform map (jet and friends) shows structure the data does not have.
 # First entry is the default.
-TRACE_COLORMAPS = ["jet", "magma", "viridis", "inferno", "plasma", "cividis"]
 
 
 class StatusLamp(QWidget):
@@ -2790,66 +2364,6 @@ class GraphicsSettingsDialog(QDialog):
 # the background via the draw_event handler) is only issued when something static
 # actually changes — axis limits, theme, log scale, line width, proportions.
 # ─────────────────────────────────────────────────────────────────────────────
-# ── Plot geometry, in figure fractions (see FrogCanvas._layout_axes) ─────────
-# Margins are sized for the 9-pt plot fonts: LEFT holds the spectrum's y label
-# plus its tick labels, COLGAP the right column's y label, and BOT the bottom
-# row's tick labels and x label.
-_GEO_R = 0.99
-# TOP is the header band: the panel title and that panel's overlay buttons share
-# one line above the axes. Sized in pixels for the same reason as LEFT below —
-# it holds a fixed-size Qt button, not a fraction of the figure.
-_GEO_TOP_PX  = 34    # HDR_BTN (24) + HDR_PAD (6) + 4 px above the button
-_GEO_TOP_MAX = 0.12  # …but never eat this much of a short window
-# The left margin and the column gap hold text at a FIXED point size, so they
-# are sized in logical pixels and only converted to a fraction at layout time:
-# one fraction that fits a small window wastes half of a large one (the old
-# 0.10 left margin was 90 px at 900 px wide but 192 px at 1920, for content
-# that never needs more than the measured worst case below).
-_GEO_L_PX   = 68     # y label + 5-digit tick labels at 8.5 pt measure ~58 px
-_GEO_L_MAX  = 0.14   # …but never eat this much of a narrow window
-_GEO_GAP_PX = 70     # column-gap floor: the right column's y label and tick
-                     # labels, plus clearance for the split handle beside them
-_GEO_ROW_RATIO = 1.8        # tall row : short row, both modes
-# Spectrum : deviation panel, when alignment mode splits the spectrum's cell.
-# Taller than _GEO_ROW_RATIO: the deviations are a strip either side of zero,
-# not a curve that has to fill a panel, and the spectrum it takes room from is
-# the one being aligned.
-_GEO_DEV_RATIO = 2.4
-_GEO_V_BOT     = 0.095
-_GEO_V_COLGAP  = 0.055
-_GEO_V_HSPACE  = 0.31       # the gridspec hspace the vertical layout was tuned with
-_GEO_H_BOT     = 0.095
-_GEO_H_COLGAP  = 0.065      # wider: two stacked y-axes share this gap, and the
-                            # autocorrelation's tick labels run longer than the
-                            # trace's, so 0.055 leaves its y label touching.
-_GEO_H_ROWGAP  = 0.0        # flush: the stacked pair shares one delay axis, so
-                            # the trace's bottom spine IS the AC's top spine
-
-# The autocorrelation panel is drawn normalized to its own peak, so its view is
-# fixed: 0…1 plus a little headroom to keep the peak off the top spine.
-_AC_YLIM = (0.0, 1.05)
-
-# Title offsets in inches, so the gaps are DPI- and resize-independent.
-_TITLE_ABOVE_IN  = 6 / 72   # centres the 12 pt title in the header band
-_TITLE_INSET_IN  = (0.08, 0.06)   # (right, down) from the axes' top-left corner
-# Strip an INSIDE title occupies, measured down from the axes' top spine: the
-# inset above the text, the 12 pt line itself, and a little air under it. A
-# panel titled this way keeps its curves below the band — see _title_band_frac.
-_TITLE_BAND_IN   = _TITLE_INSET_IN[1] + 12 / 72 + 4 / 72
-
-# Resolution the toolbar's camera prints at (FrogCanvas.save_picture). The
-# figure is printed at the size it is ON SCREEN, so this is purely a detail
-# multiplier over the dpi the canvas is drawn at (100, times the display's
-# device-pixel ratio): every line, font and gap keeps exactly the proportion it
-# has in the window, and only the pixel count goes up. 300 dpi is what a
-# journal asks for.
-PICTURE_DPI = 300
-# …but the page's pixel size is the WINDOW's size times that ratio, and a
-# maximized window on a 4K panel would ask for ~10000 px of trace image —
-# tens of megabytes, and seconds of it on the GUI thread, for detail no
-# screen or printer will ever resolve. Past this the dpi is reduced to fit;
-# a page that big is already a long side of 20 inches at 300 dpi.
-PICTURE_MAX_PX = 6000
 
 # The rest of the panel header band (HDR_BTN and friends) is defined up with
 # the other Qt chrome constants — _glyph_icon needs HDR_ICON at import time.

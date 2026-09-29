@@ -72,7 +72,14 @@ a = Analysis(
     # calibration_files/*.txt are SEED data: frog_gui_fast.seed_calibration_dir
     # copies them from the bundle to a user-editable calibration_files/ folder
     # next to the .exe on first run (only top-level files — Old/ stays behind).
-    datas=[('icons', 'icons')] + [
+    # The stylesheet is bundled at the SAME relative path it has in the source
+    # tree, because lillypad.design.stylesheet asks for it by that one path
+    # (resource_path('lillypad', 'design', 'qss', 'app.qss')) and must not have
+    # to know whether it is frozen. A missing app.qss does not crash — Qt just
+    # gets no stylesheet — so the app would come up working but unstyled, which
+    # a headless check will not notice. Eyeball a themed window after a build.
+    datas=[('icons', 'icons'),
+           ('lillypad/design/qss', 'lillypad/design/qss')] + [
         (p, 'calibration_files') for p in glob.glob('calibration_files/*.txt')],
     hiddenimports=[],
     hookspath=[],

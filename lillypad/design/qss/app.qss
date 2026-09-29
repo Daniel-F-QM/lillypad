@@ -1,0 +1,170 @@
+/* Lillypad application stylesheet.
+ *
+ * Placeholders are substituted by design.stylesheet.build_stylesheet via
+ * string.Template. Template, NOT str.format or an f-string: this file is made of
+ * CSS braces, and brace-based templating would need every one of the ~150 of
+ * them escaped, where a single miss silently unstyles the whole application.
+ * QSS has no dollar sign of its own, so there is nothing to escape the other way.
+ *
+ * NOTE for editors: a literal dollar in a COMMENT must be written twice ($$), or
+ * Template will try to substitute the word after it and the whole render dies
+ * with a KeyError at startup. Hence the doubling below.
+ *
+ * Colour placeholders are palette keys (design.tokens.DARK_PALETTE /
+ * LIGHT_PALETTE). $$fs_*, $$fw_*, $$font_* and $$radius_* come from TYPE and
+ * METRICS in the same module. $$arrow_up, $$arrow_dn and $$check are PNG paths
+ * rendered at runtime by design.icons_runtime, because QSS url() cannot load a
+ * data URI.
+ *
+ * No raw hex colour and no bare font size belongs in here - add a token to
+ * design.tokens instead, or the theme stops being switchable in one place. A test
+ * enforces both.
+ *
+ * Widgets never carry their own stylesheet: colour comes from setObjectName plus
+ * style().polish(), so a runtime theme switch reaches everything. The #ids below
+ * are that vocabulary.
+ */
+QMainWindow, QWidget { background-color:$bg; color:$text;
+    font-family:$font_stack; font-size:$fs_body; font-weight:$fw_normal; }
+QGroupBox { border:1px solid $border; border-radius:$radius_lg; margin-top:11px;
+    padding:6px 6px 6px 6px; font-size:$fs_label; font-weight:$fw_bold; color:$text_dim;
+    letter-spacing:1.5px; text-transform:uppercase; }
+QGroupBox::title { subcontrol-origin:margin; left:8px; padding:0 4px; }
+QPushButton { background-color:$surface; border:1px solid $border;
+    border-radius:$radius; padding:5px 12px; color:$text; font-size:$fs_body;
+    font-weight:$fw_semibold; }
+QPushButton:focus { border-color:$accent; }
+QPushButton:hover { border-color:$accent; color:$accent;
+    background-color:$border_hover; }
+QPushButton:pressed { background-color:$accent; color:$bg; }
+QPushButton:disabled { color:$text_disabled; }
+QPushButton#accent { border-color:$accent; color:$accent; }
+QPushButton#accent:hover { background-color:$accent; color:$bg; }
+QPushButton#danger { border-color:$danger; color:$danger; }
+QPushButton#danger:hover { background-color:$danger; color:$bg; }
+/* Narrow unit toggle: the default 14px side padding leaves too little text box
+   inside its fixed width, and clipped "um". */
+QPushButton#unit { padding:5px 4px; }
+/* Secondary actions in the side panel — same colours as the default/accent
+   buttons, but on one text line's worth of padding so the panel fits without
+   scrolling. */
+QPushButton#compact { padding:4px 10px; font-size:$fs_small; }
+QPushButton#accentcompact { padding:4px 10px; font-size:$fs_small;
+    border-color:$accent; color:$accent; }
+QPushButton#accentcompact:hover { background-color:$accent;
+    color:$bg; }
+QPushButton#overlay { border-color:$accent; color:$accent;
+    padding:0px; font-size:$fs_small; border-radius:$radius_sm; }
+QPushButton#overlay:hover { background-color:$accent; color:$bg; }
+QPushButton#overlay:pressed { background-color:$accent; color:$bg; }
+/* Checked state for the header toggles. NOT the accent fill the hover and
+   pressed rules use: every one of these buttons carries an icon drawn in that
+   same accent, which would disappear into it — an "on" state you can only see
+   by taking the mouse away is no state at all. A raised surface behind a
+   thicker accent border reads as pressed-in while leaving the mark on top. */
+QPushButton#overlay:checked { background-color:$border_hover;
+    border:2px solid $accent; }
+QPushButton#overlay:checked:hover { background-color:$accent;
+    color:$bg; }
+/* The "no spectrometer connected" message centred on an empty spectrum panel.
+   Accent, not danger: nothing is wrong, there is simply nothing connected yet
+   — and the accent is what carries against the plot background it sits on,
+   which the dim text colour was never meant to be read over. Transparent, so
+   NoDeviceOverlay's own painted background (and its watermark) shows through. */
+QLabel#nodev { color:$accent; background:transparent; font-size:$fs_display;
+    font-weight:$fw_semibold; letter-spacing:0.5px; }
+/* Same header button, in the stop colour — the live feed's running state. */
+QPushButton#overlaydanger { border-color:$danger; color:$danger;
+    padding:0px; font-size:$fs_small; border-radius:$radius_sm; }
+QPushButton#overlaydanger:hover { background-color:$danger;
+    color:$bg; }
+QPushButton#overlaydanger:pressed { background-color:$danger;
+    color:$bg; }
+QPushButton::menu-indicator { image: url("$arrow_dn"); width:8px; height:7px;
+    subcontrol-origin:padding; subcontrol-position:center right; right:6px; }
+QMenu { background-color:$surface; border:1px solid $border;
+    border-radius:$radius; padding:4px; color:$text; font-size:$fs_body;
+    font-weight:$fw_normal; }
+QMenu::item { padding:6px 14px 6px 26px; border-radius:$radius_sm; }
+QMenu::item:selected { background-color:$border_hover;
+    color:$accent; }
+QMenu::indicator { width:12px; height:12px; left:8px; }
+QDoubleSpinBox, QSpinBox { background-color:$surface;
+    border:1px solid $border; border-radius:$radius_sm;
+    padding:1px 16px 1px 6px; color:$text; font-weight:$fw_normal;
+    min-height:18px; selection-background-color:$accent;
+    selection-color:$bg; }
+QDoubleSpinBox:focus, QSpinBox:focus { border-color:$accent; }
+QDoubleSpinBox::up-button, QSpinBox::up-button {
+    subcontrol-origin:border; subcontrol-position:top right;
+    width:14px; border-left:1px solid $border;
+    border-bottom:1px solid $border;
+    border-top-right-radius:4px; background:$surface; }
+QDoubleSpinBox::up-button:hover, QSpinBox::up-button:hover {
+    background:$border_hover; }
+QDoubleSpinBox::up-button:pressed, QSpinBox::up-button:pressed {
+    background:$accent; }
+QDoubleSpinBox::down-button, QSpinBox::down-button {
+    subcontrol-origin:border; subcontrol-position:bottom right;
+    width:14px; border-left:1px solid $border;
+    border-bottom-right-radius:4px; background:$surface; }
+QDoubleSpinBox::down-button:hover, QSpinBox::down-button:hover {
+    background:$border_hover; }
+QDoubleSpinBox::down-button:pressed, QSpinBox::down-button:pressed {
+    background:$accent; }
+QDoubleSpinBox::up-arrow, QSpinBox::up-arrow {
+    image: url("$arrow_up"); width:8px; height:7px; }
+QDoubleSpinBox::down-arrow, QSpinBox::down-arrow {
+    image: url("$arrow_dn"); width:8px; height:7px; }
+QCheckBox { spacing:8px; font-weight:$fw_normal; background:transparent; }
+QCheckBox::indicator { width:15px; height:15px; border:2px solid $border;
+    border-radius:$radius_xs; background:$surface; }
+QCheckBox::indicator:checked { background-color:$accent;
+    border-color:$accent; image: url("$check"); }
+QLabel { background:transparent; }
+QLabel#dim { color:$text_dim; font-size:$fs_small; font-weight:$fw_normal; }
+QLabel#value { color:$accent; font-weight:$fw_semibold; font-size:$fs_value; }
+QLabel#readout { color:$accent; font-weight:$fw_semibold; font-size:$fs_value;
+    font-family:$font_mono; }
+QLabel#readout_sm { color:$accent; font-weight:$fw_semibold; font-size:$fs_body;
+    font-family:$font_mono; }
+/* The stage state, under its caption in the readout row. Bold in both states
+   so the column keeps one width and does not twitch as it flips; _moving()
+   swaps between the two object names. */
+QLabel#idle { color:$text_dim; font-size:$fs_small; font-weight:$fw_bold; }
+QLabel#moving { color:$warn; font-size:$fs_small; font-weight:$fw_bold; }
+QLabel#hdr { color:$text_dim; font-weight:$fw_bold; }
+QLabel#sat { color:$danger; font-size:$fs_small; font-weight:$fw_semibold; }
+QLabel#satok { color:$text_dim; font-size:$fs_small; font-weight:$fw_normal; }
+QLabel#satwarn { color:$warn; font-size:$fs_small; font-weight:$fw_semibold; }
+QLabel#ok { color:$accent; }
+QLabel#err { color:$danger; }
+QProgressBar { border:1px solid $border; border-radius:$radius_sm;
+    text-align:center; background:$surface; color:$text;
+    font-weight:$fw_medium; }
+QProgressBar::chunk { background-color:$accent; border-radius:$radius_xs; }
+QStatusBar { background-color:$surface; color:$text_dim;
+    border-top:1px solid $border; font-size:$fs_small; font-weight:$fw_normal; }
+QToolBar { background:$surface; border-bottom:1px solid $border;
+    spacing:6px; padding:4px 8px; }
+QDialog { background:$bg; }
+QScrollArea { border:none; background:transparent; }
+QScrollBar:vertical { background:transparent; width:18px; margin:2px;
+    border:none; border-radius:$radius_pill; }
+QScrollBar::handle:vertical { background:$border; min-height:32px;
+    border-radius:$radius_pill; }
+QScrollBar::handle:vertical:hover { background:$border_hover; }
+QScrollBar::handle:vertical:pressed { background:$accent; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0px;
+    width:0px; background:transparent; border:none; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:transparent; }
+QScrollBar:horizontal { background:transparent; height:18px; margin:2px;
+    border:none; border-radius:$radius_pill; }
+QScrollBar::handle:horizontal { background:$border; min-width:32px;
+    border-radius:$radius_pill; }
+QScrollBar::handle:horizontal:hover { background:$border_hover; }
+QScrollBar::handle:horizontal:pressed { background:$accent; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0px;
+    height:0px; background:transparent; border:none; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background:transparent; }
+QFrame#sep { background-color:$border; }
