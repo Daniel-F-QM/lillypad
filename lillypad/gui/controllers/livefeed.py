@@ -230,7 +230,7 @@ class LiveFeedController:
         """Render the newest pending data — scan column or live frame."""
         if self.win._scan_dirty:
             with perf_tick("scan_render"):
-                self.win._render_scan_frame()
+                self.win.scanning._render_scan_frame()
             return
         if self.win._live_frame is None:
             return
@@ -473,7 +473,7 @@ class LiveFeedController:
         if on:
             # During a scan the worker owns the hardware; arm the feed and let
             # _reset_scan_ui start it once the scan hands the devices back.
-            if not self.win._scan_running():
+            if not self.win.scanning.running():
                 self.win._feed.resume()
         else:
             self.win._feed.pause()
@@ -487,7 +487,7 @@ class LiveFeedController:
         share this one debounce, so editing them together costs a single feed
         handover.
         """
-        if self.win._scan_running():
+        if self.win.scanning.running():
             self.win.status.showMessage(
                 "A scan is running — integration time applies to the next scan.", 4000)
             return
@@ -569,7 +569,7 @@ class LiveFeedController:
         means the merged frame and the member frames come from one exposure
         instead of two different ones.
         """
-        if self.win._scan_running():
+        if self.win.scanning.running():
             self.win.status.showMessage("A scan is running — spectrometer is busy.", 3000)
             return
         if not self.win._have_spec():

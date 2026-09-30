@@ -261,7 +261,7 @@ class AvantesSettingsDialog(QDialog):
         if dev is None:
             self._do(False, "No Avantes spectrometer is connected.")
             return
-        if self.main._scan_running():
+        if self.main.scanning.running():
             self._do(False, "A scan is running — stop it before changing "
                             "spectrometer settings.")
             return
@@ -358,7 +358,7 @@ class AvantesSettingsDialog(QDialog):
         """Timed readback. Silent on failure: a busy feed must not turn the
         dialog into a blinking error, and the scan worker owns the device
         outright while a scan runs."""
-        if not self.isVisible() or self.main._scan_running():
+        if not self.isVisible() or self.main.scanning.running():
             return
         self._refresh_readback(quiet=True)
 
@@ -366,7 +366,7 @@ class AvantesSettingsDialog(QDialog):
         """Read the board temperature. A device call, so it takes the feed
         handover like any other."""
         dev = self._target()
-        if dev is None or self.main._scan_running():
+        if dev is None or self.main.scanning.running():
             return
         with self.main.devices.device_lock() as ok:
             if not ok:

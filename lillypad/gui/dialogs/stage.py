@@ -81,7 +81,7 @@ class StageDialog(ConnectDialog):
             "the slack and coming back up makes every move repeatable.\n\n"
             "0 disables it — correct for a Thorlabs controller (its firmware "
             "already does this) or a piezo, wrong for a Zaber.")
-        self.spin_backlash.valueChanged.connect(self.main._on_backlash_changed)
+        self.spin_backlash.valueChanged.connect(self.main.stage_ctl.on_backlash_changed)
         brow.addWidget(self.spin_backlash, 0, 1)
         lay.addLayout(brow)
         self.lbl_backlash_fs = QLabel("—"); self.lbl_backlash_fs.setObjectName("dim")

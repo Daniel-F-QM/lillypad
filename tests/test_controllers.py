@@ -39,7 +39,14 @@ EXPECTED = {
     "appearance": "AppearanceController",
     "feed": "LiveFeedController",
     "alignment": "AlignmentController",
+    "stage_ctl": "StageController",
+    "scanning": "ScanController",
+    "export": "ExportController",
+    "settings_ctl": "SettingsController",
 }
+# Two of them are `_ctl`, because `win.stage` is the delay stage and
+# `win.settings` is the loaded preferences dict. Shadowing either would be a
+# silent bug in the code that reads them, so the controller yields the name.
 
 
 @pytest.fixture(scope="module")
@@ -168,23 +175,38 @@ class TestTheCouplingsAreVisible:
     READABLE, which is what `self.win.<other>.<call>` gives. This records which
     ones exist, so that a new one is a deliberate act rather than a surprise."""
 
-    def test_the_cross_controller_calls_are_the_expected_ones(self):
-        classes = _controller_classes()
-        edges = set()
+    # window attribute -> module file that defines it
+    MODULE_OF = {"devices": "devices", "appearance": "appearance",
+                 "feed": "livefeed", "alignment": "alignment",
+                 "stage_ctl": "stage", "scanning": "scanning",
+                 "export": "export", "settings_ctl": "persistence"}
+
+    def test_no_controller_reaches_itself_through_the_window(self):
+        """Going out to the window and back into the controller you are already
+        in would work, and would mean a method was left on the wrong side of
+        the split."""
+        offenders = []
         for path in CONTROLLERS.glob("*.py"):
             if path.name == "__init__.py":
                 continue
             src = path.read_text(encoding="utf-8")
-            for attr in classes:
-                if re.search(rf"self\.win\.{attr}\.", src):
-                    edges.add((path.stem, attr))
-        # Every edge must be between files that exist, and none may point at
-        # itself — a controller calling itself through the window would work but
-        # would mean a method was left on the wrong side of the split.
-        for src_mod, attr in edges:
-            own = {"devices": "devices", "appearance": "appearance",
-                   "feed": "livefeed", "alignment": "alignment"}.get(attr)
-            assert own != src_mod, f"{src_mod} reaches itself via the window"
+            for attr, mod in self.MODULE_OF.items():
+                if mod == path.stem and re.search(rf"self\.win\.{attr}\.", src):
+                    offenders.append(f"{path.name} reaches .{attr}")
+        assert not offenders, offenders
+
+    def test_every_cross_controller_call_names_a_real_controller(self):
+        """`self.win.<attr>.` where <attr> is not one of the eight is a typo
+        that only fails when the line runs."""
+        classes = _controller_classes()
+        found = set()
+        for path in CONTROLLERS.glob("*.py"):
+            src = path.read_text(encoding="utf-8")
+            found |= set(re.findall(r"self\.win\.([a-z_]+)\.[a-z_]", src))
+        # Only the names that look like controllers are checked — the rest are
+        # window attributes (canvas, status, btn_feed, _feed, dlg_spec, …).
+        suspects = {n for n in found if n.endswith("_ctl") or n in classes}
+        assert suspects <= set(classes), sorted(suspects - set(classes))
 
 
 class TestNoUnreachableImports:

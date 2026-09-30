@@ -35,7 +35,12 @@ get wrong, and a controller can be constructed before any widget exists.
 from lillypad.gui.controllers.alignment import AlignmentController
 from lillypad.gui.controllers.appearance import AppearanceController
 from lillypad.gui.controllers.devices import DeviceController
+from lillypad.gui.controllers.export import ExportController
 from lillypad.gui.controllers.livefeed import LiveFeedController
+from lillypad.gui.controllers.persistence import SettingsController
+from lillypad.gui.controllers.scanning import ScanController
+from lillypad.gui.controllers.stage import StageController
 
 __all__ = ["DeviceController", "AppearanceController", "LiveFeedController",
-           "AlignmentController"]
+           "AlignmentController", "StageController", "ScanController",
+           "ExportController", "SettingsController"]

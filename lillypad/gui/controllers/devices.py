@@ -85,7 +85,7 @@ class DeviceController:
         try:
             yield ok
         finally:
-            if self.win.btn_feed.isChecked() and not self.win._scan_running():
+            if self.win.btn_feed.isChecked() and not self.win.scanning.running():
                 self.win._feed.resume()
 
     # ── Hardware ─────────────────────────────────────────────────────────────
@@ -201,7 +201,7 @@ class DeviceController:
         old stage at construction, so disconnecting it here would pull the
         device out from under the thread currently driving it.
         """
-        if self.win._scan_running():
+        if self.win.scanning.running():
             return False, "A scan is running — stop it before changing hardware."
         # Pause the feed (and wait for any in-flight acquire) before swapping,
         # so the worker never reads a half-swapped device.
@@ -232,17 +232,17 @@ class DeviceController:
                 # it. Adopt it anyway so the travel maths has something sane to
                 # work with, but _start_scan refuses to run until it is homed.
                 self.win.scan_cfg.zero_pos_um = stage_to_um(new_stage.get_position())
-            self.win._update_stage_unit_ranges()  # new travel + possibly new zero
-            self.win._refresh_positions()   # inside the lock — we still own the stage
-        self.win._sync_backlash_ui()        # the new stage brings its own default
-        self.win._refresh_scan_um()         # zero may have moved: fs→um previews
+            self.win.stage_ctl._update_stage_unit_ranges()  # new travel + possibly new zero
+            self.win.stage_ctl._refresh_positions()   # inside the lock — we still own the stage
+        self.win.stage_ctl._sync_backlash_ui()        # the new stage brings its own default
+        self.win.stage_ctl._refresh_scan_um()         # zero may have moved: fs→um previews
         self.win.appearance._sync_connection_ui()      # panel swaps between controls/Connect
         return True, ""
 
     def _apply_spectrometer(self, new_spec):
         """Swap in a new spectrometer, or None to disconnect. (ok, error);
         see _apply_stage."""
-        if self.win._scan_running():
+        if self.win.scanning.running():
             return False, "A scan is running — stop it before changing hardware."
         with self.device_lock() as ok:
             if not ok:
@@ -597,7 +597,7 @@ class DeviceController:
         names the file, and that mismatch silently corrupts a whole session's
         data — it must not be allowed to scroll past.
         """
-        if self.win._scan_running():
+        if self.win.scanning.running():
             self.win.status.showMessage(
                 "A scan is running — stop it before changing calibration.", 4000)
             return False
@@ -688,7 +688,7 @@ class DeviceController:
     def set_slot(self, slot, serial, label):
         """Point one slot at a device and connect whatever the slots now
         describe. (ok, msg)."""
-        if self.win._scan_running():
+        if self.win.scanning.running():
             return False, ("A scan is running — stop it before changing "
                            "spectrometers.")
         with self._slots_rolled_back_on_failure() as out:
@@ -709,7 +709,7 @@ class DeviceController:
 
     def clear_slot(self, slot):
         """Empty one slot and connect whatever is left. (ok, msg)."""
-        if self.win._scan_running():
+        if self.win.scanning.running():
             return False, ("A scan is running — stop it before changing "
                            "spectrometers.")
         if slot == 0 and self.win._multi["serials"][1] is None:
@@ -805,7 +805,7 @@ class DeviceController:
 
     def _connect_multi_pair(self):
         """Open both slot devices and swap in the stitched pair. (ok, msg)."""
-        if self.win._scan_running():
+        if self.win.scanning.running():
             return False, "A scan is running — stop it before changing hardware."
         s1, s2 = self.win._multi["serials"]
         if s1 == s2:
@@ -896,7 +896,7 @@ class DeviceController:
     def fit_stitch_factor(self):
         if not self.win._pair_live():
             return False, "No stitched pair is connected."
-        if self.win._scan_running():
+        if self.win.scanning.running():
             return False, "A scan is running — stop it before fitting."
         darks = self._fit_darks()
         with self.device_lock() as ok:

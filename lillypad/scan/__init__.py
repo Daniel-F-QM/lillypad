@@ -20,7 +20,8 @@ clean.
 
 from lillypad.scan.core import (autocorrelation, build_delay_grid,
                                 delay_to_position_um, fwhm,
-                                position_to_delay_fs, stage_to_um, um_to_stage)
+                                position_to_delay_fs, stage_to_um,
+                                symmetry_center, symmetry_view, um_to_stage)
 from lillypad.scan.model import FrogResult, FrogScanConfig
 from lillypad.scan.writers import write_csv, write_dwc, write_npz
 
@@ -28,6 +29,7 @@ __all__ = [
     "um_to_stage", "stage_to_um",
     "delay_to_position_um", "position_to_delay_fs", "build_delay_grid",
     "autocorrelation", "fwhm",
+    "symmetry_center", "symmetry_view",
     "FrogScanConfig", "FrogResult",
     "write_dwc", "write_npz", "write_csv",
 ]

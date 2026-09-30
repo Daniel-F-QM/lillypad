@@ -106,3 +106,90 @@ def fwhm(x, y):
     left  = cross(i0 - 1, i0) if i0 > 0 else x[i0]
     right = cross(i1, i1 + 1) if i1 < x.size - 1 else x[i1]
     return abs(right - left)
+
+
+# ── Symmetry folding ────────────────────────────────────────────────────────
+# Display maths, but maths: these take arrays and return arrays, so they belong
+# with the rest of the numpy in this module rather than on a Qt window where
+# they cannot be tested without one. `fold_fs` is the hand-placed fold line, or
+# None for the autocorrelation peak.
+
+
+def symmetry_center(ac, delays, fold_fs=None):
+    """Column index the trace is folded about.
+
+    The autocorrelation maximum by default: the AC is the trace summed over
+    wavelength, so its peak is where the two pulses overlap best — the delay
+    the trace SHOULD be symmetric about. Not the middle column, which would
+    make a scan range that was not centred on the overlap report its own
+    offset as asymmetry.
+
+    A hand-placed line (dragged on the plot) overrides it, snapped to the
+    nearest measured column: the fold is an index into the trace, so there
+    is no sub-column position it could honour without resampling.
+    """
+    if fold_fs is None:
+        return int(np.nanargmax(np.asarray(ac, float)))
+    d = np.asarray(delays, float)
+    return int(np.argmin(np.abs(d - float(fold_fs))))
+
+def symmetry_view(trace, ac, delays, fold_fs=None):
+    """Measured trace on the left of the fold, |T(+d) - T(-d)| on the right.
+
+    Returns (image, peak, score, fold_delay_fs).
+
+    Half and half rather than the difference everywhere: keeping one side as
+    it was measured gives the eye something to judge the other against, and
+    the two are directly comparable because they share one colour scale —
+    taken from the MEASURED peak, so the left half looks exactly as it does
+    in the ordinary view and "nearly black on the right" genuinely means
+    "nearly symmetric" rather than "rescaled until it looks that way".
+
+    ABSOLUTE difference. The signed one is antisymmetric, so folding it onto
+    a single side would put half the pixels below zero, and every colormap
+    here is sequential with clim (0, peak) — those would flatten onto the
+    floor and hide exactly what the mode exists to show.
+
+    Columns past the fold with no counterpart behind it — the tail of the
+    longer half, whenever the fold sits off-centre — are left NaN rather
+    than zeroed. Zero would claim perfect symmetry where there is simply
+    nothing to compare against; NaN takes _apply_cmap's 'bad' colour, the
+    plot background, so unmeasured reads as unmeasured.
+    """
+    t = np.asarray(trace, float)
+    n = t.shape[1]
+    c = symmetry_center(ac, delays, fold_fs)
+    fold = float(np.asarray(delays, float)[c])
+    out = t.copy()                   # left of the fold: measured, untouched
+    h = min(c, n - 1 - c)            # columns both sides can cover
+    peak = float(np.nanmax(t)) if t.size else 0.0
+    if h < 1:
+        out[:, c + 1:] = np.nan      # fold on an edge: nothing to compare
+        return out, peak, 0.0, fold
+    left  = t[:, c - h:c + 1]        # columns c-h … c
+    right = t[:, c:c + h + 1]        # columns c   … c+h
+    d = np.abs(right - left[:, ::-1])
+    out[:, c:c + h + 1] = d
+    out[:, c + h + 1:]  = np.nan     # beyond the overlap: no counterpart
+    # Score: sum of the absolute difference over the sum of the whole
+    # trace — but with the sum over WAVELENGTH taken first, i.e. on the
+    # autocorrelation rather than pixel by pixel.
+    #
+    # This is not cosmetic. Per pixel, |noise - noise| never cancels: the
+    # modulus turns every one of the ~30k near-zero background pixels into
+    # a positive contribution, and their sum swamps the signal. Measured on
+    # the simulator, a PERFECTLY symmetric beam scored 13.8% at 460 peak
+    # counts, 2.7% at 4000 and 0.9% at 20000 — a floor that moves with
+    # exposure and, at realistic levels, is not far off the 26.7% a badly
+    # misaligned trace scored. Collapsing the wavelength axis first averages
+    # that noise down instead of rectifying it: the same two traces score
+    # 0.6% and 20.6%, near enough exposure-independent.
+    #
+    # The blind spot is an asymmetry that cancels in the wavelength sum. The
+    # IMAGE is per-pixel and still shows it — the picture says where, the
+    # number says how much.
+    a = np.asarray(ac, float)
+    total = float(np.nansum(a))
+    score = (float(np.nansum(np.abs(a[c:c + h + 1] - a[c - h:c + 1][::-1])))
+             / total) if total > 0 else 0.0
+    return out, peak, score, fold

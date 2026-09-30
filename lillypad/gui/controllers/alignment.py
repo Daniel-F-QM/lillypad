@@ -26,7 +26,8 @@ import numpy as np
 from lillypad.gui.text import FEED_BUSY_MSG
 from lillypad.gui.workers import AlignmentWorker
 from lillypad.hardware import StitchedSpectrometer
-from lillypad.scan import delay_to_position_um, stage_to_um
+from lillypad.scan import (delay_to_position_um, stage_to_um, symmetry_center,
+                           symmetry_view)
 
 
 class AlignmentController:
@@ -89,7 +90,7 @@ class AlignmentController:
         """
         if self._align_running():
             return False
-        if self.win._scan_running():
+        if self.win.scanning.running():
             self.win.status.showMessage("A scan is running — the stage is busy.", 3000)
             return False
         if self.win.spec is None or self.win.stage is None:
@@ -125,7 +126,7 @@ class AlignmentController:
             self.win.status.showMessage(f"Alignment failed — stage: {e}", 5000)
             return False
         span_um = abs(float(delay_to_position_um(2.0 * step, 0.0, pf)))
-        lo, hi = self.win._travel_range_um()
+        lo, hi = self.win.stage_ctl._travel_range_um()
         if start_um - span_um < lo or start_um + span_um > hi:
             if self.win._feed_was_on:
                 self.win._feed.resume()
@@ -137,10 +138,10 @@ class AlignmentController:
 
         self.win.appearance._set_hardware_buttons_enabled(False)
         self.win.btn_scan.setEnabled(False)
-        self.win._set_stage_controls_enabled(False)
+        self.win.stage_ctl._set_stage_controls_enabled(False)
         self.win.btn_align_spec.setEnabled(False)
         self.win.btn_align_refresh.setEnabled(False)
-        self.win._moving(True)
+        self.win.stage_ctl._moving(True)
 
         self.win._align_worker = AlignmentWorker(self.win.stage, self.win.spec,
                                              self.win.scan_cfg, step)
@@ -195,13 +196,13 @@ class AlignmentController:
 
     def _reset_align_ui(self):
         """Hand the devices back and re-enable what the sweep locked out."""
-        self.win._moving(False)
+        self.win.stage_ctl._moving(False)
         self.win.appearance._set_hardware_buttons_enabled(True)
         self.win.btn_scan.setEnabled(True)
-        self.win._set_stage_controls_enabled(True)
+        self.win.stage_ctl._set_stage_controls_enabled(True)
         self.win.btn_align_spec.setEnabled(True)
         self.win.btn_align_refresh.setEnabled(True)
-        self.win._refresh_positions()
+        self.win.stage_ctl._refresh_positions()
         if self.win._feed_was_on:
             self.win._feed.resume()
 
@@ -230,8 +231,8 @@ class AlignmentController:
         """The symmetry view of the finished scan, or None if there is none."""
         if self.win.result is None:
             return None
-        return self.win._symmetry_view(self.win._result_view, self.win._result_ac,
-                                   self.win.result.delays_fs)
+        return symmetry_view(self.win._result_view, self.win._result_ac,
+                             self.win.result.delays_fs, self.win._fold_fs)
 
     def _show_symmetry(self):
         """Push the symmetry view, its fold line and its score to the canvas."""
@@ -252,9 +253,11 @@ class AlignmentController:
         be work with nothing to show for it."""
         if self.win.result is None or not self.win._symmetry_on:
             return
-        before = self.win._symmetry_center(self.win._result_ac, self.win.result.delays_fs)
+        before = symmetry_center(self.win._result_ac, self.win.result.delays_fs,
+                                 self.win._fold_fs)
         self.win._fold_fs = float(x_fs)
-        after = self.win._symmetry_center(self.win._result_ac, self.win.result.delays_fs)
+        after = symmetry_center(self.win._result_ac, self.win.result.delays_fs,
+                                self.win._fold_fs)
         if after != before:
             self._show_symmetry()
 

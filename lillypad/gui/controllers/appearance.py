@@ -299,7 +299,7 @@ class AppearanceController:
         dead until a device swap or a theme switch happened along.
         """
         if running is None:
-            running = self.win._scan_running()
+            running = self.win.scanning.running()
         self.win.btn_autostitch.setVisible(self.win._pair_live()
                                        and len(self.win.devices._slot_members()) == 2)
         self.win.btn_autostitch.setEnabled(not running)
@@ -612,7 +612,7 @@ class AppearanceController:
         refresh happened along.
         """
         if running is None:
-            running = self.win._scan_running()
+            running = self.win.scanning.running()
         ready = self.win.result is not None and not running
         self.win.btn_symmetry.setEnabled(ready)
         self.win.btn_symmetry.setToolTip(

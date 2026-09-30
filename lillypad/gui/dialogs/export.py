@@ -69,7 +69,7 @@ class ExportDialog(QDialog):
             # `on and …`: a click also un-toggles the radio that HELD the
             # choice, and that second signal must not report the old format as
             # a new one.
-            rb.toggled.connect(lambda on, k=key: on and win._set_export_fmt(k))
+            rb.toggled.connect(lambda on, k=key: on and win.export.set_format(k))
             lay.addWidget(rb)
             self.radios[key] = rb
         hint = QLabel(
@@ -115,7 +115,7 @@ class ExportDialog(QDialog):
         self.btn_save.setMinimumHeight(30)
         self.btn_save.setEnabled(False)
         self.btn_save.setToolTip("Choose where to write the scan")
-        self.btn_save.clicked.connect(win._export_now)
+        self.btn_save.clicked.connect(win.export.save_now)
         lay.addWidget(self.btn_save)
         btn = QPushButton("Close"); btn.clicked.connect(self.hide)
         lay.addWidget(btn)

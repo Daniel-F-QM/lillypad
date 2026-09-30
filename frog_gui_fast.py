@@ -52,20 +52,17 @@ and shared with frog_gui.py via hardware.py / scan.py.
 
 import gc
 import sys
-import math
-import numpy as np
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget,
                                QVBoxLayout, QHBoxLayout, QGridLayout,
                                QGroupBox, QLabel, QCheckBox, QPushButton,
                                QProgressBar, QScrollArea, QSizePolicy,
-                               QStatusBar, QFileDialog, QToolBar, QMessageBox)
+                               QStatusBar, QToolBar)
 from PySide6.QtCore import Qt, QTimer, Signal, QSize, QRect
 from PySide6.QtGui import QFont, QIcon
 
 from lillypad.paths import seed_calibration_dir
-from lillypad.settings import (SETTINGS_VERSION, as_bool, load_settings,
-                               save_settings)
+from lillypad.settings import load_settings
 # The design layer. No colour, font size or icon path is defined in this file any
 # more — see lillypad/design/. PALETTE is mutated in place by install_theme, so
 # importing the name here follows a runtime theme switch.
@@ -77,7 +74,9 @@ from lillypad.design.theme import install_theme, startup_theme
 # at all any more — see lillypad/gui/canvas/figure.py.
 from lillypad.gui.canvas import FrogCanvas
 from lillypad.gui.controllers import (AlignmentController, AppearanceController,
-                                      DeviceController, LiveFeedController)
+                                      DeviceController, ExportController,
+                                      LiveFeedController, ScanController,
+                                      SettingsController, StageController)
 from lillypad.gui.dialogs.acquisition import AcquisitionSettingsDialog
 from lillypad.gui.dialogs.alignment import AlignmentDialog
 from lillypad.gui.dialogs.avantes import AvantesSettingsDialog
@@ -90,12 +89,9 @@ from lillypad.gui.perf import PERF, install_probe
 from lillypad.gui.state import InstrumentState
 from lillypad.gui.widgets import (DoubleSpinBox, NoDeviceOverlay, StatusLamp,
                                   _hline)
-from lillypad.gui.text import FEED_BUSY_MSG, RIGHT_CLICK_HINT
+from lillypad.gui.text import RIGHT_CLICK_HINT
 from lillypad.gui.workers import (MAX_UI_EXPOSURE_MS, _ORPHANED_THREADS,
-                                  ExportWorker, LiveFeedWorker)
-from scan import (FrogScanWorker, fwhm, autocorrelation,
-                  position_to_delay_fs, delay_to_position_um,
-                  um_to_stage, stage_to_um)
+                                  LiveFeedWorker)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,7 +223,7 @@ class FrogWindow(QMainWindow):
         # One per concern, each holding a reference to this window. They are a
         # grouping of BEHAVIOUR, not an encapsulation boundary: the widgets stay
         # on the window and the instrument stays in InstrumentState, so a
-        # controller reads `self.win.btn_feed` and `self.win.spec` exactly where
+        # controller reads `self.btn_feed` and `self.spec` exactly where
         # the flat method read `self.btn_feed` and `self.spec`.
         #
         # That is deliberate. This was 4,000 lines relocated out of one class,
@@ -241,10 +237,14 @@ class FrogWindow(QMainWindow):
         #
         # Constructed BEFORE _build_ui, whose lambdas connect straight to
         # controller methods. None of them touches a widget on construction.
-        self.devices    = DeviceController(self)
-        self.appearance = AppearanceController(self)
-        self.feed       = LiveFeedController(self)
-        self.alignment  = AlignmentController(self)
+        self.devices      = DeviceController(self)
+        self.appearance   = AppearanceController(self)
+        self.feed         = LiveFeedController(self)
+        self.alignment    = AlignmentController(self)
+        self.stage_ctl    = StageController(self)
+        self.scanning     = ScanController(self)
+        self.export       = ExportController(self)
+        self.settings_ctl = SettingsController(self)
 
         self.dlg_settings = AcquisitionSettingsDialog(self)
         self.dlg_align    = AlignmentDialog(self)
@@ -328,7 +328,7 @@ class FrogWindow(QMainWindow):
         # canvas _build_ui created. Nothing has painted yet — the event loop
         # only starts in main() — so the draw_idle()s this sets off all collapse
         # into the first frame.
-        self._restore_settings()
+        self.settings_ctl._restore_settings()
         # Closing is not the only way this program ends: a vendor driver can
         # take the process with it (see the warning in closeEvent), and losing a
         # session of preferences to a fault in someone else's DLL is exactly the
@@ -336,7 +336,7 @@ class FrogWindow(QMainWindow):
         # can be lost, and the write only happens when something changed.
         self._settings_timer = QTimer(self)
         self._settings_timer.setInterval(10_000)
-        self._settings_timer.timeout.connect(self._autosave_settings)
+        self._settings_timer.timeout.connect(self.settings_ctl._autosave_settings)
         self._settings_timer.start()
 
     # ── Instrument state ─────────────────────────────────────────────────────
@@ -462,9 +462,6 @@ class FrogWindow(QMainWindow):
         This is the ONLY definition of multi-spectrometer mode."""
         return self.state.pair_live()
 
-    # ── Shared-device access ─────────────────────────────────────────────────
-    def _scan_running(self):
-        return self._worker is not None and self._worker.isRunning()
 
 
 
@@ -983,8 +980,8 @@ class FrogWindow(QMainWindow):
 
         jog = QHBoxLayout()
         self.btn_minus = QPushButton("−"); self.btn_plus = QPushButton("+")
-        self.btn_minus.clicked.connect(lambda: self._jog(-1))
-        self.btn_plus.clicked.connect(lambda: self._jog(+1))
+        self.btn_minus.clicked.connect(lambda: self.stage_ctl._jog(-1))
+        self.btn_plus.clicked.connect(lambda: self.stage_ctl._jog(+1))
         self.spin_step = DoubleSpinBox()
         self.spin_step.setDecimals(0)
         self.spin_step.setSuffix(" fs")     # value set after ranges, below
@@ -993,7 +990,7 @@ class FrogWindow(QMainWindow):
         self.btn_units.setFixedWidth(42)
         self.btn_units.setToolTip("Toggle jog/move units between optical delay (fs) "
                                   "and stage position (um)")
-        self.btn_units.clicked.connect(self._toggle_stage_units)
+        self.btn_units.clicked.connect(self.stage_ctl._toggle_stage_units)
         jog.addWidget(self.btn_minus); jog.addWidget(self.spin_step); jog.addWidget(self.btn_plus)
         jog.addWidget(self.btn_units)
         lay.addLayout(jog)
@@ -1003,14 +1000,14 @@ class FrogWindow(QMainWindow):
         self.spin_moveto.setDecimals(0)
         self.spin_moveto.setSuffix(" fs")
         self.btn_moveto = QPushButton("Move")
-        self.btn_moveto.clicked.connect(self._move_absolute)
+        self.btn_moveto.clicked.connect(self.stage_ctl._move_absolute)
         mv.addWidget(self.spin_moveto); mv.addWidget(self.btn_moveto)
         lay.addLayout(mv)
 
         self.btn_home = QPushButton("Home")
-        self.btn_home.clicked.connect(self._home_stage)
+        self.btn_home.clicked.connect(self.stage_ctl._home_stage)
         self.btn_goto_zero = QPushButton("Move to 0 fs")
-        self.btn_goto_zero.clicked.connect(self._move_to_zero)
+        self.btn_goto_zero.clicked.connect(self.stage_ctl._move_to_zero)
         zrow = QHBoxLayout()
         zrow.addWidget(self.btn_home); zrow.addWidget(self.btn_goto_zero)
         lay.addLayout(zrow)
@@ -1051,7 +1048,7 @@ class FrogWindow(QMainWindow):
 
         self.btn_set_zero = QPushButton("Set Position as 0 fs")
         self.btn_set_zero.setObjectName("accentcompact")
-        self.btn_set_zero.clicked.connect(self._mark_zero)
+        self.btn_set_zero.clicked.connect(self.stage_ctl._mark_zero)
         lay.addWidget(self.btn_set_zero)
 
         # Backlash lives in the Stage dialog — it is a property of the
@@ -1060,9 +1057,9 @@ class FrogWindow(QMainWindow):
         # Ranges from whatever stage is loaded, which at build time is none:
         # _travel_range_um falls back to 300 mm of travel, and _apply_stage
         # calls this again with the real numbers on every connect.
-        self._update_stage_unit_ranges()
+        self.stage_ctl._update_stage_unit_ranges()
         self.spin_step.setValue(10.0)      # after ranges: default 10 fs jog
-        self._sync_backlash_ui()
+        self.stage_ctl._sync_backlash_ui()
 
         self.btn_connect_stage = QPushButton("Connect Stage")
         self.btn_connect_stage.setObjectName("accent")
@@ -1110,7 +1107,7 @@ class FrogWindow(QMainWindow):
         cell(2, 0, "Step", self.spin_step_fs, " fs", 1, 0.1, 1e5, 1.0)
         lay.addLayout(g)
         for s in (self.spin_start, self.spin_stop):
-            s.valueChanged.connect(self._refresh_scan_um)
+            s.valueChanged.connect(self.stage_ctl._refresh_scan_um)
 
         # The scan and its export on one line, in the order they are used.
         # btn_scan keeps the wider share: it also carries "Abort Scan" while a
@@ -1119,7 +1116,7 @@ class FrogWindow(QMainWindow):
         self.btn_scan = QPushButton("Measure FROG")
         self.btn_scan.setObjectName("accent")
         self.btn_scan.setMinimumHeight(30)
-        self.btn_scan.clicked.connect(self._start_scan)
+        self.btn_scan.clicked.connect(self.scanning._start_scan)
         arow.addWidget(self.btn_scan, 3)
 
         self.btn_save = QPushButton(f"Save ({EXPORT_FORMATS[self._export_fmt][1]})")
@@ -1128,7 +1125,7 @@ class FrogWindow(QMainWindow):
         # Straight to the write, in the format and under the name the Export
         # window is showing — this button is the shortcut past that window, not
         # a second set of choices.
-        self.btn_save.clicked.connect(self._export_now)
+        self.btn_save.clicked.connect(self.export.save_now)
         arow.addWidget(self.btn_save, 2)
         lay.addLayout(arow)
 
@@ -1140,7 +1137,7 @@ class FrogWindow(QMainWindow):
         # The AC FWHM is reported inside the autocorrelation panel itself
         # (FrogCanvas.set_fwhm), next to the curve it measures.
 
-        self._refresh_scan_um()
+        self.stage_ctl._refresh_scan_um()
         return grp
 
 
@@ -1203,97 +1200,6 @@ class FrogWindow(QMainWindow):
 
 
     # ── Symmetry mode ────────────────────────────────────────────────────────
-    def _symmetry_center(self, ac, delays):
-        """Column index the trace is folded about.
-
-        The autocorrelation maximum by default: the AC is the trace summed over
-        wavelength, so its peak is where the two pulses overlap best — the delay
-        the trace SHOULD be symmetric about. Not the middle column, which would
-        make a scan range that was not centred on the overlap report its own
-        offset as asymmetry.
-
-        A hand-placed line (dragged on the plot) overrides it, snapped to the
-        nearest measured column: the fold is an index into the trace, so there
-        is no sub-column position it could honour without resampling.
-        """
-        if self._fold_fs is None:
-            return int(np.nanargmax(np.asarray(ac, float)))
-        d = np.asarray(delays, float)
-        return int(np.argmin(np.abs(d - float(self._fold_fs))))
-
-    def _symmetry_view(self, trace, ac, delays):
-        """Measured trace on the left of the fold, |T(+d) - T(-d)| on the right.
-
-        Returns (image, peak, score, fold_delay_fs).
-
-        Half and half rather than the difference everywhere: keeping one side as
-        it was measured gives the eye something to judge the other against, and
-        the two are directly comparable because they share one colour scale —
-        taken from the MEASURED peak, so the left half looks exactly as it does
-        in the ordinary view and "nearly black on the right" genuinely means
-        "nearly symmetric" rather than "rescaled until it looks that way".
-
-        ABSOLUTE difference. The signed one is antisymmetric, so folding it onto
-        a single side would put half the pixels below zero, and every colormap
-        here is sequential with clim (0, peak) — those would flatten onto the
-        floor and hide exactly what the mode exists to show.
-
-        Columns past the fold with no counterpart behind it — the tail of the
-        longer half, whenever the fold sits off-centre — are left NaN rather
-        than zeroed. Zero would claim perfect symmetry where there is simply
-        nothing to compare against; NaN takes _apply_cmap's 'bad' colour, the
-        plot background, so unmeasured reads as unmeasured.
-        """
-        t = np.asarray(trace, float)
-        n = t.shape[1]
-        c = self._symmetry_center(ac, delays)
-        fold = float(np.asarray(delays, float)[c])
-        out = t.copy()                   # left of the fold: measured, untouched
-        h = min(c, n - 1 - c)            # columns both sides can cover
-        peak = float(np.nanmax(t)) if t.size else 0.0
-        if h < 1:
-            out[:, c + 1:] = np.nan      # fold on an edge: nothing to compare
-            return out, peak, 0.0, fold
-        left  = t[:, c - h:c + 1]        # columns c-h … c
-        right = t[:, c:c + h + 1]        # columns c   … c+h
-        d = np.abs(right - left[:, ::-1])
-        out[:, c:c + h + 1] = d
-        out[:, c + h + 1:]  = np.nan     # beyond the overlap: no counterpart
-        # Score: sum of the absolute difference over the sum of the whole
-        # trace — but with the sum over WAVELENGTH taken first, i.e. on the
-        # autocorrelation rather than pixel by pixel.
-        #
-        # This is not cosmetic. Per pixel, |noise - noise| never cancels: the
-        # modulus turns every one of the ~30k near-zero background pixels into
-        # a positive contribution, and their sum swamps the signal. Measured on
-        # the simulator, a PERFECTLY symmetric beam scored 13.8% at 460 peak
-        # counts, 2.7% at 4000 and 0.9% at 20000 — a floor that moves with
-        # exposure and, at realistic levels, is not far off the 26.7% a badly
-        # misaligned trace scored. Collapsing the wavelength axis first averages
-        # that noise down instead of rectifying it: the same two traces score
-        # 0.6% and 20.6%, near enough exposure-independent.
-        #
-        # The blind spot is an asymmetry that cancels in the wavelength sum. The
-        # IMAGE is per-pixel and still shows it — the picture says where, the
-        # number says how much.
-        a = np.asarray(ac, float)
-        total = float(np.nansum(a))
-        score = (float(np.nansum(np.abs(a[c:c + h + 1] - a[c - h:c + 1][::-1])))
-                 / total) if total > 0 else 0.0
-        return out, peak, score, fold
-
-
-
-
-
-
-
-
-
-
-
-
-
     # Whether the live feed is meant to be running. The toolbar button is the
     # one piece of state that answers that, but callers outside this file (the
     # Avantes window has to stop the feed before arming a hardware trigger)
@@ -1313,819 +1219,45 @@ class FrogWindow(QMainWindow):
 
 
 
-    # ── Manual stage ──────────────────────────────────────────────────────────
-    def _set_stage_controls_enabled(self, on):
-        for w in (self.btn_minus, self.btn_plus, self.btn_moveto,
-                  self.btn_home, self.btn_goto_zero, self.btn_set_zero,
-                  self.btn_units, self.spin_backlash):
-            w.setEnabled(on)
-
-
-    def _moving(self, on):
-        self.lbl_moving.setText("MOVING" if on else "IDLE")
-        self.lbl_moving.setObjectName("moving" if on else "idle")
-        self.lbl_moving.style().unpolish(self.lbl_moving); self.lbl_moving.style().polish(self.lbl_moving)
-        # repaint() paints synchronously WITHOUT spinning the event loop.
-        # processEvents() here used to dispatch queued work — a spectrum_ready
-        # delivery, or another click on the jog button — in the middle of a
-        # blocking move, re-entering this code path.
-        self.lbl_moving.repaint()
-
-    def _stage_action(self, fn, done_msg=None):
-        """Run a blocking stage operation from a slot, safely.
-
-        Parks the live feed (which drives the same stage from thread 2),
-        disables the stage controls so the operation cannot be re-entered, and
-        restores both however `fn` exits.
-        """
-        if self._scan_running():
-            self.status.showMessage("A scan is running — the stage is busy.", 3000)
-            return
-        if not self._have_stage():
-            self.status.showMessage("Connect a stage first.", 4000)
-            return
-        self._set_stage_controls_enabled(False)
-        self._moving(True)
-        try:
-            with self.devices.device_lock() as ok:
-                if not ok:
-                    self.status.showMessage(FEED_BUSY_MSG, 5000)
-                    return
-                fn()
-                self._refresh_positions()   # still inside the lock
-                # An adapter that reports a failed move through position_fault()
-                # instead of raising (the piezo does, so a scan can record the
-                # column and carry on) would otherwise leave a manual move
-                # looking successful while the stage sits somewhere else.
-                fault = None
-                try:
-                    fault = self.stage.position_fault()
-                except Exception:
-                    pass
-                if fault:
-                    self.status.showMessage(f"Stage: {fault}", 8000)
-                elif done_msg:
-                    self.status.showMessage(done_msg, 3000)
-        except Exception as e:
-            self.status.showMessage(f"Stage error: {e}", 5000)
-        finally:
-            self._moving(False)
-            self._set_stage_controls_enabled(True)
-
-    def _travel_range_um(self):
-        """Reachable position range (lo, hi) in um.
-
-        Not [0, travel]: limit.min is not always 0 (a soft limit protecting the
-        optics is common), and the low end has to leave room for the backlash
-        pre-move to undershoot into. Falls back to 300 mm of travel when the
-        adapter reports none.
-        """
-        t = getattr(self.stage, "travel_mm", None)
-        hi = stage_to_um(t if t else 300.0)
-        lo = stage_to_um(float(getattr(self.stage, "travel_min_mm", 0.0) or 0.0)
-                          + float(getattr(self.stage, "backlash_mm", 0.0) or 0.0))
-        return lo, hi
-
-    def _update_stage_unit_ranges(self):
-        """Set spin_step/spin_moveto ranges for the active unit, the connected
-        stage's travel, and the current zero. Call after: unit toggle, stage
-        swap, zero change, backlash change."""
-        lo_um, hi_um = self._travel_range_um()
-        pf, z = self.scan_cfg.pass_factor, self.scan_cfg.zero_pos_um
-        if self._stage_units_fs:
-            # Inward rounding (ceil min, floor max) so every integer fs in
-            # range maps to a position strictly inside the travel range.
-            self.spin_step.setRange(
-                1, max(1, math.floor(float(
-                    position_to_delay_fs(hi_um - lo_um, 0.0, pf)))))
-            self.spin_moveto.setRange(
-                math.ceil(float(position_to_delay_fs(lo_um, z, pf))),
-                math.floor(float(position_to_delay_fs(hi_um, z, pf))))
-        else:
-            self.spin_step.setRange(0.01, hi_um - lo_um)
-            self.spin_moveto.setRange(lo_um, hi_um)
-
-    def _sync_backlash_ui(self):
-        """Push the active stage's backlash into the spin box and its fs hint.
-
-        Blocks signals: this reflects the stage, it must not write back to it.
-        """
-        b_um = stage_to_um(float(getattr(self.stage, "backlash_mm", 0.0) or 0.0))
-        self.spin_backlash.blockSignals(True)
-        self.spin_backlash.setValue(b_um)
-        self.spin_backlash.blockSignals(False)
-        self._refresh_backlash_hint(b_um)
-
-    def _refresh_backlash_hint(self, b_um):
-        if b_um <= 0.0:
-            self.lbl_backlash_fs.setText(
-                "Off — moves arrive from whichever side they came from.")
-            return
-        fs = float(position_to_delay_fs(b_um, 0.0, self.scan_cfg.pass_factor))
-        self.lbl_backlash_fs.setText(
-            f"Approach from below, undershooting {b_um:.1f} um ({fs:.0f} fs).")
-
-    def _on_backlash_changed(self, value_um):
-        if self._scan_running():
-            self.status.showMessage("A scan is running — the stage is busy.", 3000)
-            self._sync_backlash_ui()      # snap back to what the stage has
-            return
-        if not self._have_stage():
-            return
-        # Plain attribute write, no device I/O — no lock needed. Ranges shift
-        # because the low end reserves the margin.
-        self.stage.backlash_mm = um_to_stage(float(value_um))
-        self._refresh_backlash_hint(float(value_um))
-        self._update_stage_unit_ranges()
-
-    def _toggle_stage_units(self):
-        pf, z = self.scan_cfg.pass_factor, self.scan_cfg.zero_pos_um
-        step, move = self.spin_step.value(), self.spin_moveto.value()
-        self._stage_units_fs = not self._stage_units_fs
-        if self._stage_units_fs:
-            new_step = round(float(position_to_delay_fs(step, 0.0, pf)))
-            new_move = round(float(position_to_delay_fs(move, z, pf)))
-            suffix, dec = " fs", 0
-        else:
-            new_step = round(float(delay_to_position_um(step, 0.0, pf)))
-            new_move = round(float(delay_to_position_um(move, z, pf)))
-            suffix, dec = " um", 2
-        for s in (self.spin_step, self.spin_moveto):
-            s.setSuffix(suffix); s.setDecimals(dec)
-        self._update_stage_unit_ranges()   # ranges before values: no bad clamp
-        self.spin_step.setValue(new_step)
-        self.spin_moveto.setValue(new_move)
-        self.btn_units.setText("fs" if self._stage_units_fs else "um")
-
-    def _jog(self, sign):
-        v = self.spin_step.value()
-        step_um = (float(delay_to_position_um(v, 0.0, self.scan_cfg.pass_factor))
-                   if self._stage_units_fs else v)
-        lo, hi = self._travel_range_um()
-        def do():
-            # Clamped move_to instead of move_by: the target can never leave
-            # the travel range. get_position() runs inside the device lock.
-            cur = stage_to_um(self.stage.get_position())
-            target = min(max(cur + sign * step_um, lo), hi)
-            self.stage.move_to(um_to_stage(target))
-        self._stage_action(do)
-
-    def _move_absolute(self):
-        v = self.spin_moveto.value()
-        pf, z = self.scan_cfg.pass_factor, self.scan_cfg.zero_pos_um
-        target_um = float(delay_to_position_um(v, z, pf)) if self._stage_units_fs else v
-        lo, hi = self._travel_range_um()
-        target_um = min(max(target_um, lo), hi)
-        self._stage_action(lambda: self.stage.move_to(um_to_stage(target_um)))
-
-    def _move_to_zero(self):
-        self._stage_action(
-            lambda: self.stage.move_to(um_to_stage(self.scan_cfg.zero_pos_um)))
-
-    def _home_stage(self):
-        """Home the axis, and drop a zero that homing has invalidated.
-
-        Homing an axis that had no reference re-establishes the coordinate
-        frame, which moves any zero marked in the old one. Silently keeping it
-        would shift the whole delay axis by the home offset, so it goes.
-        """
-        was_unreferenced = bool(getattr(self.stage, "needs_homing", False))
-        landed = []          # stays empty if home() raised or the feed was busy
-
-        def do():
-            self.stage.home()
-            # Read it here, inside the lock — get_position() is device I/O and
-            # the live feed drives the same stage from its own thread.
-            landed.append(stage_to_um(self.stage.get_position()))
-
-        self._stage_action(do)
-        if not landed:
-            return           # _stage_action already reported why
-        pos_um = landed[0]
-        if was_unreferenced:
-            self.scan_cfg.zero_pos_um = pos_um
-            self._update_stage_unit_ranges()
-            self._refresh_positions()
-            self._refresh_scan_um()
-            self.status.showMessage(
-                f"Homed to {pos_um:.2f} um. The axis had no reference before, "
-                f"so the old zero-delay was in a different frame — set zero "
-                f"again before scanning.", 0)
-        else:
-            self.status.showMessage(f"Stage homed to {pos_um:.2f} um.", 3000)
-
-    def _mark_zero(self):
-        def mark():
-            # get_position() is a device read like any other — take the lock.
-            self.scan_cfg.zero_pos_um = stage_to_um(self.stage.get_position())
-        self._stage_action(mark)
-        # fs-mode values are delays and stay as typed — the zero moved, so the
-        # same delay now maps to the new (correct) absolute position. Only the
-        # ranges need recomputing; Qt clamps anything now out of range.
-        self._update_stage_unit_ranges()
-        self._refresh_scan_um()
-        self.status.showMessage(f"Zero-delay set to {self.scan_cfg.zero_pos_um:.2f} um.", 3000)
-
-    def _refresh_positions(self):
-        self.lbl_pos.setText(
-            f"{stage_to_um(self.stage.get_position()):.2f} um"
-            if self._have_stage() else "— um")
-        self.lbl_zero.setText(f"{self.scan_cfg.zero_pos_um:.2f} um")
-
-    def _refresh_scan_um(self):
-        z = self.scan_cfg.zero_pos_um
-        p0 = delay_to_position_um(self.spin_start.value(), z, self.scan_cfg.pass_factor)
-        p1 = delay_to_position_um(self.spin_stop.value(),  z, self.scan_cfg.pass_factor)
-        self.eq_start.setText(f"{p0:,.1f} um")
-        self.eq_stop.setText(f"{p1:,.1f} um")
-
-    # ── FROG scan ─────────────────────────────────────────────────────────────
-    def _start_scan(self):
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.abort()
-            self.btn_scan.setEnabled(False); self.btn_scan.setText("Aborting…")
-            return
-        if not self._have_spec():
-            self.status.showMessage("Connect a spectrometer first.", 4000); return
-        if not self._have_stage():
-            self.status.showMessage("Connect a stage first — a FROG scan has "
-                                    "to sweep the delay.", 4000); return
-        if self.alignment._align_running():
-            self.status.showMessage(
-                "An alignment sweep is running — the stage is busy.", 3000); return
-        # An unreferenced axis has no usable coordinate frame: every delay the
-        # scan would record is measured from a zero that means nothing, and
-        # homing afterwards moves the frame again. Refuse rather than save it.
-        if getattr(self.stage, "needs_homing", False):
-            self.status.showMessage(
-                "Stage is not homed — press Home, then set zero, then scan.",
-                6000)
-            return
-
-        c = self.scan_cfg
-        c.delay_start_fs = self.spin_start.value()
-        c.delay_stop_fs  = self.spin_stop.value()
-        c.delay_step_fs  = self.spin_step_fs.value()
-        c.n_average      = self.dlg_settings.n_average
-        c.idle_shots     = self.dlg_settings.idle_shots
-        c.wait_after_move_s = self.dlg_settings.settle_ms / 1000.0
-        c.capture_delay_reference = self.dlg_settings.take_delay_reference
-        c.saturation_fraction  = self.dlg_settings.sat_percent / 100.0
-        c.abort_on_saturation  = self.dlg_settings.abort_on_saturation
-        c.abort_on_stage_fault = self.dlg_settings.abort_on_stage_fault
-        # c.saturation_counts is owned by the Hardware dialog's override field.
-
-        try:
-            delays = c.delays_fs()
-        except ValueError as e:
-            self.status.showMessage(f"Bad scan range: {e}", 4000); return
-        wl = np.asarray(self.spec.wavelengths, float)
-
-        # No dark means the exported trace carries the full pedestal, which on
-        # a typical bench is several times the signal — so say so ONCE, before
-        # anything moves, and let the operator decide. Asked here rather than
-        # refused outright because a deliberately uncorrected scan is a
-        # legitimate thing to want; the .npz records which it was either way.
-        if self.feed.display_dark() is None and not self._confirm_no_dark():
-            return
-
-        # Hand the shared stage/spectrometer over to the scan worker: pause the
-        # live feed and wait for any in-flight acquire to finish first. If it
-        # will not let go, refuse to start rather than run the scan against a
-        # spectrometer the feed thread is still inside.
-        self._feed_was_on = self.btn_feed.isChecked()
-        if not self._feed.pause():
-            if self._feed_was_on:
-                self._feed.resume()
-            self.status.showMessage(f"Scan not started — {FEED_BUSY_MSG}", 6000)
-            return
-
-        # The worker captures these devices for the whole scan, so lock out
-        # everything that could swap or drive them underneath it.
-        self.appearance._set_hardware_buttons_enabled(False)
-        self._set_stage_controls_enabled(False)
-        # The fold line belongs to the result it came from, and the panel is
-        # about to start showing a different trace. running=True is asserted:
-        # the worker for THIS scan does not exist yet, so _scan_running() would
-        # still be answering for the previous one.
-        self.alignment._clear_symmetry(running=True)
-
-        self._scan_trace  = np.zeros((wl.size, delays.size))
-        self._scan_delays = delays
-        self._scan_wl     = wl
-        # The pedestal every column of THIS scan is drawn against, sampled once
-        # here rather than per column or per render.
-        #
-        # Once, because a trace assembled from columns corrected two different
-        # ways is not a picture of anything — and because the alternative,
-        # subtracting at render time, is a pass over the whole trace on every
-        # display tick (measured: 12 ms on a 4000 x 1000 trace, against the
-        # 4 ms the row pooling already costs), where doing it as each column
-        # lands is one 4000-element subtract.
-        #
-        # Nothing it depends on can move mid-scan in any case: the worker owns
-        # the device, so no dark can be recorded and Auto-stitch cannot re-fit,
-        # and the Spectrometer window (the band) is locked out for the
-        # duration. The one thing an operator CAN still do is untick Subtract
-        # Dark, and that now takes effect on the next scan rather than striping
-        # this one.
-        self._scan_dark   = self.feed.display_dark()
-        # The same dark at MEMBER level, for the RAW view. RAW shows the two
-        # detectors uncalibrated and unstitched, so the pedestal has to come off
-        # each member's own raw frame — the combined dark above has already been
-        # through both calibrations and the crossfade.
-        self._scan_member_dark = (
-            self.background_members
-            if (self.chk_dark.isChecked() and self._pair_live()) else None)
-        # Running reductions _on_column keeps current, so the per-column render
-        # never has to walk the trace. Reallocated with the trace: an aborted
-        # scan leaves these sized to the OLD delay axis.
-        self._scan_ac     = np.zeros(delays.size)
-        self._scan_peak   = 0.0
-        # A pending render from a previous (aborted) scan must not fire
-        # against the fresh, differently-sized arrays.
-        self._scan_dirty  = False
-        self._scan_last_i = -1
-        self._scan_members_raw = None   # …and the last scan's member frames
-        self._live_frame  = None     # park any leftover live-feed frame too
-        self.alignment._init_align_trace(wl, delays.size)
-        self.canvas.init_trace(delays, wl)
-        self.feed.reset_saturation(); self.progress.setValue(0)
-        # A difference measured at the old position says nothing about the
-        # scan that is starting, and the scan owns the stage the sweep needs.
-        if self.btn_align_spec.isChecked() or self.canvas.dev_visible():
-            self.alignment._close_align_mode()
-
-        self.btn_scan.setObjectName("danger"); self.btn_scan.setText("Abort Scan")
-        self.btn_scan.style().unpolish(self.btn_scan); self.btn_scan.style().polish(self.btn_scan)
-        self._set_save_enabled(False)
-
-        self._worker = FrogScanWorker(self.stage, self.spec, c,
-                                      dark=self._scan_dark)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.column_ready.connect(self._on_column)
-        self._worker.delay_reference_ready.connect(self._on_delay_reference)
-        self._worker.saturation_warning.connect(self._on_saturation)
-        self._worker.stage_fault.connect(self._on_stage_fault)
-        self._worker.finished_scan.connect(self._on_finished)
-        self._worker.error.connect(self._on_error)
-        # QThread.finished, not finished_scan: the worker parks the stage on
-        # zero delay in a finally, which runs AFTER finished_scan is emitted.
-        # Refreshing the readout from _on_finished would print the last delay's
-        # position and leave it there.
-        self._worker.finished.connect(self._refresh_positions)
-        self._worker.start()
-        # Auto-stitch drives the pair the worker now owns, so it greys out for
-        # the duration. The per-spectrometer view does not — the scan carries
-        # its own member frames, and _render_scan_frame draws them.
-        self.appearance._refresh_overlay_button()
-        # Explicit, not inferred: this happens to run after _worker.start(), so
-        # _scan_running() would answer True — but that is an ordering accident,
-        # and the same call one line earlier would have greyed nothing.
-        self.appearance._refresh_autostitch_button(running=True)
-        self.status.showMessage(f"FROG scan: {delays.size} points…", 0)
-
-    def _on_progress(self, done, total):
-        self.progress.setValue(int(100 * done / total))
-
-    def _on_column(self, i, delay_fs, pos_um, col, members_raw=None):
-        """Slot for FrogScanWorker.column_ready — O(1), like _on_spectrum.
-
-        Every column is RECORDED here (the data path must never drop), but
-        rendering is deferred to _display_tick so a slow machine skips
-        intermediate redraws instead of queuing them up.
-
-        `col` is corrected on the way in. _scan_trace is a DISPLAY buffer — the
-        FrogResult is assembled by the worker from its own array, and nothing
-        here reaches a file — so this is the one place the correction has to
-        happen for the trace, the running peak, the autocorrelation sum and the
-        spectrum panel to agree about what a column contains.
-        """
-        col = self._corrected_column(col)
-        self._scan_trace[:, i] = col
-        # The raw member frames are interpolated and cut ONCE, here, rather
-        # than kept per column and re-derived at render time: that keeps the
-        # memory to one trace-sized array and the work to O(n_wl) per column.
-        self.alignment._store_align_column(i, members_raw)
-        # …but the NEWEST pair is kept as-is, so the per-spectrometer spectrum
-        # view has something to draw while a scan owns the device. One tuple
-        # reference, overwritten per column — the scan's cut and normalisation
-        # above are for the trace and are the wrong thing for this panel.
-        self._scan_members_raw = members_raw
-        # Fold the new column into the running reductions the render needs, so
-        # _render_scan_frame stays O(1) in the column index. Recomputing either
-        # of these from the whole trace per column made the scan cost O(N^2).
-        self._scan_ac[i]  = col.sum()
-        self._scan_peak   = max(self._scan_peak, float(col.max()))
-        self._scan_last_i = i
-        self._scan_col = col
-        self._scan_pos_um = pos_um
-        self._scan_dirty = True
-
-    def _render_scan_frame(self):
-        """Draw the in-progress scan from the newest recorded column.
-
-        Everything here is O(1) in the column index on purpose. The obvious
-        version — autocorrelation() over self._scan_trace[:, :i+1], and a
-        raw.max() over the whole preallocated trace inside _render_trace — is
-        O(n_wl * i) per column, i.e. O(n_wl * N^2) over the scan, and was what
-        made a long scan get slower the further it ran. _on_column keeps both
-        reductions up to date incrementally instead.
-        """
-        self._scan_dirty = False
-        i = self._scan_last_i
-        self.lbl_pos.setText(f"{self._scan_pos_um:.2f} um")
-        # Same value autocorrelation() would return for this slice: a per-column
-        # sum over the wavelength axis, baseline-shifted to its own minimum
-        # (scan.py:87-89). Only the baseline couples the columns, and a min over
-        # the accumulated sums is 1-D and cheap.
-        acc = self._scan_ac[:i + 1]
-        ac  = acc - acc.min()
-        # One blit for all three panels instead of three.
-        with self.canvas.batch():
-            # Keep the spectrum panel alive through the scan. The live feed is
-            # parked (the worker owns the device), so the column the scan just
-            # measured is the only spectrum there is.
-            #
-            # Trace only, never the headroom lamp: `col` is an average of
-            # n_average frames, so its peak sits below any single frame's and
-            # would under-report clipping. Saturation during a scan is reported
-            # per-frame by the worker via saturation_warning -> _on_saturation.
-            #
-            # The per-spectrometer view is honoured here exactly as the live
-            # feed honours it: update_spectrum owns the panel mode, so calling
-            # it unconditionally was what dropped a stitched pair back to the
-            # combined curve the moment a measurement started. A column whose
-            # member frames did not arrive falls through to the combined curve
-            # rather than freezing on the last one.
-            if self._scan_wl is not None:
-                if not (self._overlay_on
-                        and self.feed._render_overlay(self._scan_members_raw)):
-                    # Already corrected, in _on_column, along with the column
-                    # that went into the trace beside this panel.
-                    self.canvas.update_spectrum(self._scan_wl, self._scan_col)
-            if self._align_trace_on and self._align_trace is not None:
-                self.canvas.update_trace(self.alignment._align_trace_view(), 1.0)
-            else:
-                self.canvas.update_trace(self._scan_trace, self._scan_peak)
-            self.canvas.update_ac(self._scan_delays[:i + 1], ac)
-            # Inside the batch: the readout lives in the AC panel now, so its
-            # repaint is the same blit the three updates above share.
-            self.canvas.set_fwhm(fwhm(self._scan_delays[:i + 1], ac))
-
-    def _corrected_column(self, col):
-        """One scan column with this scan's pedestal removed.
-
-        A new array, never a write into `col`: the worker built that one and
-        the raw member frames beside it are what the RAW alignment view is
-        assembled from.
-
-        Clipped at zero like every other correction in the program
-        (prepare_pair, _corrected_spectrum): below the pedestal there is no
-        signal to show, and the trace panel has no way to draw a negative
-        count. The autocorrelation is unaffected by the floor — it subtracts
-        its own baseline (scan.autocorrelation).
-        """
-        bg = self._scan_dark
-        if bg is None or np.shape(bg) != np.shape(col):
-            return col
-        return np.clip(col - bg, 0, None)
-
-    def _confirm_no_dark(self):
-        """Ask before running a scan whose export will not be dark-corrected.
-
-        Two distinct reasons land here and the message names both, because the
-        fix differs: no dark has been recorded at all, or one has but Subtract
-        Dark is off. Answering No leaves everything untouched.
-        """
-        if self.background is None and self.background_members is None:
-            why = ("No dark has been recorded.")
-            fix = ("Record Dark in the Spectrum panel first, or continue and "
-                   "the .dwc and .csv will carry the raw pedestal.")
-        else:
-            why = ("A dark is recorded, but Subtract Dark is switched off.")
-            fix = ("Tick Subtract Dark to correct this scan, or continue and "
-                   "the .dwc and .csv will carry the raw pedestal.")
-        return QMessageBox.question(
-            self, "Scan without a dark?",
-            f"{why}\n\n{fix}\n\nThe .npz records that no dark was "
-            f"subtracted either way.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No) == QMessageBox.Yes
-
-    def _on_delay_reference(self, which, spectrum):
-        self.status.showMessage(
-            f"Delay-extreme reference ({which}) captured — archived, not "
-            f"subtracted.", 2500)
-
-    def _on_stage_fault(self, i, delay_fs, reason):
-        """Slot for FrogScanWorker.stage_fault.
-
-        With the abort enabled the worker's error() follows immediately and
-        supersedes this; the message matters in the override case, where the
-        scan carries on and this is the only live sign that it has stopped
-        tracking. Timeout 0 — it must not quietly disappear.
-        """
-        where = "the reference frame" if i < 0 else f"{delay_fs:+.0f} fs"
-        self.status.showMessage(f"⚠ STAGE FAULT @ {where} — {reason}", 0)
-
-    def _on_saturation(self, i, delay_fs, npx, peak):
-        """Slot for FrogScanWorker.saturation_warning — one signal per frame.
-
-        Latches: it reports that THIS scan's data is clipped, which stays true
-        for the rest of the scan even if later columns come back clean. The
-        worst frame is what gets named, since simply overwriting on every
-        signal would leave the last (often marginal) column on display and hide
-        how much of the trace is actually ruined.
-        """
-        self._sat_latched = True
-        self._sat_frames += 1
-        if npx > self._sat_worst[0]:
-            self._sat_worst = (npx, delay_fs, i)
-        npx_w, delay_w, i_w = self._sat_worst
-        where = "background" if i_w < 0 else f"{delay_w:+.0f} fs"
-        self.appearance._set_lamp("sat",
-                       f"⚠ SATURATED — {self._sat_frames} frame"
-                       f"{'' if self._sat_frames == 1 else 's'}, "
-                       f"worst @ {where} ({npx_w} px)",
-                       "sat")
-        # The worker's signal aggregates over stitched members; latch both
-        # lamps so neither device shows a green light over clipped data.
-        if self._pair_live():
-            self.lamp2.set_state("sat")
-
-    def _finished_trace_view(self, result):
-        """The finished scan as it should be DRAWN — pedestal removed.
-
-        Prefers the scan's OWN bracketed background over the recorded dark, and
-        never uses both: the background frames were taken through this very
-        pipeline with the beam blocked, so they already carry the dark along
-        with whatever stray light was on the bench, and subtracting the dark as
-        well would take the pedestal off twice. This is also exactly what
-        .dwc and .csv are written from (FrogResult.corrected_trace), so the
-        panel and the file finally agree.
-
-        Falls back to the dark when the scan ran with Background unticked, and
-        to the raw trace when there is neither — a trace with no pedestal
-        removed, which is what every finished scan used to show.
-
-        Display only. result.trace is untouched, and the .npz still archives
-        the raw counts with both background frames kept separately.
-        """
-        if result.dark is None:
-            return result.trace
-        return np.clip(result.corrected_trace(), 0, None)
-
-    def _on_finished(self, result):
-        self.result = result
-        # Cached, not recomputed per view: the symmetry fold and the RAW toggle
-        # both re-render from it, and it is a trace-sized subtraction.
-        self._result_view = self._finished_trace_view(result)
-        # From the SAME array the panel shows, so the curve and the width
-        # readout describe the picture above them. They used to come off
-        # result.trace, i.e. off the pedestal-bearing counts.
-        self._result_ac = autocorrelation(self._result_view)
-        # The final render below supersedes any pending intermediate tick.
-        self._scan_dirty = False
-        if self._align_trace_on and self._align_trace is not None:
-            # The raw view is a display mode, not a stage of the scan: finishing
-            # must not silently drop the operator back to the calibrated trace.
-            self.canvas.update_trace(self.alignment._align_trace_view(), 1.0)
-        else:
-            self.canvas.update_trace(self._result_view)
-        ac = self._result_ac
-        self.canvas.update_ac(result.delays_fs, ac)
-        self.canvas.set_fwhm(fwhm(result.delays_fs, ac))
-        self.progress.setValue(100)
-        n_bad = int(result.faulted_columns().size)
-        if n_bad:
-            # Only reachable with the abort override off — the scan ran to the
-            # end over a stage that had stopped tracking. Say so permanently
-            # rather than for five seconds; the delay axis is compromised.
-            self.status.showMessage(
-                f"Scan complete — {result.trace.shape[1]} columns, but the "
-                f"stage reported a fault on {n_bad} of them. Their delays are "
-                f"not trustworthy; the .npz marks which.", 0)
-        else:
-            self.status.showMessage(
-                f"Scan complete — {result.trace.shape[1]} columns.", 5000)
-        self._set_save_enabled(True)
-        self._reset_scan_ui()
-
-    def _on_error(self, msg):
-        self.status.showMessage(f"Scan: {msg}", 6000)
-        self._reset_scan_ui()
-
-    def _reset_scan_ui(self):
-        self.btn_scan.setEnabled(True)
-        self.btn_scan.setObjectName("accent"); self.btn_scan.setText("Measure FROG")
-        self.btn_scan.style().unpolish(self.btn_scan); self.btn_scan.style().polish(self.btn_scan)
-        self.appearance._set_hardware_buttons_enabled(True)
-        self._set_stage_controls_enabled(True)
-        self.appearance._refresh_overlay_button()
-        # running=False for the same reason as the symmetry button below: the
-        # worker's thread may not have left run() yet, so neither may infer it.
-        self.appearance._refresh_autostitch_button(running=False)
-        self.appearance._refresh_align_trace_button()
-        self.appearance._refresh_symmetry_button(running=False)   # a finished scan folds
-        if self._feed_was_on and self.btn_feed.isChecked():
-            self._feed.resume()
-
-    # ── Save ──────────────────────────────────────────────────────────────────
-    def _set_save_enabled(self, on):
-        """Enable or disable both ways in to an export at once — the side
-        panel's Save button and the Export window's. They write the same file
-        from the same data, so a state that applies to one applies to both."""
-        self.btn_save.setEnabled(on)
-        self.dlg_export.btn_save.setEnabled(on)
-
-    def _set_export_fmt(self, key):
-        """Make `key` the active export format, without writing anything.
-
-        The single writer of _export_fmt: the Export window's radios come here,
-        and so does a format restored from settings at startup. It writes back
-        to the radios as well, so the two can never disagree — that path is
-        blocked at the widget (see ExportDialog.show_format) rather than guarded
-        here, which keeps this function one-directional.
-        """
-        _label, suffix, _filt, _writer = EXPORT_FORMATS[key]   # bad key: KeyError
-        self._export_fmt = key
-        self.dlg_export.show_format(key)
-        self.dlg_export.refresh_preview()      # the suffix in it just changed
-        self.btn_save.setText(f"Save ({suffix})")
-
-    def _export_now(self):
-        """Write the last scan in the active format.
-
-        Both Save buttons land here, and neither can be pressed without a scan
-        (_set_save_enabled), so there is no 'nothing to save yet' branch — that
-        message existed because picking a format from the old menu also tried
-        to save. The guard below is for the one case the buttons cannot cover:
-        a second press while the first export is still running.
-        """
-        if self.result is None:
-            return
-        if self._export_worker is not None and self._export_worker.isRunning():
-            self.status.showMessage("An export is already in progress.", 3000)
-            return
-        _label, suffix, filt, writer = EXPORT_FORMATS[self._export_fmt]
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save FROG scan", self.dlg_export.file_name(suffix), filt)
-        if not path:
-            return
-        if not path.lower().endswith(suffix):
-            path += suffix
-        # Formatting a full trace takes seconds — write it on a worker thread so
-        # the window keeps painting (and the live feed keeps running).
-        self._set_save_enabled(False)
-        self.status.showMessage(f"Saving → {path} …", 0)
-        # Deliberately NOT parented to the window: a QThread child of a window
-        # that lives for the session is never destroyed, so rebinding
-        # self._export_worker would leak one thread — and the whole FrogResult
-        # it holds — per save. The Python reference below is what keeps it alive
-        # for the duration; finished() (queued onto the GUI thread) drops both.
-        w = ExportWorker(writer, path, self.result)
-        w.done.connect(self._on_export_done)
-        w.error.connect(self._on_export_error)
-        w.finished.connect(w.deleteLater)
-        w.finished.connect(self._release_export_worker)
-        self._export_worker = w
-        w.start()
-
-    def _release_export_worker(self):
-        self._export_worker = None
-
-    def _on_export_done(self, path):
-        self._end_export()
-        self.status.showMessage(f"Saved → {path}", 5000)
-
-    def _on_export_error(self, msg):
-        self._end_export()
-        self.status.showMessage(f"Save failed: {msg}", 8000)
-
-    def _end_export(self):
-        # btn_export is left alone: it opens the Export window now rather than
-        # writing anything, so there is nothing to lock out while a write runs.
-        self._set_save_enabled(self.result is not None)
-
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
-    def _scan_join_timeout_ms(self):
-        """How long to allow the scan worker to finish the step it is on.
-
-        abort() only takes effect between delay points, and a point is a stage
-        move plus (idle_shots + n_average) exposures — far more than the live
-        feed's single-cycle estimate covers, so it gets its own figure derived
-        from the settings the running scan was started with.
-        """
-        c = self.scan_cfg
-        shots = max(1, int(c.idle_shots) + int(c.n_average))
-        exposure = float(getattr(self.spec, "integration_ms", 10.0))
-        return max(5000.0, 2.0 * shots * exposure
-                   + 2000.0 * float(c.wait_after_move_s) + 5000.0)
-
-    # ── Settings persistence ─────────────────────────────────────────────────
-    # One table, read in both directions: (key, getter, setter). Adding a
-    # setting is one line here and nothing else — the save, the autosave diff
-    # and the restore all walk this list.
-    #
-    # A setter of None means "restored somewhere else, for a reason given at
-    # that site": the theme has to exist before any widget does, and the
-    # geometry has to be applied in the same breath as the decision to show
-    # maximized. Both are still SAVED from here, so this stays the one place
-    # that knows the full set.
-    #
-    # ORDER IS LOAD-BEARING on restore, twice over:
-    #   • the auto-scale checkboxes come before the limit spinboxes, because
-    #     _on_autoscale_trace(False) pins those four boxes to whatever is on
-    #     screen and would overwrite the values being restored;
-    #   • the layout mode comes before the split fraction, so the axes are laid
-    #     out once, in the mode they are going to stay in.
-    #
-    # Getters read the CANVAS for the auto-scale flags and the WIDGETS for the
-    # manual limits. That split is not arbitrary: _apply_zoom and reset_axes
-    # mutate canvas.autoscale_* directly, so the canvas is the only thing that
-    # always knows; while the spinboxes are the memory of the last bounds the
-    # operator dialled in by hand, which is what should come back — not a
-    # snapshot of an auto-scaled view that happened to be live at the time.
-    def _setting_specs(self):
-        c = self.canvas
-        g = self.dlg_graphics
-        d = self.dlg_settings
-        return [
-            ("theme",   lambda: self._theme,    None),
-            ("window",  self._window_geometry,  None),
-
-            ("layout_mode", lambda: c.layout_mode, self.appearance._set_layout),
-            ("spec_frac",   lambda: float(c.spec_fraction()),
-                            lambda v: g.sld_prop.setValue(int(round(float(v) * 100)))),
-
-            # NO axis state here — not the auto-scale flags, not the manual
-            # limits, not the autocorrelation's view. Where the axes are
-            # pointing is a property of the session, not a preference: a
-            # rubber-band zoom and a hand-typed range land in exactly the same
-            # place (auto-scale off, limits pinned), so persisting either meant
-            # a zoom taken to read one feature survived the restart and the
-            # program came back still zoomed into it, on data that had gone.
-            # Every launch starts on the normal view and fits to what is there.
-            ("log_scale",  lambda: g.log_scale,
-                           lambda v: g.chk_log.setChecked(as_bool(v))),
-            # setCurrentText is a silent no-op on a non-editable combo for a name
-            # that is not in the list, so a colormap dropped from
-            # TRACE_COLORMAPS needs no guard of its own.
-            ("cmap",          lambda: c.cmap_name, g.cmb_cmap.setCurrentText),
-            ("cmap_reversed", lambda: c.cmap_reversed,
-                              lambda v: g.chk_cmap_rev.setChecked(as_bool(v))),
-            # Percent, as typed — the canvas keeps the fraction.
-            ("trace_threshold_pct", g.spin_thresh.value,
-                                    lambda v: g.spin_thresh.setValue(float(v))),
-            ("line_width",    lambda: float(c.linewidth),
-                              lambda v: g.spin_lw.setValue(float(v))),
-            ("export_format", lambda: self._export_fmt, self._set_export_fmt),
-            # The name as TYPED, not the composed file name: the date prefix is
-            # the checkbox's doing and is re-made from today's date on every
-            # save, so storing it would bring back the day this was written.
-            ("export_name", self.dlg_export.edit_name.text,
-                            lambda v: self.dlg_export.edit_name.setText(str(v))),
-            ("export_date_prefix", lambda: self.dlg_export.date_stamped,
-                                   lambda v: self.dlg_export.chk_date.setChecked(
-                                       as_bool(v))),
-
-            ("avg_per_point",      lambda: d.n_average,
-                                   lambda v: d.spin_avg.setValue(int(v))),
-            ("idle_shots",         lambda: d.idle_shots,
-                                   lambda v: d.spin_idle.setValue(int(v))),
-            ("wait_after_move_ms", lambda: d.settle_ms,
-                                   lambda v: d.spin_wait.setValue(int(v))),
-            ("saturation_pct",     lambda: d.sat_percent,
-                                   lambda v: d.spin_sat.setValue(float(v))),
-            ("abort_on_saturation",  lambda: d.abort_on_saturation,
-                                     lambda v: d.chk_abort_sat.setChecked(as_bool(v))),
-            ("abort_on_stage_fault", lambda: d.abort_on_stage_fault,
-                                     lambda v: d.chk_abort_stage_fault.setChecked(as_bool(v))),
-
-            ("scan_start_fs",   self.spin_start.value,
-                                lambda v: self.spin_start.setValue(float(v))),
-            ("scan_stop_fs",    self.spin_stop.value,
-                                lambda v: self.spin_stop.setValue(float(v))),
-            ("scan_step_fs",    self.spin_step_fs.value,
-                                lambda v: self.spin_step_fs.setValue(float(v))),
-            ("scan_delay_reference", lambda: d.take_delay_reference,
-                                lambda v: self.dlg_settings.chk_ref.setChecked(
-                                    as_bool(v))),
-            ("align_step_fs",   lambda: self.dlg_align.step_fs,
-                                lambda v: self.dlg_align.spin_align_step.setValue(float(v))),
-        ]
-
-    def _window_geometry(self):
-        """Position and size for the next launch.
-
-        normalGeometry when maximized, not geometry: a maximized window reports
-        the whole screen, and saving that would make the next un-maximize
-        restore to a 'normal' size the operator never chose.
-        """
-        r = self.normalGeometry() if self.isMaximized() else self.geometry()
-        return {"x": r.x(), "y": r.y(), "w": r.width(), "h": r.height(),
-                "maximized": self.isMaximized()}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def show_restored(self):
         """Show the window where the last session left it, maximized by default.
@@ -2157,75 +1289,16 @@ class FrogWindow(QMainWindow):
         else:
             self.show()
 
-    def _restore_settings(self):
-        """Apply the saved settings to widgets that already exist.
 
-        Every key is applied on its own and every failure is swallowed on its
-        own: a file half-written by an older build, a hand-edit with a typo in
-        it, or a colormap that no longer exists must cost the operator that ONE
-        setting and never the rest of them.
 
-        Deliberately NOT blockSignals. The dialog's signal wiring IS the only
-        path from a widget to the canvas — blocking it would restore the
-        dialog's appearance while leaving the canvas on defaults — and the
-        handlers carry side effects nothing else does: _on_autoscale_* enable
-        and disable the boxes they own, _on_prop repaints its percent label.
-        Restoring through the same route a click takes is also the version that
-        cannot drift from it. push_to_canvas() then covers the values that
-        happened to equal a widget's default and so emitted nothing.
-        """
-        for key, _get, setter in self._setting_specs():
-            if setter is None or key not in self._settings:
-                continue
-            try:
-                setter(self._settings[key])
-            except Exception:
-                continue          # one bad key costs one setting
-        try:
-            self.dlg_graphics.push_to_canvas()
-        except Exception:
-            pass
-        self._settings_saved = self._settings_snapshot()
 
-    def _settings_snapshot(self):
-        """Everything worth saving, as JSON-native values."""
-        data = {"version": SETTINGS_VERSION}
-        for key, getter, _set in self._setting_specs():
-            try:
-                data[key] = getter()
-            except Exception:
-                # Carry the last good value forward rather than dropping the
-                # key: a getter that throws should not also erase what the
-                # operator had.
-                if key in self._settings_saved:
-                    data[key] = self._settings_saved[key]
-        return data
-
-    def _save_settings(self, data=None):
-        if data is None:
-            data = self._settings_snapshot()
-        if save_settings(data):
-            self._settings_saved = data
-
-    def _autosave_settings(self):
-        """Periodic write, but only when something actually changed.
-
-        Polled off the table rather than wired to thirty valueChanged signals,
-        for two reasons: adding a setting stays one line, and a slider drag
-        emits fifty changes a second, not one of which is worth a disk write.
-        Comparing a ~30-entry dict every ten seconds is free next to the 60 ms
-        render tick.
-        """
-        snap = self._settings_snapshot()
-        if snap != self._settings_saved:
-            self._save_settings(snap)
 
     def closeEvent(self, event):
         # First, before anything else: everything below this waits on threads
         # that may not stop and calls into vendor code that may not return, and
         # the settings must not be the casualty of a device that will not let go.
         self._settings_timer.stop()
-        self._save_settings()
+        self.settings_ctl._save_settings()
         self._display_timer.stop()
         if self._perf_timer is not None:
             self._perf_timer.stop()   # report() walks the widget tree we tear down
@@ -2239,7 +1312,7 @@ class FrogWindow(QMainWindow):
             _ORPHANED_THREADS.append(self._feed)
         if self._worker is not None and self._worker.isRunning():
             self._worker.abort()
-            if not self._worker.wait(int(self._scan_join_timeout_ms())):
+            if not self._worker.wait(int(self.scanning.join_timeout_ms())):
                 _ORPHANED_THREADS.append(self._worker)
                 released = False
         # The alignment sweep has no abort — it is four points long and its
@@ -2247,7 +1320,7 @@ class FrogWindow(QMainWindow):
         # cut short. Waited out on the same per-point budget as a scan, with
         # room for the four moves plus the return.
         if self._align_worker is not None and self._align_worker.isRunning():
-            if not self._align_worker.wait(int(5 * self._scan_join_timeout_ms())):
+            if not self._align_worker.wait(int(5 * self.scanning.join_timeout_ms())):
                 _ORPHANED_THREADS.append(self._align_worker)
                 released = False
         # A half-written export would be a corrupt file, and the worker holds a
