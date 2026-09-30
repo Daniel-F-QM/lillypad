@@ -149,7 +149,7 @@ class GraphicsSettingsDialog(QDialog):
         cm_row.addWidget(QLabel("Colormap"))
         self.cmb_cmap = ComboBox()
         self.cmb_cmap.addItems(TRACE_COLORMAPS)
-        self.cmb_cmap.setCurrentText(canvas._cmap_name)
+        self.cmb_cmap.setCurrentText(canvas.cmap_name)
         self.cmb_cmap.currentTextChanged.connect(canvas.set_cmap)
         cm_row.addWidget(self.cmb_cmap, 1)
         lay.addLayout(cm_row)
@@ -180,7 +180,7 @@ class GraphicsSettingsDialog(QDialog):
         lw_row.addWidget(QLabel("Width"))
         self.spin_lw = DoubleSpinBox()
         self.spin_lw.setRange(0.3, 6.0); self.spin_lw.setDecimals(1)
-        self.spin_lw.setSingleStep(0.1); self.spin_lw.setValue(canvas._lw)
+        self.spin_lw.setSingleStep(0.1); self.spin_lw.setValue(canvas.linewidth)
         self.spin_lw.setSuffix(" px")
         self.spin_lw.valueChanged.connect(canvas.set_linewidth)
         lw_row.addWidget(self.spin_lw); lw_row.addStretch()
@@ -267,12 +267,12 @@ class GraphicsSettingsDialog(QDialog):
         self.spin_ymax.setEnabled(not on)
 
     def _on_autoscale_x(self, on):
-        self.canvas.autoscale_x = on
+        self.canvas.set_autoscale_x(on)
         self.spin_xmin.setEnabled(not on)
         self.spin_xmax.setEnabled(not on)
 
     def _on_autoscale_trace(self, on):
-        self.canvas.autoscale_trace = on
+        self.canvas.set_autoscale_trace(on)
         for sb in (self.spin_tmin, self.spin_tmax,
                    self.spin_twmin, self.spin_twmax):
             sb.setEnabled(not on)
