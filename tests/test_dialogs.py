@@ -83,12 +83,18 @@ class TestConstructionOrder:
     def test_the_graphics_dialog_guards_are_still_there(self):
         """_build_ui calls methods that touch dlg_graphics before it exists, so
         they test for it. Turning these into a plain attribute access
-        AttributeErrors at startup."""
-        import inspect
+        AttributeErrors at startup.
 
-        import frog_gui_fast
-        src = inspect.getsource(frog_gui_fast)
-        n = len(re.findall(r"hasattr\(self, ['\"]dlg_graphics['\"]\)", src))
+        Counted across the window AND the controllers, because that is where the
+        guarded methods now live — a hasattr guard that got tidied away on the
+        way out of the monolith would fail here rather than at someone's
+        startup."""
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parents[1]
+        paths = ([root / "frog_gui_fast.py"]
+                 + sorted((root / "lillypad" / "gui" / "controllers").glob("*.py")))
+        n = sum(len(re.findall(r"hasattr\(self(?:\.win)?, ['\"]dlg_graphics['\"]\)",
+                               p.read_text(encoding="utf-8"))) for p in paths)
         assert n == 3, f"expected 3 init-order guards, found {n}"
 
     def test_the_connect_dialogs_share_one_base(self):

@@ -163,7 +163,7 @@ class TestRawViewDarkCorrection:
         frames = (np.full(64, 500.0), np.full(64, 900.0))
         darks = (np.full(64, 200.0), np.full(64, 800.0))
         self._arm(win, darks)
-        win._store_align_column(0, frames)
+        win.alignment._store_align_column(0, frames)
         stored = np.asarray(win._align_trace[:, 0], float)
         # blue half: 500-200 = 300; red half: 900-800 = 100
         assert np.allclose(stored[:32], 300.0)
@@ -172,7 +172,7 @@ class TestRawViewDarkCorrection:
     def test_without_a_dark_the_frames_are_stored_as_measured(self, win):
         frames = (np.full(64, 500.0), np.full(64, 900.0))
         self._arm(win, None)
-        win._store_align_column(0, frames)
+        win.alignment._store_align_column(0, frames)
         stored = np.asarray(win._align_trace[:, 0], float)
         assert np.allclose(stored[:32], 500.0)
         assert np.allclose(stored[32:], 900.0)
@@ -181,7 +181,7 @@ class TestRawViewDarkCorrection:
         """Better raw than wrong — the same rule the display correction uses."""
         frames = (np.full(64, 500.0), np.full(64, 900.0))
         self._arm(win, (np.full(8, 200.0), np.full(8, 800.0)))
-        win._store_align_column(0, frames)
+        win.alignment._store_align_column(0, frames)
         stored = np.asarray(win._align_trace[:, 0], float)
         assert np.allclose(stored[:32], 500.0)
 
@@ -189,7 +189,7 @@ class TestRawViewDarkCorrection:
         """The other half of what RAW is: no stitch factor, no calibration, two
         independent scales and a hard cut."""
         self._arm(win, (np.zeros(64), np.zeros(64)))
-        win._store_align_column(0, (np.full(64, 400.0), np.full(64, 50.0)))
-        view = win._align_trace_view()
+        win.alignment._store_align_column(0, (np.full(64, 400.0), np.full(64, 50.0)))
+        view = win.alignment._align_trace_view()
         assert np.allclose(view[:32, 0], 1.0)
         assert np.allclose(view[32:, 0], 1.0)

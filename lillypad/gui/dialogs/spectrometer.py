@@ -92,7 +92,7 @@ class SpectrometerDialog(ConnectDialog):
         self.btn_fit.setToolTip("Fit the stitch factor from one frame — needs "
                                 "light across the overlap region")
         self.btn_fit.clicked.connect(
-            lambda: self._do(self.main._fit_stitch_factor))
+            lambda: self._do(self.main.devices.fit_stitch_factor))
         self.btn_manual = QPushButton("Manual…")
         self.btn_manual.setObjectName("compact")
         self.btn_manual.clicked.connect(self._manual_stitch)
@@ -162,7 +162,7 @@ class SpectrometerDialog(ConnectDialog):
         tagged-id list, so one call covers the bench.
         """
         try:
-            self._devices = list(self.main._list_spectrometers())
+            self._devices = list(self.main.devices.list_spectrometers())
         except Exception as e:
             self._devices = []
             return False, f"Scan failed: {e}"
@@ -175,7 +175,7 @@ class SpectrometerDialog(ConnectDialog):
         # an unplugged cable look identical from here.
         msg = ("No spectrometers found. Check the USB cables and the vendor "
                "drivers, then press Rescan.")
-        notes = self.main._spectrometer_scan_notes()
+        notes = self.main.devices.scan_notes()
         if notes:
             msg += "\n\n" + "\n".join(notes)
         return False, msg
@@ -187,25 +187,25 @@ class SpectrometerDialog(ConnectDialog):
         if ident == self.state.multi["serials"][slot]:
             return                       # re-picked what is already there
         if ident is None:
-            self._do(lambda: self.main._clear_slot(slot))
+            self._do(lambda: self.main.devices.clear_slot(slot))
         else:
-            self._do(lambda: self.main._set_slot(slot, ident, label))
+            self._do(lambda: self.main.devices.set_slot(slot, ident, label))
 
     def _on_cal_picked(self, slot):
         path = self.cmb_cal[slot].currentData()
-        self.main._select_slot_calibration(slot, path)
+        self.main.devices.select_slot_calibration(slot, path)
         self.refresh()
 
     def _disconnect(self):
-        self._do(self.main._disconnect_spectrometer)
+        self._do(self.main.devices.disconnect_spectrometer)
 
     # ── Stitching handlers ───────────────────────────────────────────────────
     def _manual_stitch(self):
-        self.main._set_stitch_factor()
+        self.main.devices.set_stitch_factor()
         self.refresh()
 
     def _set_band(self):
-        self.main._set_overlap_band()
+        self.main.devices.set_overlap_band()
         self.refresh()
 
     # ── Device-wide settings ─────────────────────────────────────────────────
@@ -226,7 +226,7 @@ class SpectrometerDialog(ConnectDialog):
                                          f"number of counts (got {text!r})."))
                 return
             self.state.scan_cfg.saturation_counts = value
-        self.main._reset_saturation()
+        self.main.feed.reset_saturation()
         self._do(lambda: (True, "Full scale: " + (
             f"{self.state.scan_cfg.saturation_counts:.0f} counts (override)."
             if self.state.scan_cfg.saturation_counts else "auto (from device).")))
@@ -238,9 +238,9 @@ class SpectrometerDialog(ConnectDialog):
         # A device opened through the other backend cannot survive the switch
         # (selecting a backend shuts the previous backend's API down), so
         # release it now rather than severing it mid-use on the next connect.
-        live = self.main._live_seabreeze_backend()
+        live = self.main.devices.live_seabreeze_backend()
         if live is not None and live != backend:
-            ok, err = self.main._disconnect_spectrometer()
+            ok, err = self.main.devices.disconnect_spectrometer()
             if not ok:
                 # Refused (scan running / feed busy) — keep the old choice.
                 self.cmb_backend.setCurrentIndex(
@@ -310,7 +310,7 @@ class SpectrometerDialog(ConnectDialog):
             cmb.clear()
             cmb.addItem("No calibration", None)
             current = 0
-            for i, f in enumerate(self.main._calibration_files(), start=1):
+            for i, f in enumerate(self.main.devices.calibration_files(), start=1):
                 cmb.addItem(f.stem, f)
                 if cal is not None and f.stem == cal.stem:
                     current = i

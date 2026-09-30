@@ -53,87 +53,53 @@ and shared with frog_gui.py via hardware.py / scan.py.
 import gc
 import sys
 import math
-import shutil
 import numpy as np
-from contextlib import contextmanager
-from pathlib import Path
 
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QGroupBox, QLabel, QCheckBox, QPushButton,
-    QProgressBar, QScrollArea, QSizePolicy, QStatusBar, QFileDialog,
-    QToolBar, QMenu,
-    QMessageBox, QInputDialog, QAbstractSpinBox
-)
-from PySide6.QtCore import (Qt, QTimer, Signal, QSize, QRect,
-                            QSignalBlocker)
-from PySide6.QtGui import QFont, QIcon, QAction, QActionGroup
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget,
+                               QVBoxLayout, QHBoxLayout, QGridLayout,
+                               QGroupBox, QLabel, QCheckBox, QPushButton,
+                               QProgressBar, QScrollArea, QSizePolicy,
+                               QStatusBar, QFileDialog, QToolBar, QMessageBox)
+from PySide6.QtCore import Qt, QTimer, Signal, QSize, QRect
+from PySide6.QtGui import QFont, QIcon
 
-from lillypad.paths import CALIBRATION_DIR, seed_calibration_dir
+from lillypad.paths import seed_calibration_dir
 from lillypad.settings import (SETTINGS_VERSION, as_bool, load_settings,
                                save_settings)
 # The design layer. No colour, font size or icon path is defined in this file any
 # more — see lillypad/design/. PALETTE is mutated in place by install_theme, so
 # importing the name here follows a runtime theme switch.
-from lillypad.design.geometry import (HDR_BTN, HDR_GAP, HDR_GROUP_GAP, HDR_ICON,
-                                      HDR_PAD, HDR_TITLE_GAP)
-from lillypad.design.icons import (ALIGN_ICON, HIDE_ICON,
-                                   HORIZ_ICON,
-                                   LOCKED_ICON, MERGE_ICON, MOON_ICON,
-                                   PICTURE_ICON, REFRESH_ICON, RESCALE_ICON,
-                                   SHOW_ICON, SPLIT_ICON, STITCH_ICON, SUN_ICON,
-                                   SYMMETRY_ICON, UNLOCKED_ICON, VERT_ICON,
-                                   app_icon)
-from lillypad.design.icons_runtime import glyph_icon as _glyph_icon
+from lillypad.design.geometry import HDR_BTN, HDR_ICON
+from lillypad.design.icons import MOON_ICON, SUN_ICON, SYMMETRY_ICON, app_icon
 from lillypad.design.theme import install_theme, startup_theme
 # The plotting canvas. Importing it is also what selects matplotlib's QtAgg
 # backend and installs the rcParams, so nothing in this file imports matplotlib
 # at all any more — see lillypad/gui/canvas/figure.py.
 from lillypad.gui.canvas import FrogCanvas
+from lillypad.gui.controllers import (AlignmentController, AppearanceController,
+                                      DeviceController, LiveFeedController)
 from lillypad.gui.dialogs.acquisition import AcquisitionSettingsDialog
 from lillypad.gui.dialogs.alignment import AlignmentDialog
 from lillypad.gui.dialogs.avantes import AvantesSettingsDialog
-from lillypad.gui.dialogs.base import DevicePickerDialog
 from lillypad.gui.dialogs.export import EXPORT_FORMATS, ExportDialog
 from lillypad.gui.dialogs.graphics import GraphicsSettingsDialog
 from lillypad.gui.dialogs.simulation import SimulationDialog
 from lillypad.gui.dialogs.spectrometer import SpectrometerDialog
 from lillypad.gui.dialogs.stage import StageDialog
-from lillypad.gui.perf import PERF, install_probe, perf_tick
+from lillypad.gui.perf import PERF, install_probe
 from lillypad.gui.state import InstrumentState
-from lillypad.gui.widgets import (SAT_WARN_FRACTION, DoubleSpinBox,
-                                  NoDeviceOverlay, StatusLamp, _hline)
+from lillypad.gui.widgets import (DoubleSpinBox, NoDeviceOverlay, StatusLamp,
+                                  _hline)
 from lillypad.gui.text import FEED_BUSY_MSG, RIGHT_CLICK_HINT
-from lillypad.gui.workers import (MAX_UI_EXPOSURE_MS,
-                                  _ORPHANED_THREADS, AlignmentWorker,
-                                  ExportWorker, LiveFeedWorker, _exposure_bounds,
-                                  _exposure_ms)
-from lillypad.design.tokens import MEMBER_COLORS, PALETTE
-from hardware import (SimulatedStage, SimulatedSpectrometer,
-                      KinesisStage, ZaberStage, PiezoJenaStage,
-                      SeabreezeSpectrometer, AvantesSpectrometer,
-                      StitchedSpectrometer,
-                      list_kinesis_stages, list_spectrometers,
-                      list_avantes_spectrometers, list_seabreeze_spectrometers,
-                      open_spectrometer,
-                      load_calibration_file,
-                      SIM_SPECTROMETERS, sim_spectrometer_pair)
+from lillypad.gui.workers import (MAX_UI_EXPOSURE_MS, _ORPHANED_THREADS,
+                                  ExportWorker, LiveFeedWorker)
 from scan import (FrogScanWorker, fwhm, autocorrelation,
                   position_to_delay_fs, delay_to_position_um,
-                  _um_to_stage, _stage_to_um)
+                  um_to_stage, stage_to_um)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Simulated members offered alongside real devices in the multi-spectrometer
-# slots, so the mode can be exercised without two spectrometers on the bench.
-# These are sentinels, not device ids — _open_slot_device matches them BEFORE
-# it hands anything to hardware.open_spectrometer, so they deliberately do not
-# carry a "vendor:serial" tag. Each covers one overlapping half of the
-# simulated signal band; see _make_sim_member for why halves and not two
-# full-band copies.
-SIM_SLOT_DEVICES = (("__sim_blue__", "Simulated — blue half"),
-                    ("__sim_red__",  "Simulated — red half"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -257,6 +223,29 @@ class FrogWindow(QMainWindow):
         self._pending_rescale = False
         self._export_fmt   = "dwc"
 
+        # ── The controllers ───────────────────────────────────────────────
+        # One per concern, each holding a reference to this window. They are a
+        # grouping of BEHAVIOUR, not an encapsulation boundary: the widgets stay
+        # on the window and the instrument stays in InstrumentState, so a
+        # controller reads `self.win.btn_feed` and `self.win.spec` exactly where
+        # the flat method read `self.btn_feed` and `self.spec`.
+        #
+        # That is deliberate. This was 4,000 lines relocated out of one class,
+        # and giving each controller private state would have meant redesigning
+        # every coupling at the same time as moving it. The couplings here are
+        # not accidental — a device swap has to re-arm the saturation lamp,
+        # refit the spectrum, reseed the exposure boxes and repaint eight
+        # buttons, and those genuinely are four concerns having to agree. They
+        # are now visible as `self.win.<other>.<call>`, which is also the list
+        # of things to think about before changing one.
+        #
+        # Constructed BEFORE _build_ui, whose lambdas connect straight to
+        # controller methods. None of them touches a widget on construction.
+        self.devices    = DeviceController(self)
+        self.appearance = AppearanceController(self)
+        self.feed       = LiveFeedController(self)
+        self.alignment  = AlignmentController(self)
+
         self.dlg_settings = AcquisitionSettingsDialog(self)
         self.dlg_align    = AlignmentDialog(self)
         # Built here with the other pop-ups, but note it reaches back into the
@@ -288,7 +277,7 @@ class FrogWindow(QMainWindow):
         self.lbl_backlash_fs = self.dlg_stage.lbl_backlash_fs
         # The threshold is applied live, not just at scan start, so the lamp
         # reflects the setting you are in the middle of tuning.
-        self.dlg_settings.spin_sat.valueChanged.connect(self._on_sat_fraction)
+        self.dlg_settings.spin_sat.valueChanged.connect(self.feed._on_sat_fraction)
 
         self._build_ui()
 
@@ -296,13 +285,13 @@ class FrogWindow(QMainWindow):
         # device to make them to. Both happen on connect instead —
         # _apply_spectrometer clamps the exposure into the new device's range,
         # and _apply_stage parks or adopts the position.
-        self.stage_warning.connect(self._on_stage_warning)
-        self._sync_connection_ui()
+        self.stage_warning.connect(self.devices._on_stage_warning)
+        self.appearance._sync_connection_ui()
 
         # FIX 2/3 — acquisition runs on a worker thread, paced to integration.
         self._feed = LiveFeedWorker(lambda: self.spec)
-        self._feed.spectrum_ready.connect(self._on_spectrum)
-        self._feed.acquire_failed.connect(self._on_feed_error)
+        self._feed.spectrum_ready.connect(self.feed._on_spectrum)
+        self._feed.acquire_failed.connect(self.feed._on_feed_error)
         self._feed.start()
         if self.btn_feed.isChecked():
             self._feed.resume()
@@ -323,7 +312,7 @@ class FrogWindow(QMainWindow):
         self._scan_members_raw = None  # newest column's raw member frames
         self._display_timer = QTimer(self)
         self._display_timer.setInterval(60)      # ~16 fps display cadence
-        self._display_timer.timeout.connect(self._display_tick)
+        self._display_timer.timeout.connect(self.feed._display_tick)
         self._display_timer.start()
 
         # Opt-in instrumentation (LILLYPAD_PERF=1). Reports to stderr every 10 s.
@@ -477,443 +466,27 @@ class FrogWindow(QMainWindow):
     def _scan_running(self):
         return self._worker is not None and self._worker.isRunning()
 
-    @contextmanager
-    def _device_lock(self):
-        """Take the stage/spectrometer for a device call made ON the GUI thread.
 
-        The live feed drives the same two devices from its own thread, so any
-        direct `self.stage.*` / `self.spec.*` call from a slot has to park the
-        feed first — otherwise two threads are inside one vendor driver at once.
-        (Harmless for the simulators; a real Kinesis/Zaber/seabreeze can
-        interleave transactions and return garbage.)
 
-        Yields True when the feed actually parked. On False the caller MUST NOT
-        touch the device. The feed is restored on the way out either way, unless
-        a scan now owns the hardware.
-        """
-        ok = self._feed.pause()
-        try:
-            yield ok
-        finally:
-            if self.btn_feed.isChecked() and not self._scan_running():
-                self._feed.resume()
 
-    # ── Hardware ─────────────────────────────────────────────────────────────
-    def _make_sim_spectrometer(self):
-        """A sim spectrometer that derives its delay from the LIVE stage (so it
-        works with a real stage too — the Stage.py test setup)."""
-        return SimulatedSpectrometer(
-            self.stage, gate=self.sim_gate, pulse=self.sim_pulse,
-            position_to_delay=lambda pos_mm: position_to_delay_fs(
-                _stage_to_um(pos_mm), self.scan_cfg.zero_pos_um, self.scan_cfg.pass_factor))
 
-    def _make_sim_device(self, half):
-        """One member of the simulated pair, modelled on a REAL spectrometer.
 
-        Used for a beam that names a pair in PULSE_SHAPES (see "bird", whose
-        SHG covers 500–1400 nm and needs the Si + InGaAs bench to be measured
-        at all). Unlike the two halves below, these devices have their own
-        pixel grids, detector responses, darks and noise, so the two curves
-        differ for the reasons two real spectrometers differ — and the fit that
-        matches them has something real to absorb.
 
-        The matching calibration file is loaded when it is on disk: it is the
-        reciprocal of the device's simulated response, exactly as the shipped
-        files are for the hardware they were measured on. Without it the pair
-        still connects, and Auto-stitch then reports the large residual an
-        uncalibrated Si/InGaAs overlap really does have.
-        """
-        model = SIM_SPECTROMETERS[
-            sim_spectrometer_pair(self.sim_pulse, self.sim_gate)[half]]
-        sim = SimulatedSpectrometer(
-            self.stage, gate=self.sim_gate, pulse=self.sim_pulse,
-            position_to_delay=lambda pos_mm: position_to_delay_fs(
-                _stage_to_um(pos_mm), self.scan_cfg.zero_pos_um,
-                self.scan_cfg.pass_factor),
-            **model["device"])
-        sim.name = model["name"]
-        cal = CALIBRATION_DIR / f"{model['calibration']}.txt"
-        if cal.is_file():
-            try:
-                sim.set_calibration(cal)
-            except Exception:
-                pass        # raw counts is a fine fallback; nothing is wrong yet
-        return sim
 
-    def _make_sim_member(self, half):
-        """A simulated spectrometer covering one half of the simulated signal
-        band, for use as a stitched-pair member.
 
-        Halves, not two full-band copies: identical grids would make the whole
-        spectrum "overlap", so the stitch geometry — a blue-only region, a
-        shared middle, a red-only region — would never be exercised. The 30%
-        shared middle is what Auto-stitch fits over. The band itself is only
-        known to a constructed simulator (it is sized from the signal), hence
-        the throwaway probe; construction touches no hardware and costs a
-        handful of FFTs.
 
-        A beam that names its own pair of instruments gets those instead.
-        """
-        if sim_spectrometer_pair(self.sim_pulse, self.sim_gate) is not None:
-            return self._make_sim_device(half)
-        probe = self._make_sim_spectrometer()
-        wl = np.asarray(probe.wavelengths, float)
-        lo, hi = float(wl[0]), float(wl[-1])
-        span = hi - lo
-        start, end = ((lo, lo + 0.65 * span) if half == 0
-                      else (lo + 0.35 * span, hi))
-        sim = SimulatedSpectrometer(
-            self.stage, gate=self.sim_gate, pulse=self.sim_pulse,
-            wl_start=start, wl_end=end, n_pixels=512,
-            # DIFFERENT pedestals, and deliberately so: the halves used to
-            # default to background_counts=0, which is why every dark bug in
-            # the stitched path could only be found on the bench. Two unequal,
-            # exposure-scaled pedestals (see SimulatedSpectrometer._raw_column)
-            # are what a real pair looks like, and they make a mis-applied dark
-            # show up as a step at the seam.
-            background_counts=300.0 if half == 0 else 1200.0,
-            position_to_delay=lambda pos_mm: position_to_delay_fs(
-                _stage_to_um(pos_mm), self.scan_cfg.zero_pos_um,
-                self.scan_cfg.pass_factor))
-        # Distinct names: the two members share a class, so the saturation-lamp
-        # tooltips and the Auto-stitch message would otherwise name both
-        # identically and give no way to tell which is which.
-        sim.name = (f"simulated {'blue' if half == 0 else 'red'} half "
-                    f"[{start:.0f}–{end:.0f} nm]")
-        return sim
 
-    def _open_slot_device(self, ident):
-        """Open whatever a multi-spectrometer slot points at — a simulated
-        half, or a real device by its tagged id. The sentinels are matched
-        first: they carry no vendor tag, so open_spectrometer would reject
-        them."""
-        for half, (sim_ident, _label) in enumerate(SIM_SLOT_DEVICES):
-            if ident == sim_ident:
-                return self._make_sim_member(half)
-        return open_spectrometer(ident, self.seabreeze_backend)
 
-    def _attach_stage_warnings(self, stage):
-        """Route a stage's warnings into the status bar. Safe from any thread —
-        emit() is what crosses back to the GUI one."""
-        stage.warn_cb = self.stage_warning.emit
 
-    def _on_stage_warning(self, message):
-        self.status.showMessage(f"Stage: {message}", 5000)
 
-    def _apply_stage(self, new_stage):
-        """Swap in a new stage. Returns (ok, error) — on failure NOTHING has
-        changed and `new_stage` is still the caller's to dispose of.
 
-        `new_stage` may be None: that is the disconnect path, and it takes the
-        same lock and the same teardown as any other swap.
 
-        Refused outright while a scan is running: FrogScanWorker captured the
-        old stage at construction, so disconnecting it here would pull the
-        device out from under the thread currently driving it.
-        """
-        if self._scan_running():
-            return False, "A scan is running — stop it before changing hardware."
-        # Pause the feed (and wait for any in-flight acquire) before swapping,
-        # so the worker never reads a half-swapped device.
-        with self._device_lock() as ok:
-            if not ok:
-                return False, FEED_BUSY_MSG
-            old = getattr(self, "stage", None)
-            if old is not None and old is not new_stage:
-                try:
-                    old.disconnect()
-                except Exception:
-                    pass
-            self.stage = new_stage
-            if new_stage is not None:
-                self._attach_stage_warnings(new_stage)
-            # A simulated spectrometer reads the live stage, so re-point it.
-            # None is allowed: SimulatedSpectrometer.acquire falls back to zero
-            # delay, so the simulator keeps working with no stage attached.
-            if isinstance(self.spec, SimulatedSpectrometer):
-                self.spec.stage = self.stage
-            if isinstance(new_stage, SimulatedStage):
-                new_stage.move_to(_um_to_stage(self.scan_cfg.zero_pos_um))
-            elif new_stage is not None:
-                # Real stage: adopt its ACTUAL position as zero-delay so
-                # "Move to 0 fs" can never slam it into a travel limit.
-                # Except when the axis has no reference — that readback is an
-                # arbitrary number, and homing later would move the frame under
-                # it. Adopt it anyway so the travel maths has something sane to
-                # work with, but _start_scan refuses to run until it is homed.
-                self.scan_cfg.zero_pos_um = _stage_to_um(new_stage.get_position())
-            self._update_stage_unit_ranges()  # new travel + possibly new zero
-            self._refresh_positions()   # inside the lock — we still own the stage
-        self._sync_backlash_ui()        # the new stage brings its own default
-        self._refresh_scan_um()         # zero may have moved: fs→um previews
-        self._sync_connection_ui()      # panel swaps between controls/Connect
-        return True, ""
 
-    def _apply_spectrometer(self, new_spec):
-        """Swap in a new spectrometer, or None to disconnect. (ok, error);
-        see _apply_stage."""
-        if self._scan_running():
-            return False, "A scan is running — stop it before changing hardware."
-        with self._device_lock() as ok:
-            if not ok:
-                return False, FEED_BUSY_MSG
-            old = getattr(self, "spec", None)
-            if old is not None and old is not new_spec:
-                try:
-                    old.disconnect()
-                except Exception:
-                    pass
-            self.spec = new_spec
-            if not isinstance(new_spec, StitchedSpectrometer):
-                # Any single device replaces a stitched pair wholesale — the
-                # slot->member mapping is only meaningful while the pair lives.
-                self._multi_members = [None, None]
-            if new_spec is not None:
-                # Clamped to the INCOMING device's range: the box still carries
-                # the outgoing device's value, and 0.05 ms from an Avantes is a
-                # hard error on an Ocean unit with a 1 ms floor. _sync_multi_ui
-                # below reseeds the box from whatever the device ended up with.
-                lo, hi = _exposure_bounds(new_spec)
-                new_spec.set_integration_time(
-                    min(hi, max(lo, float(self.spin_integration.value()))))
-            # The old device's frames and dark are meaningless for the new one
-            # — and a different pixel count (certain with a stitched grid)
-            # would crash the dark subtraction outright.
-            self.background = None
-            self.background_members = None
-            self.background_exposures = None
-            self._dark_member_warned = False
-            if new_spec is None:
-                # Disconnecting: take the curve off the panel too, or the last
-                # frame would sit frozen under the "no spectrometer" message.
-                self.canvas.clear_spectrum()
-            else:
-                self.canvas.clear_members()  # a dead pair's curves can't linger
-            # And the reference with them, in both cases: it is a spectrum from
-            # the outgoing device, on that device's pixel grid, and comparing
-            # the incoming one against it would be meaningless where it was not
-            # simply misleading.
-            self.canvas.clear_reference()
-            # Same for both halves of alignment mode: a difference and a raw
-            # trace describe the device that measured them, right down to the
-            # pixel grid they sit on.
-            self._close_align_mode()
-            self._clear_align_trace()
-            self.chk_dark.setChecked(False); self.chk_dark.setEnabled(False)
-            self.last_spectrum = None
-            self._live_frame = None
-            self._sat_frame = None
-            self._sat_peak = -1.0
-            # New device, new full scale — a latched warning about the old one
-            # would be meaningless (and its threshold plain wrong).
-            self._reset_saturation()
-            # Re-centre spectrum when a new spectrometer comes online
-            self._pending_fit = True
-            self.canvas.set_autoscale_x(True)
-            if hasattr(self, 'dlg_graphics'):
-                self.dlg_graphics.chk_auto_x.setChecked(True)
-        # Outside the lock: pure widget state, no device I/O.
-        self._sync_multi_ui()
-        return True, ""
 
-    def _use_sim_stage(self):
-        ok, err = self._apply_stage(SimulatedStage(travel_mm=300.0))
-        if not ok:
-            return False, err
-        self.status.showMessage("Stage: simulated.", 4000)
-        return True, "Stage set to simulated."
 
-    def _disconnect_stage(self):
-        ok, err = self._apply_stage(None)
-        if not ok:
-            return False, err
-        self.status.showMessage("Stage disconnected.", 4000)
-        return True, "Stage disconnected."
 
-    def _connect_real_stage(self, conn=None):
-        """Connect a Kinesis stage. `conn` names one the caller already chose
-        (the Stage dialog's scan list); without it this enumerates and picks or
-        asks, which is what any other caller needs."""
-        if conn is None:
-            try:
-                devices = list_kinesis_stages()   # brief per-device model query
-            except Exception as e:
-                return False, f"Stage connect failed: {e}"
-            if not devices:
-                return False, "Stage connect failed: No Kinesis devices found."
-            if len(devices) > 1:
-                conn = DevicePickerDialog.pick(
-                    self.dlg_stage, devices, "Select Kinesis Stage",
-                    f"{len(devices)} Kinesis devices found — choose one:")
-                if conn is None:
-                    return False, "Cancelled — stage unchanged."
-            else:
-                conn = devices[0][1]
-        try:
-            # Identifies the stage and refuses anything it can't calibrate in mm.
-            stage = KinesisStage(serial=conn)
-        except Exception as e:
-            return False, f"Stage connect failed: {e}"
-        ok, err = self._apply_stage(stage)
-        if not ok:
-            self._drop(stage)      # never adopted — don't leak the connection
-            return False, err
-        self.status.showMessage(f"Stage: {stage.name} — zero at current position.", 5000)
-        travel = (f"Travel {stage.travel_mm:.0f} mm." if stage.travel_mm else
-                  "Travel unknown — no soft range limit, set one in the scan "
-                  "config if you need it.")
-        return True, (f"Stage connected: {stage.name}. Zero-delay set to current "
-                      f"position ({self.scan_cfg.zero_pos_um:.1f} um). {travel}")
 
-    def _connect_zaber_stage(self, port=None):
-        try:
-            stage = ZaberStage(port=port)     # blank port -> auto-scan
-        except Exception as e:
-            return False, f"Zaber connect failed: {e}"
-        ok, err = self._apply_stage(stage)
-        if not ok:
-            self._drop(stage)      # never adopted — release the serial port
-            return False, err
-        if stage.needs_homing:
-            self.status.showMessage(
-                f"Stage: {stage.name} — NOT HOMED, home it before scanning.", 0)
-            return True, (
-                f"Stage connected: {stage.name}, but the axis is NOT HOMED. Its "
-                f"position readback has no physical meaning until you press "
-                f"Home, and homing will move the coordinate frame — so home "
-                f"first, then set zero. Scans are blocked until then.")
-        self.status.showMessage(f"Stage: {stage.name} — zero at current position.", 5000)
-        backlash_um = _stage_to_um(stage.backlash_mm)
-        return True, (f"Stage connected: {stage.name}. Zero-delay set to current "
-                      f"position ({self.scan_cfg.zero_pos_um:.1f} um). "
-                      f"Backlash approach {backlash_um:.0f} um — Zaber does no "
-                      f"backlash correction of its own, and without this the "
-                      f"marked zero and a scan sweep sit in frames that differ "
-                      f"by the screw slack.")
 
-    def _connect_piezo_jena_stage(self, port=None):
-        try:
-            stage = PiezoJenaStage(port=port)     # blank port -> auto-scan
-        except Exception as e:
-            return False, f"Piezo Jena connect failed: {e}"
-        ok, err = self._apply_stage(stage)
-        if not ok:
-            self._drop(stage)      # never adopted — release the serial port
-            return False, err
-        self.status.showMessage(f"Stage: {stage.name} — zero at current position.", 5000)
-        return True, (f"Stage connected: {stage.name}. Zero-delay set to current "
-                      f"position ({self.scan_cfg.zero_pos_um:.1f} um).")
-
-    def _use_sim_spectrometer(self):
-        ok, err = self._apply_spectrometer(self._make_sim_spectrometer())
-        if not ok:
-            return False, err
-        # The full-band simulator is not reachable by id, so no slot can name
-        # it — empty them rather than leave them pointing at whatever was
-        # connected before.
-        self._multi["serials"] = [None, None]
-        self._multi["labels"]  = [None, None]
-        self.status.showMessage(f"Spectrometer: {self.spec.name}.", 4000)
-        return True, f"Simulated: {self.spec.pulse_label}."
-
-    def _use_sim_pair(self):
-        """Both slots on simulated halves, connected as a stitched pair.
-
-        The only way to exercise multi-spectrometer mode without two devices on
-        the bench — _open_slot_device matches the SIM_SLOT_DEVICES sentinels to
-        the half-band simulators, so this is the ordinary pair path with the
-        slots filled in for you.
-
-        The slot labels follow what the sentinels will actually open: the two
-        named instruments when the beam brings a pair of its own, the two
-        halves of its band otherwise.
-        """
-        models = sim_spectrometer_pair(self.sim_pulse, self.sim_gate)
-        for slot, (ident, label) in enumerate(SIM_SLOT_DEVICES):
-            self._multi["serials"][slot] = ident
-            self._multi["labels"][slot]  = (
-                label if models is None
-                else SIM_SPECTROMETERS[models[slot]]["name"])
-        return self._connect_multi_pair()
-
-    def _disconnect_spectrometer(self):
-        """Release whatever is connected and empty both slots. (ok, msg)."""
-        ok, err = self._apply_spectrometer(None)
-        if not ok:
-            return False, err
-        self._multi["serials"] = [None, None]
-        self._multi["labels"]  = [None, None]
-        self.status.showMessage("Spectrometer disconnected.", 4000)
-        return True, "Spectrometer disconnected."
-
-    def _live_seabreeze_backend(self):
-        """Backend name of the currently connected seabreeze device, or None
-        when no live device is a seabreeze one.
-
-        Every member is checked, not just spec1: StitchedSpectrometer assigns
-        spec1 by wavelength, so in a mixed-vendor pair the seabreeze device can
-        land in either slot. Missing it would skip the release step below and
-        let select_seabreeze_backend shut the API down under a LIVE device.
-        calibration_targets() is the existing "physical devices behind the
-        facade" accessor — [self] for a single device, both members for a pair.
-        """
-        if not self._have_spec():
-            return None
-        for spec in self.spec.calibration_targets():
-            if isinstance(spec, SeabreezeSpectrometer):
-                return getattr(spec, "backend", None)
-        return None
-
-    def _list_spectrometers(self):
-        """Enumerate every vendor's attached spectrometers as tagged ids.
-        Selecting a seabreeze backend tears the previous backend's API down,
-        which would sever a device still open through it — so any such device
-        is released first. Raises RuntimeError when that release is refused
-        (scan running / feed busy)."""
-        live = self._live_seabreeze_backend()
-        if live is not None and live != self.seabreeze_backend:
-            ok, err = self._apply_spectrometer(None)
-            if not ok:
-                raise RuntimeError(err)
-        return list_spectrometers(self.seabreeze_backend)
-
-    def _spectrometer_scan_notes(self):
-        """Why a vendor contributed nothing to the last enumeration.
-
-        list_spectrometers deliberately swallows a vendor whose SDK is missing,
-        so one absent driver cannot hide the other vendor's devices. That is
-        right for the list and wrong for the operator staring at an empty one,
-        so the same two calls are made again here purely for their errors —
-        this is what the old per-vendor connect buttons used to surface.
-        """
-        notes = []
-        try:
-            list_seabreeze_spectrometers(self.seabreeze_backend)
-        except Exception as e:
-            notes.append(f"seabreeze ({self.seabreeze_backend}): {e}")
-        try:
-            list_avantes_spectrometers()
-        except Exception as e:
-            notes.append(f"Avantes: {e}")
-        return notes
-
-    def _avantes_devices(self):
-        """Every live Avantes device — [], [one], or both members of a mixed
-        stitched pair. calibration_targets() is the existing accessor for
-        "the physical devices behind whatever facade is connected", so this
-        keeps working for any future composite."""
-        if not self._have_spec():
-            return []
-        return [s for s in self.spec.calibration_targets()
-                if isinstance(s, AvantesSpectrometer)]
-
-    @staticmethod
-    def _drop(device):
-        """Close a device we opened but did not end up adopting."""
-        try:
-            device.disconnect()
-        except Exception:
-            pass
 
     # ── UI ───────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -961,7 +534,7 @@ class FrogWindow(QMainWindow):
             "Save the last scan — pick the format and the file name")
         self.btn_export.clicked.connect(self.dlg_export.toggle)
         tb.addWidget(self.btn_export)
-        tb.addWidget(self._build_calibration_button())
+        tb.addWidget(self.devices._build_calibration_button())
         # Vendor-specific, so it is HIDDEN rather than disabled when there is
         # no Avantes attached — the toolbar already carries six buttons, and a
         # permanently greyed one is noise on a bench that has none. Visibility
@@ -989,7 +562,7 @@ class FrogWindow(QMainWindow):
         self.btn_theme.setFixedWidth(42)
         self.btn_theme.setToolTip("Switch to dark mode" if self._theme == "light"
                                   else "Switch to light mode")
-        self.btn_theme.clicked.connect(self._toggle_theme)
+        self.btn_theme.clicked.connect(self.appearance._toggle_theme)
         tb.addWidget(self.btn_theme)
         # Save the plots as a picture, between the two controls that decide what
         # those plots LOOK like — the theme and the layout. It belongs with them
@@ -999,14 +572,14 @@ class FrogWindow(QMainWindow):
         self.btn_picture = QPushButton()
         self.btn_picture.setIconSize(QSize(18, 18))
         self.btn_picture.setFixedWidth(42)
-        self._refresh_picture_icon()
-        self.btn_picture.clicked.connect(self._save_picture)
+        self.appearance._refresh_picture_icon()
+        self.btn_picture.clicked.connect(self.appearance._save_picture)
         tb.addWidget(self.btn_picture)
         # Plot layout toggle; icon and tooltip come from _refresh_layout_button.
         self.btn_layout = QPushButton()
         self.btn_layout.setIconSize(QSize(18, 18))
         self.btn_layout.setFixedWidth(42)
-        self.btn_layout.clicked.connect(self._toggle_layout)
+        self.btn_layout.clicked.connect(self.appearance._toggle_layout)
         tb.addWidget(self.btn_layout)
 
         central = QWidget()
@@ -1039,13 +612,13 @@ class FrogWindow(QMainWindow):
         self.btn_autofit = QPushButton(self.canvas)
         self.btn_autofit.setObjectName("overlay")
         self.btn_autofit.setIconSize(QSize(HDR_ICON, HDR_ICON))
-        self._refresh_autofit_icon()
+        self.appearance._refresh_autofit_icon()
         self.btn_autofit.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_autofit.setToolTip(
             "Auto-fit spectrum X and Y axes to current data.\n"
             + RIGHT_CLICK_HINT)
         self.btn_autofit.show()
-        self.btn_autofit.clicked.connect(self._autofit_spectrum)
+        self.btn_autofit.clicked.connect(self.feed._autofit_spectrum)
 
         # Continuous auto-scale, next to the one-shot fit it complements: that
         # button fits ONCE, this one says whether the panel goes on following
@@ -1060,9 +633,9 @@ class FrogWindow(QMainWindow):
         self.btn_autoscale.setCheckable(True)
         self.btn_autoscale.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_autoscale.setIconSize(QSize(HDR_ICON, HDR_ICON))
-        self._refresh_autoscale_icon()
+        self.appearance._refresh_autoscale_icon()
         self.btn_autoscale.show()
-        self.btn_autoscale.clicked.connect(self._on_autoscale_clicked)
+        self.btn_autoscale.clicked.connect(self.feed._on_autoscale_clicked)
 
         # Log/linear, at the top of the y axis it rescales — beside the padlock
         # that freezes the same axis, so the two controls that decide what the
@@ -1102,10 +675,10 @@ class FrogWindow(QMainWindow):
         self.btn_autostitch.setObjectName("overlay")
         self.btn_autostitch.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_autostitch.setIconSize(QSize(HDR_ICON, HDR_ICON))
-        self._refresh_autostitch_icon()
+        self.appearance._refresh_autostitch_icon()
         self.btn_autostitch.hide()
         self.btn_autostitch.clicked.connect(
-            lambda: self._menu_result(self._fit_stitch_factor))
+            lambda: self.devices._menu_result(self.devices.fit_stitch_factor))
 
         # Live-feed start/stop. In the spectrum header rather than the side
         # panel: it is the control most often reached for while watching that
@@ -1116,8 +689,8 @@ class FrogWindow(QMainWindow):
         self.btn_feed.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_feed.setIconSize(QSize(HDR_ICON, HDR_ICON))
         self.btn_feed.show()
-        self.btn_feed.toggled.connect(self._toggle_feed)
-        self._refresh_feed_button()
+        self.btn_feed.toggled.connect(self.feed._toggle_feed)
+        self.appearance._refresh_feed_button()
 
         # Freeze the spectrum as a grey reference, next to the feed whose newest
         # frame it captures. A generated glyph rather than a pair of PNGs, like
@@ -1127,20 +700,20 @@ class FrogWindow(QMainWindow):
         self.btn_freeze.setObjectName("overlay")
         self.btn_freeze.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_freeze.setIconSize(QSize(HDR_ICON, HDR_ICON))
-        self._refresh_freeze_icon()
+        self.appearance._refresh_freeze_icon()
         self.btn_freeze.setToolTip(
             "Freeze the spectrum as a grey reference under the live curve — "
             "make an adjustment, and you can see exactly what it changed.\n"
             "Press again to replace the reference with the current spectrum, "
             "or right-click to drop it.")
         self.btn_freeze.show()
-        self.btn_freeze.clicked.connect(self._freeze_reference)
+        self.btn_freeze.clicked.connect(self.feed._freeze_reference)
         # Dropping a reference has no button of its own: it is the rare half of
         # a pair whose common half (hide) is beside it already, and a third
         # header button for it would cost every session the room to say so.
         self.btn_freeze.setContextMenuPolicy(Qt.CustomContextMenu)
         self.btn_freeze.customContextMenuRequested.connect(
-            lambda _pos: self._clear_reference())
+            lambda _pos: self.feed._clear_reference())
 
         # …and the reference's own hide/show. Pair-only in the same sense as the
         # alignment sweep's re-run button: it exists exactly as long as there is
@@ -1154,7 +727,7 @@ class FrogWindow(QMainWindow):
         # and a checked frame around it would be a second readout of the same
         # bit — one that says "on" while the eye says "hide".
         self.btn_refshow.hide()
-        self.btn_refshow.clicked.connect(self._toggle_reference)
+        self.btn_refshow.clicked.connect(self.feed._toggle_reference)
 
         # Per-spectrometer view toggle. Only meaningful for a stitched pair, so
         # it stays hidden otherwise; its icon and tooltip are set by
@@ -1165,7 +738,7 @@ class FrogWindow(QMainWindow):
         self.btn_overlay.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_overlay.setIconSize(QSize(HDR_ICON, HDR_ICON))
         self.btn_overlay.hide()
-        self.btn_overlay.toggled.connect(self._on_overlay_toggled)
+        self.btn_overlay.toggled.connect(self.feed._on_overlay_toggled)
 
         # Alignment mode, spectrum side: opens the deviation panel under the
         # spectrum, steps to +/-x and +/-2x, and plots the two differences there.
@@ -1174,7 +747,7 @@ class FrogWindow(QMainWindow):
         self.btn_align_spec.setCheckable(True)
         self.btn_align_spec.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_align_spec.setIconSize(QSize(HDR_ICON, HDR_ICON))
-        self._refresh_align_button()
+        self.appearance._refresh_align_button()
         self.btn_align_spec.setToolTip(
             "Alignment mode — opens a deviation panel under the spectrum, then "
             "measures at −2x, −x, +x, +2x (Alignment → Alignment step) and "
@@ -1183,7 +756,7 @@ class FrogWindow(QMainWindow):
             "adjustment — the previous sweep stays as a shaded area to compare "
             "against.\nPress again to close the panel.")
         self.btn_align_spec.show()
-        self.btn_align_spec.toggled.connect(self._on_align_spec_toggled)
+        self.btn_align_spec.toggled.connect(self.alignment._on_align_spec_toggled)
 
         # Re-run the sweep without leaving the mode. Only meaningful while the
         # panel is open, so it lives and dies with it — and the comparison it
@@ -1193,13 +766,13 @@ class FrogWindow(QMainWindow):
         self.btn_align_refresh.setObjectName("overlay")
         self.btn_align_refresh.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_align_refresh.setIconSize(QSize(HDR_ICON, HDR_ICON))
-        self._refresh_align_refresh_icon()
+        self.appearance._refresh_align_refresh_icon()
         self.btn_align_refresh.setToolTip(
             "Re-run the alignment sweep. The sweep now on the panel is kept as "
             "a shaded area underneath, so you can see whether the last "
             "adjustment made the deviation better or worse.")
         self.btn_align_refresh.hide()
-        self.btn_align_refresh.clicked.connect(self._start_align_sweep)
+        self.btn_align_refresh.clicked.connect(self.alignment._start_align_sweep)
 
         # Alignment mode, trace side — the trace panel's own header.
         # Wider than the rest: it is the one button still carrying a word.
@@ -1208,7 +781,7 @@ class FrogWindow(QMainWindow):
         self.btn_align_trace.setCheckable(True)
         self.btn_align_trace.setFixedSize(40, HDR_BTN)
         self.btn_align_trace.hide()
-        self.btn_align_trace.toggled.connect(self._on_align_trace_toggled)
+        self.btn_align_trace.toggled.connect(self.alignment._on_align_trace_toggled)
 
         # Symmetry mode, trace panel. Always present — unlike RAW it does not
         # depend on the pair — but only enabled once a finished scan gives it an
@@ -1223,8 +796,8 @@ class FrogWindow(QMainWindow):
             self.btn_symmetry.setText("|")
         self.btn_symmetry.setFixedSize(HDR_BTN, HDR_BTN)
         self.btn_symmetry.show()
-        self.btn_symmetry.toggled.connect(self._on_symmetry_toggled)
-        self._refresh_symmetry_button()
+        self.btn_symmetry.toggled.connect(self.alignment._on_symmetry_toggled)
+        self.appearance._refresh_symmetry_button()
 
         # ── "No spectrometer connected" ──────────────────────────────────────
         # A Qt child of the canvas, not a matplotlib artist: the canvas blits,
@@ -1237,17 +810,17 @@ class FrogWindow(QMainWindow):
             self.dlg_spec.open_fresh)
         self.pnl_no_spec.hide()
 
-        self.canvas.axes_relaid.connect(self._position_panel_buttons)
-        self._position_panel_buttons()
+        self.canvas.axes_relaid.connect(self.appearance._position_panel_buttons)
+        self.appearance._position_panel_buttons()
 
         # The reference's toggle is an INDICATOR as much as a control, and the
         # canvas is what owns the state — a freeze from the button, a drop from
         # a device swap. One connection covers every way in, so the eye cannot
         # end up describing a reference that is not there.
-        self.canvas.reference_changed.connect(self._refresh_reference_button)
-        self._refresh_reference_button()
+        self.canvas.reference_changed.connect(self.appearance._refresh_reference_button)
+        self.appearance._refresh_reference_button()
 
-        self._refresh_layout_button()    # needs the canvas for the current mode
+        self.appearance._refresh_layout_button()    # needs the canvas for the current mode
 
         self.dlg_graphics = GraphicsSettingsDialog(self.canvas, self)
         # Mouse zoom/reset keeps the dialog's spinboxes and auto-scale
@@ -1256,22 +829,22 @@ class FrogWindow(QMainWindow):
         self.canvas.limits_changed.connect(self.dlg_graphics.sync_limits)
         self.canvas.log_toggle_requested.connect(self.dlg_graphics.chk_log.toggle)
         self.canvas.proportions_changed.connect(self.dlg_graphics.sync_proportions)
-        self.canvas.fold_dragged.connect(self._on_fold_dragged)
-        self.canvas.fold_reset_requested.connect(self._on_fold_reset)
+        self.canvas.fold_dragged.connect(self.alignment._on_fold_dragged)
+        self.canvas.fold_reset_requested.connect(self.alignment._on_fold_reset)
         self.canvas.axis_edit_failed.connect(
             lambda msg: self.status.showMessage(msg, 4000))
         # The auto-scale toggle is an INDICATOR as much as a control, so it has
         # to follow the state however it was reached: limits_changed covers the
         # right-click and every zoom, the checkbox covers Graphics Settings.
-        self.canvas.limits_changed.connect(self._refresh_autoscale_button)
-        self.dlg_graphics.chk_auto_y.toggled.connect(self._refresh_autoscale_button)
-        self._refresh_autoscale_button()
+        self.canvas.limits_changed.connect(self.appearance._refresh_autoscale_button)
+        self.dlg_graphics.chk_auto_y.toggled.connect(self.appearance._refresh_autoscale_button)
+        self.appearance._refresh_autoscale_button()
         # Same arrangement for the scale: the checkbox owns it, and everything
         # that can change it (this button, the y-strip click, the dialog, a
         # restored setting) goes through chk_log, so one connection keeps the
         # label honest.
-        self.dlg_graphics.chk_log.toggled.connect(self._refresh_logscale_button)
-        self._refresh_logscale_button()
+        self.dlg_graphics.chk_log.toggled.connect(self.appearance._refresh_logscale_button)
+        self.appearance._refresh_logscale_button()
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -1286,473 +859,28 @@ class FrogWindow(QMainWindow):
         self.status.addPermanentWidget(self.lbl_sat2)
         self.status.addPermanentWidget(self.lamp2)
         self.lbl_sat2.hide(); self.lamp2.hide()
-        self._reset_saturation()
+        self.feed.reset_saturation()
         self.status.showMessage(
             "No hardware connected — connect a spectrometer and a stage, or "
             "open Simulation to run without either.", 0)
 
-    # ── Calibration menu ──────────────────────────────────────────────────────
-    def _build_calibration_button(self):
-        """Header Calibration control — assigns an intensity-calibration file
-        to each connected physical spectrometer. Rebuilt on every open: both
-        the calibration_files folder and the connected devices change at
-        runtime."""
-        menu = QMenu(self)
-        menu.aboutToShow.connect(lambda: self._populate_calibration_menu(menu))
-        self.btn_cal = QPushButton("Calibration")
-        self.btn_cal.setToolTip(
-            "Apply an intensity calibration (wavelength/factor text file) to "
-            "the spectrometer — files live in calibration_files/ next to the "
-            "program")
-        self.btn_cal.setMenu(menu)
-        return self.btn_cal
 
-    @staticmethod
-    def _reset_menu(menu):
-        """Empty `menu` for repopulation, submenus and action groups included.
 
-        QMenu.clear() only deletes the actions the menu itself owns. A submenu
-        built by addMenu() is a child WIDGET whose menuAction() belongs to the
-        submenu, and a QActionGroup is not an action at all — so neither is
-        touched, and both stay children of a menu that lives for the whole
-        session. These menus repopulate on every aboutToShow, so without this
-        each open permanently added another set (along with the actions and
-        lambdas parented to them, some of which capture a spectrometer that has
-        since been disconnected).
-        """
-        # One call per type: PySide6's findChildren takes a single type, not the
-        # tuple isinstance() would accept.
-        for cls in (QMenu, QActionGroup):
-            for child in menu.findChildren(cls,
-                                           options=Qt.FindDirectChildrenOnly):
-                child.setParent(None)
-                child.deleteLater()
-        menu.clear()
 
-    @staticmethod
-    def _calibration_files():
-        try:
-            return sorted(CALIBRATION_DIR.glob("*.txt"),
-                          key=lambda p: p.name.lower())
-        except OSError:
-            return []
 
-    def _populate_calibration_menu(self, menu):
-        self._reset_menu(menu)
-        if not self._have_spec():
-            act = QAction("(no spectrometer connected)", menu)
-            act.setEnabled(False)
-            menu.addAction(act)
-            return
-        files = self._calibration_files()
-        targets = self.spec.calibration_targets()
-        for spec in targets:
-            # Flat list for a single device; one submenu per member of a
-            # stitched pair, so each takes its own file.
-            dest = menu.addMenu(spec.name) if len(targets) > 1 else menu
-            group = QActionGroup(dest)
-            group.setExclusive(True)
-            act = QAction("None (raw counts)", dest)
-            act.setCheckable(True)
-            act.setChecked(spec.calibration_name is None)
-            act.triggered.connect(
-                lambda _=False, s=spec: self._apply_calibration(s, None))
-            group.addAction(act); dest.addAction(act)
-            for f in files:
-                act = QAction(f.stem, dest)
-                act.setCheckable(True)
-                act.setChecked(spec.calibration_name == f.stem)
-                act.triggered.connect(
-                    lambda _=False, s=spec, p=f: self._apply_calibration(s, p))
-                group.addAction(act); dest.addAction(act)
-            if not files:
-                act = QAction("(no .txt files in calibration_files)", dest)
-                act.setEnabled(False)
-                dest.addAction(act)
-        menu.addSeparator()
-        act_add = QAction("Add new calibration…", menu)
-        act_add.triggered.connect(self._add_calibration_file)
-        menu.addAction(act_add)
 
-    def _apply_calibration(self, spec, path) -> bool:
-        """Assign `path` (or None = raw counts) to one physical spectrometer.
 
-        Returns True only if the device really carries it now. A failure is
-        raised to a modal dialog rather than a status message: an unloaded
-        calibration leaves the device on raw counts while every label still
-        names the file, and that mismatch silently corrupts a whole session's
-        data — it must not be allowed to scroll past.
-        """
-        if self._scan_running():
-            self.status.showMessage(
-                "A scan is running — stop it before changing calibration.", 4000)
-            return False
-        if spec not in self.spec.calibration_targets():
-            self.status.showMessage(
-                "That spectrometer is no longer connected.", 4000)
-            return False
-        skipped = 0
-        with self._device_lock() as ok:
-            if not ok:
-                self.status.showMessage(FEED_BUSY_MSG, 4000)
-                return False
-            try:
-                if path is None:
-                    spec.clear_calibration()
-                else:
-                    skipped = spec.set_calibration(path)
-            except Exception as e:
-                QMessageBox.warning(
-                    self, "Calibration not applied",
-                    f"{spec.name} could not load '{getattr(path, 'stem', path)}':"
-                    f"\n\n{e}\n\nThe spectrometer is still on "
-                    f"{spec.calibration_name or 'raw counts'}.")
-                return False
-        msg = (f"{spec.name}: calibration "
-               + (f"'{path.stem}' applied." if path is not None
-                  else "removed (raw counts)."))
-        if skipped:
-            msg += (f"  NOTE: {skipped} malformed line(s) in the file were "
-                    f"skipped.")
-        self.status.showMessage(msg, 8000 if skipped else 4000)
-        return True
 
-    def _add_calibration_file(self):
-        """Copy a calibration file into calibration_files/ so it shows up in
-        the menu — and, for the frozen build, survives next to the .exe."""
-        src, _ = QFileDialog.getOpenFileName(
-            self, "Add calibration file", "",
-            "Calibration files (*.txt);;All files (*)")
-        if not src:
-            return
-        src = Path(src)
-        try:
-            load_calibration_file(src)   # reject unparseable files up front
-        except Exception as e:
-            QMessageBox.warning(self, "Add calibration",
-                                f"Not a usable calibration file:\n{e}")
-            return
-        dest = CALIBRATION_DIR / src.name
-        try:
-            CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
-            if dest.exists() and not src.samefile(dest):
-                if QMessageBox.question(
-                        self, "Add calibration",
-                        f"{dest.name} already exists in calibration_files — "
-                        f"overwrite it?") != QMessageBox.Yes:
-                    return
-            if not (dest.exists() and src.samefile(dest)):
-                shutil.copyfile(src, dest)
-        except OSError as e:
-            QMessageBox.warning(self, "Add calibration",
-                                f"Could not copy into {CALIBRATION_DIR}:\n{e}")
-            return
-        self.status.showMessage(
-            f"Calibration '{src.stem}' added — assign it from the "
-            f"Calibration menu.", 5000)
 
-    # ── Spectrometer slots ───────────────────────────────────────────────────
-    # Two slots, always. Slot 1 alone is a single spectrometer; both filled is a
-    # stitched pair. The Spectrometer dialog is the only caller — it drives
-    # these three, and everything else about the pair (stitch factor, overlap
-    # band, per-slot calibration) is unchanged from when this was a menu.
-    @contextmanager
-    def _slots_rolled_back_on_failure(self):
-        """Restore the whole slot table if the connect it wraps fails.
 
-        A snapshot of all three lists, not of the one entry being edited:
-        clearing slot 1 promotes slot 2 into it, so an edit can touch every
-        field, and a per-field undo would leave the table half-shuffled. Yields
-        a one-element list the body puts its (ok, msg) into.
-        """
-        before = {k: list(v) for k, v in self._multi.items()}
-        box = []
-        yield box
-        if box and not box[0][0]:
-            self._multi = before
 
-    def _set_slot(self, slot, serial, label):
-        """Point one slot at a device and connect whatever the slots now
-        describe. (ok, msg)."""
-        if self._scan_running():
-            return False, ("A scan is running — stop it before changing "
-                           "spectrometers.")
-        with self._slots_rolled_back_on_failure() as out:
-            self._multi["serials"][slot] = serial
-            self._multi["labels"][slot]  = label
-            if all(self._multi["serials"]):
-                out.append(self._connect_multi_pair())
-            elif slot == 0:
-                out.append(self._connect_single_slot())
-            else:
-                # Slot 2 filled with slot 1 still empty. Nothing to connect
-                # against yet, so remember it and say so rather than opening
-                # this device on its own — slot 1 is the single-device slot,
-                # by definition.
-                out.append((True, f"Slot 2: {label}. Fill slot 1 to connect "
-                                  f"the pair."))
-        return out[0]
 
-    def _clear_slot(self, slot):
-        """Empty one slot and connect whatever is left. (ok, msg)."""
-        if self._scan_running():
-            return False, ("A scan is running — stop it before changing "
-                           "spectrometers.")
-        if slot == 0 and self._multi["serials"][1] is None:
-            return self._disconnect_spectrometer()
-        with self._slots_rolled_back_on_failure() as out:
-            for key in ("serials", "labels", "cals"):
-                self._multi[key][slot] = None
-            if slot == 0:
-                # Slot 1 is the single-device slot, so slot 2 alone is not a
-                # configuration. Promote it rather than leave a device named in
-                # a slot with nothing driving it.
-                for key in ("serials", "labels", "cals"):
-                    self._multi[key][0] = self._multi[key][1]
-                    self._multi[key][1] = None
-                out.append(self._connect_single_slot())
-            elif not self._pair_live():
-                out.append((True, "Slot 2 cleared."))
-            else:
-                # A live pair loses a member: release both, then reopen slot 1
-                # as the single device. Filling slot 2, in reverse.
-                out.append(self._connect_single_slot())
-        return out[0]
 
-    def _connect_single_slot(self):
-        """Open slot 1 alone as the connected spectrometer. (ok, msg).
 
-        The single-device counterpart of _connect_multi_pair, and it releases
-        the current handle for the same reason: a vendor SDK cannot open the
-        same spectrometer twice, and slot 1 may well be a member of the pair
-        being torn down.
-        """
-        ident = self._multi["serials"][0]
-        if ident is None:
-            return self._disconnect_spectrometer()
-        if self._have_spec():
-            ok, err = self._apply_spectrometer(None)
-            if not ok:
-                return False, err
-        cal = self._multi["cals"][0]
-        ragged = 0
-        try:
-            spec = self._open_slot_device(ident)
-            if cal is not None:
-                ragged = spec.set_calibration(cal)
-        except Exception as e:
-            return False, f"Spectrometer connect failed: {e}"
-        ok, err = self._apply_spectrometer(spec)
-        if not ok:
-            self._drop(spec)
-            return False, err
-        self.status.showMessage(f"Spectrometer: {spec.name}", 5000)
-        msg = f"Spectrometer connected: {spec.name}."
-        if ragged:
-            msg += (f"\n\nNOTE: {ragged} malformed line(s) were skipped in "
-                    f"'{cal.stem}' — check the file.")
-        return True, msg
 
-    def _select_slot_calibration(self, slot, path):
-        member = self._multi_members[slot]
-        if member is None and slot == 0 and not self._pair_live():
-            # Single-device mode: slot 1 IS the connected spectrometer, so its
-            # calibration can be applied to the live device straight away.
-            member = self.spec
-        if member is not None:
-            # Commit the slot ONLY once the device really carries the file.
-            # The dialog's combo is drawn from _multi["cals"], so recording it
-            # first made the combo claim a calibration that had failed to load
-            # and left that device silently on raw counts.
-            if not self._apply_calibration(member, path):
-                return
-            self._multi["cals"][slot] = path
-            return
-        # Not live yet — nothing to verify against, so the file is checked on
-        # its own and only then remembered for the connect.
-        if path is not None:
-            try:
-                _wl, _fac, skipped = load_calibration_file(path)
-            except Exception as e:
-                QMessageBox.warning(
-                    self, "Calibration not applied",
-                    f"'{path.stem}' could not be read:\n\n{e}\n\n"
-                    f"Slot {slot + 1} is unchanged.")
-                return
-        else:
-            skipped = 0
-        self._multi["cals"][slot] = path
-        msg = (f"Slot {slot + 1} calibration: "
-               f"{path.stem if path else 'none'} — applied when the device "
-               f"connects.")
-        if skipped:
-            msg += f"  NOTE: {skipped} malformed line(s) skipped."
-        self.status.showMessage(msg, 8000 if skipped else 4000)
 
-    def _connect_multi_pair(self):
-        """Open both slot devices and swap in the stitched pair. (ok, msg)."""
-        if self._scan_running():
-            return False, "A scan is running — stop it before changing hardware."
-        s1, s2 = self._multi["serials"]
-        if s1 == s2:
-            return False, ("Both slots point at the same spectrometer — pick "
-                           "two different devices.")
-        # Release any handle we already hold on one of these devices first: a
-        # vendor SDK cannot open the same spectrometer twice.
-        if self._have_spec():
-            ok, err = self._apply_spectrometer(None)
-            if not ok:
-                return False, err
-        opened = []
-        ragged = []
-        try:
-            for serial in (s1, s2):
-                opened.append(self._open_slot_device(serial))
-            for slot, (spec, cal) in enumerate(zip(opened, self._multi["cals"])):
-                if cal is not None:
-                    if spec.set_calibration(cal):
-                        ragged.append(f"slot {slot + 1} ('{cal.stem}')")
-            stitched = StitchedSpectrometer(*opened)
-        except Exception as e:
-            for s in opened:
-                self._drop(s)
-            return False, f"Stitched connect failed: {e}"
-        ok, err = self._apply_spectrometer(stitched)
-        if not ok:
-            self._drop(stitched)   # disconnects both members
-            return False, err
-        self._multi_members = list(opened)      # slot order, not blue/red
-        self._stitch_stale = False              # fresh pair, equal exposures
-        self._reset_saturation()   # slot-ordered lamp tooltips need the mapping
-        # Again, now that the slot mapping exists: _apply_spectrometer ran
-        # before _multi_members was assigned, so its _sync_multi_ui saw
-        # _slot_members() fall back to (blue, red) and would have seeded the
-        # S1/S2 spinboxes from the wrong members.
-        self._sync_multi_ui()
-        wl = stitched.wavelengths
-        lo, hi = stitched.overlap_band
-        self.status.showMessage(f"Spectrometer: {stitched.name}", 5000)
-        msg = (f"Stitched pair connected: {stitched.name}, "
-               f"{wl[0]:.0f}–{wl[-1]:.0f} nm, overlap band {lo:.1f}–{hi:.1f} "
-               f"nm. Use Auto-stitch with light across the overlap to match "
-               f"the two devices.")
-        if ragged:
-            msg += (f"\n\nNOTE: malformed lines were skipped in the "
-                    f"calibration for {', '.join(ragged)} — check the file.")
-        return True, msg
 
-    def _menu_result(self, fn):
-        """Run an (ok, msg) action from a header button; failures pop a message
-        box — the canvas header has no inline status label like the dialogs."""
-        ok, msg = fn()
-        if ok:
-            if msg:
-                self.status.showMessage(msg, 8000)
-        else:
-            QMessageBox.warning(self, "Spectrometer", msg)
 
-    def _usable_member_darks(self):
-        """The recorded member darks, or None when they cannot be applied.
-
-        All-or-nothing on purpose: subtracting from one member and not the
-        other would put the two on different baselines, which is precisely what
-        the overlap comparison — and the stitch fit — exist to measure. The one
-        gate every consumer goes through, so the per-spectrometer view, the
-        merged view and Auto-stitch can never disagree about whether a dark is
-        good.
-        """
-        darks = self.background_members
-        frames = getattr(self.spec, "last_member_raw", None)   # atomic read
-        if darks is None or frames is None or len(darks) != len(frames):
-            return None
-        if not all(np.shape(d) == np.shape(f) for d, f in zip(darks, frames)):
-            return None
-        return darks
-
-    def _fit_darks(self):
-        """The member darks Auto-stitch fits against, or None.
-
-        Deliberately NOT gated on the Subtract Dark checkbox: that is a display
-        preference, whereas the fit is physics. Two members at different
-        exposures carry different pedestals, and a fit over signal-plus-pedestal
-        returns a factor biased by the difference.
-        """
-        return self._usable_member_darks()
-
-    def _fit_stitch_factor(self):
-        if not self._pair_live():
-            return False, "No stitched pair is connected."
-        if self._scan_running():
-            return False, "A scan is running — stop it before fitting."
-        darks = self._fit_darks()
-        with self._device_lock() as ok:
-            if not ok:
-                return False, FEED_BUSY_MSG
-            try:
-                factor = self.spec.fit_stitch_factor(darks)
-            except Exception as e:
-                return False, f"Stitch-factor fit failed: {e}"
-        self._stitch_stale = False
-        lo, hi = self.spec.overlap_band
-        res = self.spec.stitch_residual
-        quality = ("" if res is None else
-                   f" Residual mismatch {res * 100:.1f}% — "
-                   + ("the two spectra agree across the band."
-                      if res < 0.05 else
-                      "one scalar does not reconcile them here; check the "
-                      "calibrations or narrow the band."))
-        return True, (f"Stitch factor fitted: {factor:.4g} "
-                      f"(applied to {self.spec.spec1.name}) over "
-                      f"{lo:.1f}–{hi:.1f} nm"
-                      + ("" if darks is not None else ", no dark subtracted")
-                      + f".{quality}")
-
-    def _set_stitch_factor(self):
-        if not self._pair_live():
-            return
-        val, ok = QInputDialog.getDouble(
-            self, "Set stitch factor",
-            f"Multiplier applied to {self.spec.spec1.name} before stitching:",
-            self.spec.stitch_factor, 1e-6, 1e6, 6)
-        if ok:
-            self.spec.stitch_factor = float(val)   # atomic — no lock needed
-            self.spec.stitch_residual = None   # hand-set: nothing was measured
-            self._stitch_stale = False   # the user just said what they want
-            # No dark warning: the merged background is derived from the member
-            # frames at the current factor, so it follows this change by itself.
-            self.status.showMessage(f"Stitch factor set to {val:.4g}.", 4000)
-
-    def _set_overlap_band(self):
-        """Pick the sub-range of the overlap that the fit and blend use."""
-        if not self._pair_live():
-            return
-        lo, hi = self.spec.overlap_band
-        glo, ghi = self.spec.geometric_overlap
-        new_lo, ok = QInputDialog.getDouble(
-            self, "Overlap band",
-            f"Band START (nm) — the two spectrometers share "
-            f"{glo:.1f}–{ghi:.1f} nm.\nEnter {glo:.1f} to reset to the full "
-            f"shared range:", lo, glo, ghi, 1)
-        if not ok:
-            return
-        new_hi, ok = QInputDialog.getDouble(
-            self, "Overlap band", "Band END (nm):", hi, glo, ghi, 1)
-        if not ok:
-            return
-        try:
-            lo, hi = self.spec.set_band(new_lo, new_hi)
-        except Exception as e:
-            QMessageBox.warning(self, "Overlap band", str(e))
-            return
-        # Push the band to the canvas now rather than waiting for the next
-        # overlay frame, so the shading moves as soon as the dialog closes. The
-        # shading only renders in the per-spectrometer view (set_overlap_band
-        # gates it on that); the combined curve has already been crossfaded, so
-        # there is nothing there for it to mark.
-        self.canvas.set_overlap_band(lo, hi)
-        self.status.showMessage(
-            f"Overlap band set to {lo:.1f}–{hi:.1f} nm — re-run Auto-stitch "
-            f"to fit over it.", 6000)
 
     @staticmethod
     def _connect_page(grp, body, button):
@@ -1795,7 +923,7 @@ class FrogWindow(QMainWindow):
         self._integration_timer = QTimer(self)
         self._integration_timer.setSingleShot(True)
         self._integration_timer.setInterval(250)
-        self._integration_timer.timeout.connect(self._apply_integration_time)
+        self._integration_timer.timeout.connect(self.feed._apply_integration_time)
         self.spin_integration.valueChanged.connect(
             lambda _v: self._integration_timer.start())
         # Second exposure, shown only for a stitched pair. The two devices see
@@ -1829,7 +957,7 @@ class FrogWindow(QMainWindow):
         drow = QHBoxLayout(); drow.setSpacing(8)
         self.btn_dark = QPushButton("Record Dark")
         self.btn_dark.setObjectName("accentcompact")
-        self.btn_dark.clicked.connect(self._capture_dark)
+        self.btn_dark.clicked.connect(self.feed._capture_dark)
         self.chk_dark = QCheckBox("Subtract Dark")
         self.chk_dark.setEnabled(False)
         drow.addWidget(self.btn_dark)
@@ -1918,7 +1046,7 @@ class FrogWindow(QMainWindow):
         # _size_moving_label reserves that width; the layout takes the pixels
         # off the stretchy columns, which have them to give.
         _readout("Stage", self.lbl_moving, 0, Qt.AlignHCenter)
-        self._size_moving_label()
+        self.appearance._size_moving_label()
         lay.addLayout(prow)
 
         self.btn_set_zero = QPushButton("Set Position as 0 fs")
@@ -2015,1207 +1143,64 @@ class FrogWindow(QMainWindow):
         self._refresh_scan_um()
         return grp
 
-    # ── Theme ─────────────────────────────────────────────────────────────────
-    def _toggle_theme(self):
-        self._apply_theme("light" if self._theme == "dark" else "dark")
-
-    def _apply_theme(self, name):
-        self._theme = name
-        install_theme(QApplication.instance(), name)   # shared with startup
-        self.canvas.apply_palette(PALETTE)
-        self.lamp.update()          # repaints from the new PALETTE
-        self.btn_theme.setIcon(QIcon(str(MOON_ICON if name == "light" else SUN_ICON)))
-        self.btn_theme.setToolTip(
-            "Switch to dark mode" if name == "light" else "Switch to light mode")
-        self._refresh_overlay_button()   # its icons are per-theme too
-        self._refresh_layout_button()    # …and so are this one's
-        self._refresh_feed_button()      # …and its glyph is drawn from PALETTE
-        self._refresh_align_button()     # …and it has one file per theme
-        self._refresh_align_refresh_icon()  # …as does its re-run button
-        self._refresh_autofit_icon()     # …and the auto-fit mark
-        self._refresh_autostitch_icon()  # …as does this one
-        self._refresh_autoscale_icon()   # …and this one
-        self._refresh_freeze_icon()      # …the + is drawn from PALETTE too
-        self._refresh_reference_button() # …and the eye has one file per theme
-        self._refresh_picture_icon()     # …as does the camera
-        self._size_moving_label()        # its font came from the stylesheet
-        self.pnl_no_spec.refresh_theme()  # …and its watermark is tinted live
-        self.status.showMessage(f"{name.capitalize()} mode.", 2000)
-
-    # ── Plot layout ──────────────────────────────────────────────────────────
-    def _toggle_layout(self):
-        mode = ("vertical" if self.canvas.layout_mode == "horizontal"
-                else "horizontal")
-        self._set_layout(mode)
-        self.status.showMessage(
-            "Horizontal layout — trace and autocorrelation share the delay axis."
-            if mode == "horizontal" else
-            "Vertical layout — autocorrelation full width below.", 4000)
-
-    def _set_layout(self, mode):
-        """Apply a layout mode and keep its button honest.
-
-        Split out of _toggle_layout so a restored mode takes exactly the same
-        path as a click — minus the status message, which at startup would push
-        the 'no hardware connected' banner off the bar before it was read.
-        """
-        if mode not in ("horizontal", "vertical"):
-            raise ValueError(mode)          # a bad settings key, caught upstream
-        self.canvas.set_layout_mode(mode)
-        self._refresh_layout_button()
-
-    def _refresh_layout_button(self):
-        """Icon and tooltip of the plot-layout toggle. Like the theme and
-        overlay buttons, it advertises the layout a CLICK produces, so the
-        vertical icon is shown while the horizontal layout is active."""
-        horiz = self.canvas.layout_mode == "horizontal"
-        icon = (VERT_ICON if horiz else HORIZ_ICON)[self._theme]
-        if icon.exists():
-            self.btn_layout.setIcon(QIcon(str(icon)))
-            self.btn_layout.setText("")
-        else:
-            self.btn_layout.setIcon(QIcon())
-            self.btn_layout.setText("▤" if horiz else "▥")
-        self.btn_layout.setToolTip(
-            "Vertical layout: autocorrelation full width below the spectrum "
-            "and FROG trace" if horiz else
-            "Horizontal layout: FROG trace above the autocorrelation, sharing "
-            "one delay axis, beside a full-height spectrum")
-
-    # ── Picture of the figure ────────────────────────────────────────────────
-    def _refresh_picture_icon(self):
-        """Per-theme camera on the picture button, with the same text fallback
-        every other icon button carries. Only the icon is re-read here — unlike
-        its two neighbours this button has one state, so its tooltip is fixed
-        and set once."""
-        icon = PICTURE_ICON[self._theme]
-        if icon.exists():
-            self.btn_picture.setIcon(QIcon(str(icon)))
-            self.btn_picture.setText("")
-        else:
-            self.btn_picture.setIcon(QIcon())
-            self.btn_picture.setText("PNG")
-        self.btn_picture.setToolTip(
-            "Save the plots as a high-resolution PNG — the FROG trace with the "
-            "autocorrelation below it and the spectrum beside them, in the "
-            "current theme. Opens on the Export window's file name.")
-
-    def _save_picture(self):
-        """Ask for a file and print the plots into it.
-
-        Opens on the Export window's file name — same stem, same date prefix,
-        only the suffix differs — so a scan and the picture of it land side by
-        side in a folder listing under one name instead of needing the two to be
-        matched up by timestamp afterwards.
-
-        Deliberately NOT gated on self.result the way the data exports are: a
-        picture of the live spectrum, or of a trace still filling in, is a
-        perfectly good thing to want — there is always something on the panels
-        worth a picture, which is not true of a scan file.
-        """
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save figure as PNG", self.dlg_export.file_name(".png"),
-            "PNG image (*.png)")
-        if not path:
-            return
-        if not path.lower().endswith(".png"):
-            path += ".png"
-        self.status.showMessage(f"Saving figure → {path} …", 0)
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        # repaint(), not the usual deferred update: the save below runs on this
-        # thread and holds the event loop for as long as it takes, so a message
-        # left for the next paint would first appear once it was already stale.
-        self.status.repaint()
-        try:
-            w, h = self.canvas.save_picture(path)
-        except Exception as e:
-            # Broad: matplotlib raises OSError for a path it cannot write and
-            # ValueError for a format it will not, and neither is worth a
-            # traceback to a console this build does not have.
-            self.status.showMessage(f"Figure save failed: {e}", 8000)
-        else:
-            # The size is reported because it is not simply PICTURE_DPI times a
-            # fixed page: it follows the window, and above PICTURE_MAX_PX the
-            # dpi gives way instead of the page growing.
-            self.status.showMessage(f"Saved → {path}  ({w} × {h} px)", 5000)
-        finally:
-            QApplication.restoreOverrideCursor()
-
-    # ── Saturation indicator ─────────────────────────────────────────────────
-    def _set_lamp(self, state, text, obj, which=0):
-        lamp = self.lamp if which == 0 else self.lamp2
-        lbl  = self.lbl_sat if which == 0 else self.lbl_sat2
-        lamp.set_state(state)
-        lbl.setText(text)
-        # Colour via objectName + repolish (not setStyleSheet) so a later theme
-        # switch restyles the label along with everything else.
-        if lbl.objectName() != obj:
-            lbl.setObjectName(obj)
-            lbl.style().unpolish(lbl)
-            lbl.style().polish(lbl)
-
-    def _full_scale(self):
-        """Effective detector full scale, in counts, or None if unknown.
-
-        Mirrors FrogScanWorker.run exactly — a typed override beats the
-        device's own report — so the lamp and the scan can never be judging
-        against different thresholds.
-        """
-        full = self.scan_cfg.saturation_counts
-        if full is None:
-            full = getattr(self.spec, "max_counts", None)
-        return full if full else None
-
-    def _on_sat_fraction(self, percent):
-        self.scan_cfg.saturation_fraction = percent / 100.0
-        self._reset_saturation()    # re-judge; the old latch used a stale rule
-
-    def _slot_members(self):
-        """Live stitched members in SLOT order (slot 1 first). Falls back to
-        the stitched device's own (blue, red) order when the pair was not
-        connected through the multi-spectrometer slots."""
-        members = getattr(self.spec, "members", None)
-        if not members:
-            return []
-        if (all(m is not None for m in self._multi_members)
-                and set(map(id, self._multi_members)) == set(map(id, members))):
-            return list(self._multi_members)
-        return list(members)
-
-    def _sync_connection_ui(self):
-        """Show the Connect buttons or the controls, per what is connected.
-
-        The side panels and the "no spectrometer connected" message all say the
-        same thing, so one function owns all three. Called from _sync_multi_ui
-        (every spectrometer swap ends there) and from _apply_stage.
-        """
-        have_spec, have_stage = self._have_spec(), self._have_stage()
-        self._body_spectrum.setVisible(have_spec)
-        self.btn_connect_spec.setVisible(not have_spec)
-        self._body_stage.setVisible(have_stage)
-        self.btn_connect_stage.setVisible(not have_stage)
-        self.pnl_no_spec.setVisible(not have_spec)
-        if not have_spec:
-            self.pnl_no_spec.raise_()
-        # The header buttons act on a spectrum that may not exist; and the
-        # message just claimed the panel, so the row has to be re-packed
-        # around whatever is left showing.
-        for b in (self.btn_autofit, self.btn_feed, self.btn_align_spec):
-            b.setEnabled(have_spec)
-        self._position_panel_buttons()
-        if self.dlg_spec.isVisible():
-            self.dlg_spec.refresh()
-        if self.dlg_stage.isVisible():
-            self.dlg_stage.refresh()
-        if self.dlg_sim.isVisible():
-            self.dlg_sim.refresh()
-
-    def _sync_multi_ui(self):
-        """Bring every stitched-vs-single widget into line with self.spec.
-
-        One owner for the second integration spinbox and the overlay button,
-        so no caller has to remember the set. Pure widget state — no device
-        I/O, so it is safe to call outside _device_lock.
-        """
-        stitched = self._pair_live()
-        slots = self._slot_members() if stitched else []
-        # One caption over both boxes — S1 on the left, S2 on the right, each
-        # in ITS OWN curve's colour. Two boxes under one caption is the compact
-        # arrangement (see _build_spectrum_group), but it leaves the reader to
-        # infer which box is which device from position alone; matching the
-        # names to the curves on the panel says it outright. Rich text rather
-        # than two labels, so the caption stays one widget on one line.
-        #
-        # MEMBER_COLORS is theme-invariant by design, so this needs no
-        # _apply_theme hook — see the note beside line_m1/line_m2 in
-        # FrogCanvas.apply_palette.
-        self.lbl_integration.setText(
-            (f"Integration Time — "
-             f"<span style='color:{MEMBER_COLORS[0]}'><b>S1</b></span> / "
-             f"<span style='color:{MEMBER_COLORS[1]}'><b>S2</b></span>")
-            if stitched else "Integration Time")
-        self.spin_integration2.setVisible(stitched)
-        # Second saturation lamp: one alarm per device, so it exists exactly as
-        # long as the pair does.
-        self.lbl_sat2.setVisible(stitched)
-        self.lamp2.setVisible(stitched)
-        if len(slots) != 2:
-            # No live pair: the per-spectrometer view has nothing to show.
-            if self.btn_overlay.isChecked():
-                with QSignalBlocker(self.btn_overlay):
-                    self.btn_overlay.setChecked(False)
-            self._overlay_on = False
-            self.canvas.clear_members()
-        elif not self._pair_seen:
-            # A pair that has just come up starts UNSTITCHED — one curve per
-            # spectrometer. The combined curve hides the one thing a fresh pair
-            # most needs checking: whether the two halves actually agree across
-            # the overlap. Seeing them apart is what makes a bad stitch factor
-            # or a dark half obvious, and Auto-stitch is judged against it.
-            #
-            # Only on the way IN, hence the latch: this runs on every device
-            # sync, and re-asserting the default there would override the
-            # operator every time anything else about the pair changed.
-            with QSignalBlocker(self.btn_overlay):
-                self.btn_overlay.setChecked(True)
-            self._overlay_on = True
-        # Latch AFTER the branch above, and cleared whenever the pair goes, so
-        # the next one to come up gets the default again.
-        self._pair_seen = len(slots) == 2
-        self._sync_integration_ui()
-        self._refresh_overlay_button()
-        self._refresh_autostitch_button()
-        self._refresh_align_trace_button()
-        self._refresh_avantes_button()
-        self._sync_connection_ui()
-
-    def _refresh_autostitch_icon(self):
-        """Per-theme mark on the Auto-stitch button, with the same text
-        fallback the other icon buttons keep for a bundle missing its icons."""
-        icon = STITCH_ICON[self._theme]
-        if icon.exists():
-            self.btn_autostitch.setIcon(QIcon(str(icon)))
-            self.btn_autostitch.setText("")
-        else:
-            self.btn_autostitch.setIcon(QIcon())
-            self.btn_autostitch.setText("⇌")
-
-    def _refresh_autostitch_button(self, running=None):
-        """Show the Auto-stitch header button only while a pair is live, and
-        enable it only while no scan owns the hardware it would drive.
-
-        `running` overrides the inferred state for the same reason
-        _refresh_symmetry_button takes it: _reset_scan_ui runs from the slot for
-        finished_scan, which the worker emits INSIDE run() — before the finally
-        that parks the stage. Whether the QThread has left run() by the time the
-        GUI thread picks that signal up is a race, and on real hardware (where
-        parking is a stage move measured in seconds) it reliably has not, so
-        _scan_running() reads True and this re-greyed the button immediately
-        after the scan that was over. Nothing refreshed it again, so it stayed
-        dead until a device swap or a theme switch happened along.
-        """
-        if running is None:
-            running = self._scan_running()
-        self.btn_autostitch.setVisible(self._pair_live()
-                                       and len(self._slot_members()) == 2)
-        self.btn_autostitch.setEnabled(not running)
-        self.btn_autostitch.setToolTip(
-            "Auto-stitch — fit the factor that matches the two spectrometers "
-            "across the overlap. Needs light across the overlap region; the "
-            "fitted factor and its mismatch are shown in the Spectrometer "
-            "window.")
-        self._position_panel_buttons()   # its visibility drives the header row
-
-    def _refresh_avantes_button(self):
-        """Show the Avantes toolbar button only while an Avantes is live.
-
-        Called from _sync_multi_ui because that is the one function guaranteed
-        to run after every device swap (_apply_spectrometer, _connect_multi_pair
-        and the slot handlers all end in it).
-        """
-        devices = self._avantes_devices()
-        self.btn_avantes.setVisible(bool(devices))
-        if not devices and self.dlg_avantes.isVisible():
-            self.dlg_avantes.hide()      # its target just went away
-        elif devices and self.dlg_avantes.isVisible():
-            self.dlg_avantes.refresh()  # a swap may have changed which device
-
-    @staticmethod
-    def _seed_integration_spin(spin, dev):
-        """Point one exposure box at `dev`: range, resolution, step and value.
-
-        The range is the device's, so sub-millisecond exposures appear only on
-        hardware that actually has them and the box cannot be used to ask for
-        something the SDK will refuse. Resolution follows: microsecond steps
-        would be noise on a device with a 1 ms floor, and adaptive stepping
-        keeps the arrows useful across a range that now spans four decades.
-
-        Blocked throughout: seeding must not restart the debounce, or 250 ms
-        later we take a feed handover to write back a value the device already
-        holds.
-        """
-        lo, hi = _exposure_bounds(dev)
-        sub_ms = lo < 1.0
-        with QSignalBlocker(spin):
-            spin.setDecimals(3 if sub_ms else 0)   # before setRange: it rounds
-            spin.setRange(lo, hi)
-            spin.setStepType(QAbstractSpinBox.AdaptiveDecimalStepType if sub_ms
-                             else QAbstractSpinBox.DefaultStepType)
-            spin.setSingleStep(1.0)
-            spin.setValue(min(hi, max(lo, _exposure_ms(dev))))
-
-    def _sync_integration_ui(self):
-        """Reseed the integration spinbox(es) from the live device(s).
-
-        Needed whenever the device behind a box changes, and whenever
-        something OTHER than the box changes the exposure it should be
-        showing. A live pair takes one box per member, from that member's own
-        limits — the two halves of a mixed-vendor pair do not share a range.
-        """
-        if not self._have_spec():
-            return          # the boxes are hidden with the rest of the panel
-        slots = self._slot_members() if self._pair_live() else []
-        if len(slots) == 2:
-            for mem, spin in zip(slots, (self.spin_integration,
-                                         self.spin_integration2)):
-                self._seed_integration_spin(spin, mem)
-        else:
-            self._seed_integration_spin(self.spin_integration, self.spec)
-
-    def _refresh_overlay_button(self):
-        """Icon, tooltip and availability of the per-spectrometer view toggle.
-
-        The icon shows the view a CLICK produces, not the current one: broken
-        spectrum while the combined curve is up, continuous once the members
-        are drawn apart.
-        """
-        stitched = self._pair_live()
-        self.btn_overlay.setVisible(stitched and len(self._slot_members()) == 2)
-        # Live through a scan, unlike Auto-stitch beside it: this only chooses
-        # which curves the panel draws, and _render_scan_frame now honours the
-        # choice from the scan's own member frames. Auto-stitch has to stay
-        # disabled — it drives the hardware the worker owns.
-        on = self.btn_overlay.isChecked()
-        icon = (MERGE_ICON if on else SPLIT_ICON)[self._theme]
-        if icon.exists():
-            self.btn_overlay.setIcon(QIcon(str(icon)))
-            self.btn_overlay.setText("")
-        else:
-            self.btn_overlay.setIcon(QIcon())
-            self.btn_overlay.setText("∿" if on else "⌇")
-        self.btn_overlay.setToolTip(
-            "Show the combined stitched spectrum as one curve" if on else
-            "Show each spectrometer as its own curve — compare the two across "
-            "the overlap to judge the stitch factor")
-        # Its visibility just changed, and the header row is packed
-        # right-to-left around whatever is showing.
-        self._position_panel_buttons()
-
-    def _on_overlay_toggled(self, on):
-        if on and not (self._pair_live()
-                       and len(self._slot_members()) == 2):
-            with QSignalBlocker(self.btn_overlay):
-                self.btn_overlay.setChecked(False)
-            return
-        self._overlay_on = bool(on)
-        if not on:
-            # Don't wait for the next frame to put the combined curve back.
-            self.canvas.clear_members()
-        self._refresh_overlay_button()
-        self._refresh_autostitch_button()
-        self.status.showMessage(
-            "Spectrum panel: one curve per spectrometer." if on else
-            "Spectrum panel: combined stitched spectrum.", 4000)
-
-    def _member_full_scale(self, member):
-        """A member's effective full scale: the Hardware override, when set,
-        applies to every member; otherwise the member's own report."""
-        full = self.scan_cfg.saturation_counts
-        if full is None:
-            full = getattr(member, "max_counts", None)
-        return full if full else None
-
-    def _reset_saturation(self):
-        """Clear a latched warning and re-read the effective full scale(s)."""
-        self._sat_latched = False
-        self._sat_frames  = 0            # saturated frames so far this scan
-        self._sat_worst   = (0, 0.0, 0)  # (n_pixels, delay_fs, column index)
-        slots = self._slot_members() if self._pair_live() else []
-        if slots:
-            # Live pair: one lamp per member, each judged against its own full
-            # scale.
-            for i, mem in enumerate(slots):
-                full = self._member_full_scale(mem)
-                lamp = self.lamp if i == 0 else self.lamp2
-                if full:
-                    src = ("override" if self.scan_cfg.saturation_counts
-                           else "device")
-                    lamp.setToolTip(
-                        f"{mem.name} headroom — full scale {full:.0f} counts "
-                        f"({src}), saturated at "
-                        f"{100 * self.scan_cfg.saturation_fraction:.0f}%")
-                    self._set_lamp("ok", f"S{i + 1}", "satok", i)
-                else:
-                    lamp.setToolTip(
-                        f"{mem.name} does not report a full-scale value, so "
-                        f"saturation cannot be checked. Set one in "
-                        f"Spectrometer → Full scale.")
-                    self._set_lamp("unknown", f"S{i + 1} — % FS", "satok", i)
-            return
-        if not self._have_spec():
-            self.lamp.setToolTip("No spectrometer connected.")
-            self._set_lamp("unknown", "", "satok")
-            return
-        full = self._full_scale()
-        if not full:
-            self.lamp.setToolTip(
-                "This spectrometer does not report a full-scale value, so "
-                "saturation cannot be checked. Set one in Spectrometer → "
-                "Full scale.")
-            self._set_lamp("unknown", "— % FS", "satok")
-        else:
-            source = ("override" if self.scan_cfg.saturation_counts else "device")
-            self.lamp.setToolTip(
-                f"Detector headroom — full scale {full:.0f} counts ({source}), "
-                f"saturated at {100 * self.scan_cfg.saturation_fraction:.0f}%")
-            self._set_lamp("ok", "", "satok")
-
-    def _judge_lamp(self, which, raw, full, prefix=""):
-        """Drive one lamp from one RAW frame and its full scale.
-
-        Same threshold the scan worker uses, so the live lamp and the scan
-        warning can never disagree about what counts as saturated.
-        """
-        if not full:
-            self._set_lamp("unknown", f"{prefix}— % FS", "satok", which)
-            return
-        peak = float(np.max(raw)) if raw.size else 0.0
-        frac = peak / full
-        sat_frac = self.scan_cfg.saturation_fraction
-        if frac >= sat_frac:
-            n = int(np.count_nonzero(raw >= sat_frac * full))
-            self._set_lamp("sat", f"{prefix}⚠ SATURATED  ({n} px)", "sat", which)
-        elif frac >= SAT_WARN_FRACTION:
-            self._set_lamp("warn", f"{prefix}⚠ {100 * frac:.0f}% FS",
-                           "satwarn", which)
-        else:
-            self._set_lamp("ok", f"{prefix}{100 * frac:.0f}% FS", "satok", which)
-
-    def _update_saturation(self, raw):
-        """Live headroom readout, driven by the feed's RAW (un-subtracted) frame.
-
-        Skipped while a scan's warning is latched: that one records that the
-        measurement is already compromised, and must not be scrolled away by
-        whatever the feed sees once the scan hands the hardware back.
-        """
-        if self._sat_latched:
-            return
-        slots = self._slot_members() if self._pair_live() else []
-        frames = getattr(self.spec, "last_member_raw", None)
-        if slots and frames is not None:
-            # Two separate alarms: each member's own raw frame against its own
-            # full scale. `raw` (the combined stitched frame) has no single
-            # ADC scale and is deliberately not judged.
-            members = self.spec.members
-            raw_by_id = {id(m): f for m, f in zip(members, frames)}
-            for i, mem in enumerate(slots):
-                frame = raw_by_id.get(id(mem))
-                if frame is not None:
-                    self._judge_lamp(i, frame, self._member_full_scale(mem),
-                                     prefix=f"S{i + 1} ")
-            return
-        full = self._full_scale()
-        if not full:
-            return
-        self._judge_lamp(0, raw, full)
-
-    # ── Live feed ─────────────────────────────────────────────────────────────
-    def _on_feed_error(self, msg):
-        """Slot for LiveFeedWorker.acquire_failed — runs on the GUI thread.
-
-        The live feed cannot stop on a failed frame (a device is allowed the
-        occasional hiccup, and the loop must keep trying), but it must not
-        swallow one either: a plot frozen on its last good frame reads as "the
-        setting I just changed did nothing" rather than as an error. The worker
-        throttles the repeats, so this only ever shows a live problem.
-        """
-        self.status.showMessage(f"Live feed: {msg}", 6000)
-
-    def _on_spectrum(self, wl, raw):
-        """Slot for LiveFeedWorker.spectrum_ready — runs on the GUI thread.
-
-        Deliberately O(1): it only records the newest frame for _display_tick
-        to render. Doing the rendering here let the event queue grow without
-        bound whenever a render outlasted the acquisition interval (weak
-        machines), and the display lagged further behind every second.
-        """
-        self._live_frame = (wl, raw)
-        # Keep the worst (highest-peak) frame between ticks so a transiently
-        # clipped frame that never gets displayed still trips the lamp.
-        p = float(raw.max()) if raw.size else 0.0
-        if p > self._sat_peak:
-            self._sat_peak = p
-            self._sat_frame = raw
-        # NB: no stage read here. Polling get_position() at feed rate raced the
-        # feed thread's own acquire() (which, for the simulator, itself reads
-        # the stage). The readout is instead refreshed after every move we make
-        # and from the scan worker's per-column read-back.
-
-    def _display_tick(self):
-        """Render the newest pending data — scan column or live frame."""
-        if self._scan_dirty:
-            with perf_tick("scan_render"):
-                self._render_scan_frame()
-            return
-        if self._live_frame is None:
-            return
-        if not self._have_spec():
-            # The feed emits from its own thread, so a spectrum_ready queued
-            # before the disconnect is still delivered after it. Drop it: the
-            # frame describes a device that is gone, and every correction
-            # below it would go through self.spec.
-            self._live_frame = None
-            return
-        with perf_tick("live_render"):
-            wl, raw = self._live_frame
-            self._live_frame = None
-            self.last_spectrum = raw
-            self._update_saturation(self._sat_frame if self._sat_frame is not None
-                                    else raw)
-            self._sat_frame = None
-            self._sat_peak = -1.0
-            if self._overlay_on and self._render_overlay():
-                self._flush_pending_fit()
-                return
-            self.canvas.update_spectrum(wl, self._dark_corrected(raw))
-            self._flush_pending_fit()
-
-    def _dark_corrected(self, raw):
-        """The merged live frame with the dark removed, ready to plot."""
-        return self._corrected_frame(
-            raw, getattr(self.spec, "last_member_raw", None))
-
-    def _corrected_frame(self, raw, frames):
-        """`raw` with the dark removed and the calibration applied.
-
-        `frames` are the RAW member frames `raw` was merged from (None for a
-        single device). Passed in rather than read from the device here, so a
-        caller holding a frame from some time ago — the alignment sweep — gets
-        the correction for ITS OWN member frames instead of whatever the feed
-        has acquired since.
-
-        A stitched pair is rebuilt from the member frames rather than having a
-        stored merged dark subtracted: the pedestal comes off each member
-        before its own calibration, and the crossfade then happens at the
-        CURRENT stitch factor and band. That is what makes this curve equal to
-        the crossfade of the two per-spectrometer curves by construction — a
-        pre-merged dark carried the factor it was recorded at and drifted the
-        moment Auto-stitch ran.
-        """
-        if not self.chk_dark.isChecked():
-            return raw if self._pair_live() \
-                else self.spec.calibrate(raw)
-        if self._pair_live():
-            darks = self._usable_member_darks()
-            if darks is None or frames is None:
-                self._warn_dark_mismatch()
-                return raw          # already calibrated and merged by acquire()
-            return self.spec.combine(
-                *self.spec.prepare_pair(*frames, darks))
-        spectrum = raw
-        if self.background is not None:
-            spectrum = np.clip(raw - self.background, 0, None)
-        # Calibration LAST, and never on what the lamp judged: saturation is a
-        # raw-ADC property, the calibration is display/data physics.
-        return self.spec.calibrate(spectrum)
-
-    def _display_dark(self):
-        """The pedestal to take off a MERGED, CALIBRATED frame before drawing
-        it — or None when there is nothing to take off.
-
-        The trace panel's counterpart to _corrected_spectrum, which cannot use
-        that function: a scan column arrives already merged and calibrated and
-        there are no per-column member frames to rebuild it from, so the dark
-        has to be pushed through the same merge instead of being taken off each
-        member first. StitchedSpectrometer.combined_dark is that push, at the
-        CURRENT stitch factor and band, which is what lands this on the same
-        baseline the live spectrum was drawn against. A single device's dark is
-        raw counts, so it takes the calibration the column already carries.
-
-        Returning None rather than raising on a mismatch is deliberate: an
-        uncorrected trace is honest, a trace with somebody else's pedestal
-        subtracted is not.
-        """
-        if not self.chk_dark.isChecked():
-            return None
-        if self._pair_live():
-            darks = self.background_members
-            if darks is None:
-                return None
-            try:
-                return self.spec.combined_dark(darks)
-            except Exception:
-                return None        # mismatched shapes: better raw than wrong
-        if self.background is None:
-            return None
-        return self.spec.calibrate(self.background)
-
-    def _warn_dark_mismatch(self):
-        """Say once that a recorded dark does not fit the live pair.
-
-        One shot only — the callers run every 60 ms and would bury the status
-        bar. Re-armed whenever a dark is recorded or dropped.
-        """
-        if self._dark_member_warned:
-            return
-        self._dark_member_warned = True
-        self.status.showMessage(
-            "The recorded dark does not match this pair — not subtracted. "
-            "Re-record it.", 6000)
-
-    def _flush_pending_fit(self):
-        """Run the one-shot fit a device swap queued, once its first frame is
-        actually on the axes.
-
-        Driven from the render, not from frame arrival: fit_xy() fits to what
-        the curves currently hold, and arrival leads the render by up to one
-        display tick. Fitting on arrival therefore had to guess a delay long
-        enough to outlast the tick, and on a starved event loop it guessed
-        wrong and fitted the OUTGOING device's wavelength range.
-        """
-        if self._pending_fit:
-            self._pending_fit = False
-            self._autofit_spectrum()
-        elif self._pending_rescale:
-            # elif: a device swap's full fit is the stronger action and already
-            # covers the rescale, so it must not be undone by one queued behind it.
-            self._pending_rescale = False
-            self._rescale_spectrum()
-
-    def _render_overlay(self, frames=None):
-        """Draw one curve per stitched member. False = nothing to draw yet, so
-        the caller falls back to the combined frame.
-
-        Runs the SAME prepare_pair() the merged frame does, then applies each
-        member's scale, so the two curves and the merged one are two views of
-        one computation rather than two derivations that can drift. Each member
-        keeps its NATIVE pixel grid; no interpolation happens here.
-
-        `frames` are the RAW member frames to draw. Passed in by the scan, which
-        holds the pair its worker measured the current column with; the live
-        feed omits it and gets the device's newest pair instead. Same
-        arrangement, and for the same reason, as _corrected_frame's.
-
-        Reads self.spec.last_member_raw from the GUI thread without the device
-        lock, exactly as _update_saturation does: the tuple assignment is
-        atomic, and calibrate() plus the wavelength arrays are pure.
-        """
-        spec = self.spec
-        if frames is None:
-            frames = getattr(spec, "last_member_raw", None)
-        slots = self._slot_members()
-        if frames is None or len(slots) != 2:
-            return False
-        darks = None
-        if self.chk_dark.isChecked():
-            darks = self._usable_member_darks()
-            if darks is None:
-                self._warn_dark_mismatch()
-        prepared = spec.prepare_pair(*frames, darks)
-        by_id = {id(m): y for m, y in zip(spec.members, prepared)}
-        curves = []
-        for mem in slots:
-            y = by_id.get(id(mem))
-            if y is None:
-                return False
-            idx = spec.member_index(mem)
-            curves.append((np.asarray(mem.wavelengths, float),
-                           y * spec.member_scale(idx)))
-        # Cheap and idempotent — set_overlap_band returns immediately unless
-        # the band actually moved.
-        self.canvas.set_overlap_band(*spec.overlap_band)
-        self.canvas.update_member_spectra(curves[0][0], curves[0][1],
-                                          curves[1][0], curves[1][1])
-        return True
-
-    def _autofit_spectrum(self):
-        """One-shot fit of spectrum X + Y; syncs Graphics Settings spinboxes."""
-        self.canvas.fit_xy()
-        if hasattr(self, 'dlg_graphics'):
-            self.dlg_graphics.sync_limits()
-
-    def _rescale_spectrum(self):
-        """Refit the spectrum to the current frame, LEAVING auto-scale as it was.
-
-        fit_xy() freezes both flags — right for a device swap, where the new
-        spectrometer's range is a fresh start, but wrong for an exposure change:
-        turning the operator's auto-scale off as a side effect of typing in a
-        new integration time is not something they asked for. So the flags are
-        put back afterwards.
-
-        Auto-scale Y goes back on through set_autoscale_y, which also drops the
-        damping filter's state — otherwise the filter would still be converging
-        on the old exposure's levels and would spend its decay constant crawling
-        off the fit that was just made.
-        """
-        c = self.canvas
-        was_x, was_y = c.autoscale_x, c.autoscale_y
-        c.fit_xy()                     # fits both axes, freezes both flags
-        c.set_autoscale_x(was_x)
-        if was_y:
-            c.set_autoscale_y(True)
-        if hasattr(self, 'dlg_graphics'):
-            self.dlg_graphics.sync_limits()
-
-    # ── Alignment mode: spectrum symmetry ────────────────────────────────────
-    def _align_running(self):
-        return (self._align_worker is not None
-                and self._align_worker.isRunning())
-
-    def _uncheck_align_spec(self):
-        """Pop the Δ button back out without re-entering its own handler."""
-        self.btn_align_spec.blockSignals(True)
-        self.btn_align_spec.setChecked(False)
-        self.btn_align_spec.blockSignals(False)
-
-    def _close_align_mode(self):
-        """Leave alignment mode: panel closed, curves dropped, button out.
-
-        The one way out, so every caller that has to abandon the mode — the
-        toggle, a device swap, the start of a scan — leaves the same state
-        behind. Silent about signals: _uncheck_align_spec blocks them, so this
-        never re-enters the toggle handler that may have called it.
-        """
-        self._uncheck_align_spec()
-        self.btn_align_refresh.hide()
-        self.canvas.clear_diff()
-        self.canvas.set_dev_visible(False)
-        self._position_panel_buttons()   # the header row just lost a button
-
-    def _on_align_spec_toggled(self, on):
-        """Open or close alignment mode.
-
-        Opening it puts the deviation panel on screen and runs the first sweep;
-        the ⟳ button then re-runs it in place, so judging an adjustment no
-        longer means toggling the mode off and on (which threw away the
-        measurement you wanted to compare against).
-        """
-        if not on:
-            self._close_align_mode()
-            self.status.showMessage("Alignment mode off.", 2500)
-            return
-        if not self._start_align_sweep():
-            self._uncheck_align_spec()
-            return
-        self.canvas.set_dev_visible(True)
-        self.btn_align_refresh.show()
-        self._position_panel_buttons()
-
-    def _start_align_sweep(self):
-        """Run one alignment sweep. False if it could not be started — the
-        caller that was also opening the mode then does not open it.
-
-        Every refusal below leaves the hardware exactly as it found it; the
-        feed, which has to be handed over before the worker can drive the
-        devices, is the only thing with any unwinding to do.
-        """
-        if self._align_running():
-            return False
-        if self._scan_running():
-            self.status.showMessage("A scan is running — the stage is busy.", 3000)
-            return False
-        if self.spec is None or self.stage is None:
-            self.status.showMessage("Connect a stage and a spectrometer first.", 4000)
-            return False
-        if getattr(self.stage, "needs_homing", False):
-            self.status.showMessage(
-                "Stage is not homed — press Home before an alignment sweep.", 6000)
-            return False
-
-        # Same handover contract as _start_scan: the worker drives the stage
-        # and the spectrometer for the whole sweep, so the feed has to let go
-        # of them first, and refusing beats running against a device the feed
-        # thread is still inside.
-        self._feed_was_on = self.btn_feed.isChecked()
-        if not self._feed.pause():
-            if self._feed_was_on:
-                self._feed.resume()
-            self.status.showMessage(f"Alignment not started — {FEED_BUSY_MSG}", 6000)
-            return False
-
-        # Only now is it safe to read the stage from this thread — the feed is
-        # parked, so nothing else is talking to it. Checked BEFORE moving:
-        # clamping a target would quietly destroy the +/- symmetry the whole
-        # measurement is about, so an out-of-range sweep is refused instead.
-        step = self.dlg_align.step_fs
-        pf   = self.scan_cfg.pass_factor
-        try:
-            start_um = _stage_to_um(self.stage.get_position())
-        except Exception as e:
-            if self._feed_was_on:
-                self._feed.resume()
-            self.status.showMessage(f"Alignment failed — stage: {e}", 5000)
-            return False
-        span_um = abs(float(delay_to_position_um(2.0 * step, 0.0, pf)))
-        lo, hi = self._travel_range_um()
-        if start_um - span_um < lo or start_um + span_um > hi:
-            if self._feed_was_on:
-                self._feed.resume()
-            self.status.showMessage(
-                f"±2×{step:.0f} fs (±{span_um:.1f} um) from here leaves the "
-                f"travel range [{lo:.1f}, {hi:.1f}] um — move away from the "
-                f"limit or reduce the Alignment Step.", 7000)
-            return False
-
-        self._set_hardware_buttons_enabled(False)
-        self.btn_scan.setEnabled(False)
-        self._set_stage_controls_enabled(False)
-        self.btn_align_spec.setEnabled(False)
-        self.btn_align_refresh.setEnabled(False)
-        self._moving(True)
-
-        self._align_worker = AlignmentWorker(self.stage, self.spec,
-                                             self.scan_cfg, step)
-        self._align_worker.progress.connect(self._on_align_progress)
-        self._align_worker.done.connect(self._on_align_done)
-        self._align_worker.error.connect(self._on_align_error)
-        self._align_worker.start()
-        self.status.showMessage(
-            f"Alignment sweep: −{2 * step:.0f}, −{step:.0f}, "
-            f"+{step:.0f}, +{2 * step:.0f} fs…", 0)
-        return True
-
-    def _on_align_progress(self, done, total):
-        self.status.showMessage(f"Alignment sweep: point {done}/{total}…", 0)
-
-    def _on_align_done(self, results):
-        """Slot for AlignmentWorker.done — results in offset order."""
-        self._reset_align_ui()
-        try:
-            # Corrected through exactly the path the spectrum panel uses, each
-            # frame with ITS OWN member frames, so the differences sit on the
-            # displayed baseline rather than a second derivation of it.
-            s = [np.asarray(self._corrected_frame(raw, frames), float)
-                 for raw, frames in results]
-            wl = np.asarray(self.spec.wavelengths, float)
-            d1 = s[2] - s[1]        # S(+x)  - S(-x)
-            d2 = s[3] - s[0]        # S(+2x) - S(-2x)
-        except Exception as e:
-            # The MODE stays open: the panel is still the right place to look,
-            # the previous sweep (if any) is still on it, and ⟳ is how you try
-            # again. Closing it here would throw away the comparison the
-            # operator was in the middle of making.
-            self.status.showMessage(f"Alignment differences failed: {e}", 5000)
-            return
-        self.canvas.show_diff(wl, d1, d2)
-        step = self.dlg_align.step_fs
-        # Peak absolute imbalance as a fraction of the largest measured signal:
-        # the one number that says "symmetric" or "not" without reading the
-        # curves off the panel.
-        scale = max(float(max(np.max(np.abs(x)) for x in s)), 1e-12)
-        r1 = float(np.max(np.abs(d1))) / scale
-        r2 = float(np.max(np.abs(d2))) / scale
-        self.status.showMessage(
-            f"Alignment: peak asymmetry {100 * r1:.1f}% at ±{step:.0f} fs, "
-            f"{100 * r2:.1f}% at ±{2 * step:.0f} fs.", 8000)
-
-    def _on_align_error(self, msg):
-        # Mode left open, for the reason in _on_align_done: a sweep that failed
-        # is a reason to fix something and press ⟳, not to lose the panel.
-        self._reset_align_ui()
-        self.status.showMessage(f"Alignment sweep failed: {msg}", 6000)
-
-    def _reset_align_ui(self):
-        """Hand the devices back and re-enable what the sweep locked out."""
-        self._moving(False)
-        self._set_hardware_buttons_enabled(True)
-        self.btn_scan.setEnabled(True)
-        self._set_stage_controls_enabled(True)
-        self.btn_align_spec.setEnabled(True)
-        self.btn_align_refresh.setEnabled(True)
-        self._refresh_positions()
-        if self._feed_was_on:
-            self._feed.resume()
-
-    # ── Alignment mode: raw stitched trace ───────────────────────────────────
-    def _position_panel_buttons(self):
-        """Lay out each panel's header row: the buttons that act on that panel,
-        on the line the panel title occupies.
-
-        Two groups per panel. Most buttons are right-aligned to the panel's
-        right edge. The two that describe the Y AXIS — the auto-scale padlock
-        and the log/linear toggle — are packed immediately AFTER the title
-        instead, so they read as part of that panel's name rather than as two
-        more entries in a row of six; the clear span between the two groups is
-        what separates "what this panel's y axis is doing" from "things you can
-        do to this panel".
-
-        Every edge here moves with the split fraction, the window size and the
-        layout mode, so this runs off canvas.axes_relaid — and off the refresh
-        methods that show or hide a button, because each row is packed from its
-        own edge and its width depends on which buttons are visible.
-        """
-        # getattr, not the attribute: the refresh methods that call this also
-        # run from _apply_spectrometer, which the connect paths can reach
-        # before _build_ui has created any of these buttons.
-        if getattr(self, "pnl_no_spec", None) is None:
-            return
-        c = self.canvas
-
-        def _row_y(top):
-            # The band sits ABOVE the axes: HDR_PAD of clear space between the
-            # buttons' bottom edge and the top spine.
-            return round(top) - HDR_PAD - HDR_BTN
-
-        def pack(ax, buttons):
-            """Right-align `buttons` to the panel's right edge. Returns the x of
-            the leftmost one placed, which is where the clear span before it
-            begins."""
-            _left, top, right = c.panel_edges_px(ax)
-            y = _row_y(top)
-            x = round(right) - 6
-            for b in reversed(buttons):
-                # isHidden, not isVisible: isVisible() is False for every child
-                # until the top-level window itself is shown, so packing on it
-                # skipped the whole row on the layout passes that run during
-                # __init__ and left the buttons piled at (0, 0) until something
-                # else happened to trigger a relayout.
-                if b.isHidden():
-                    continue      # hidden buttons take no room in the row
-                x -= b.width()
-                b.move(x, y)
-                x -= HDR_GAP
-            return x + HDR_GAP        # undo the trailing gap
-
-        def pack_after_title(ax, buttons, limit):
-            """Lay `buttons` out left to right starting just past the title.
-
-            `limit` is the x the group must not reach — the leftmost button of
-            the right-hand group. On a narrow panel the whole group slides left
-            to respect it, over the title if it has to: a control half off the
-            panel edge, or overlapping a row it does not belong to, is worse
-            than one sitting on its own title for the few pixels it takes.
-            """
-            _left, top, _right = c.panel_edges_px(ax)
-            y = _row_y(top)
-            start = round(c.title_right_px(ax)) + HDR_TITLE_GAP
-            shown = [b for b in buttons if not b.isHidden()]
-            if not shown:
-                return
-            width = sum(b.width() for b in shown) + HDR_GAP * (len(shown) - 1)
-            start = min(start, round(limit) - HDR_GROUP_GAP - width)
-            x = max(start, 0)
-            for b in shown:
-                b.move(x, y)
-                x += b.width() + HDR_GAP
-
-        spec_right = pack(
-            c.ax_spec, [self.btn_autofit, self.btn_feed, self.btn_freeze,
-                        self.btn_refshow, self.btn_autostitch,
-                        self.btn_overlay, self.btn_align_spec,
-                        self.btn_align_refresh])
-        pack(c.ax_trace, [self.btn_align_trace, self.btn_symmetry])
-        # The y-axis pair, tucked against the title it qualifies. Padlock first:
-        # it is the one that changes what the axis DOES, the scale toggle only
-        # how it is drawn.
-        pack_after_title(c.ax_spec, [self.btn_autoscale, self.btn_logscale],
-                         spec_right)
-
-        # The "no spectrometer connected" panel, stretched over the whole
-        # spectrum axes so it reads as the empty plot itself rather than a card
-        # floating in it. It is laid out only here — it has no parent layout to
-        # do that for it.
-        self.pnl_no_spec.setGeometry(c.panel_rect_px(c.ax_spec))
-
-    def _refresh_autofit_icon(self):
-        """Per-theme mark on the one-shot auto-fit button, with the text
-        fallback it used to carry if the icons are missing from the bundle."""
-        icon = RESCALE_ICON[self._theme]
-        if icon.exists():
-            self.btn_autofit.setIcon(QIcon(str(icon)))
-            self.btn_autofit.setText("")
-        else:
-            self.btn_autofit.setIcon(QIcon())
-            self.btn_autofit.setText("↔↕")
-
-    def _refresh_autoscale_icon(self):
-        """Padlock matching the axis' CURRENT state — open while it follows the
-        data, shut while it is frozen. Per theme, and re-read on every state
-        change, so this is called from _refresh_autoscale_button rather than
-        only from the theme switch."""
-        on = bool(self.canvas.autoscale_y)
-        icon = (UNLOCKED_ICON if on else LOCKED_ICON)[self._theme]
-        if icon.exists():
-            self.btn_autoscale.setIcon(QIcon(str(icon)))
-            self.btn_autoscale.setText("")
-        else:
-            self.btn_autoscale.setIcon(QIcon())
-            self.btn_autoscale.setText("🔓" if on else "🔒")
-
-    def _refresh_freeze_icon(self):
-        """The + mark, drawn from the live PALETTE so a theme switch reruns it
-        — same arrangement as the feed button's play/stop glyph."""
-        self.btn_freeze.setIcon(_glyph_icon("plus", PALETTE["accent"]))
-
-    def _freeze_reference(self):
-        """Capture the spectrum panel as it stands.
-
-        Replaces any reference already held rather than refusing: this button is
-        reached for after every adjustment, and making that "drop, then freeze"
-        would be two presses for the one thing anyone ever wants.
-        """
-        if not self.canvas.freeze_reference():
-            self.status.showMessage(
-                "Nothing on the spectrum panel to freeze yet.", 4000)
-            return
-        self.status.showMessage(
-            "Spectrum frozen as a grey reference — press + again to replace "
-            "it, the eye to hide it, or right-click + to drop it.", 6000)
-
-    def _toggle_reference(self):
-        self.canvas.set_reference_visible(not self.canvas.reference_shown())
-
-    def _clear_reference(self):
-        """Right-click on +. Silent when there is nothing held: a right-click
-        that reports having done nothing is just noise."""
-        if self.canvas.has_reference():
-            self.canvas.clear_reference()
-            self.status.showMessage("Reference spectrum dropped.", 3000)
-
-    def _refresh_reference_button(self):
-        """Visibility, icon and tooltip of the reference's hide/show toggle.
-
-        The icon shows the ACTION its two files were drawn for (see SHOW_ICON):
-        a reference on screen offers the struck-through eye, a hidden one the
-        open eye.
-        """
-        c = self.canvas
-        have = c.has_reference()
-        self.btn_refshow.setVisible(have)
-        if have:
-            shown = c.reference_shown()
-            icon = (HIDE_ICON if shown else SHOW_ICON)[self._theme]
-            if icon.exists():
-                self.btn_refshow.setIcon(QIcon(str(icon)))
-                self.btn_refshow.setText("")
-            else:
-                self.btn_refshow.setIcon(QIcon())
-                self.btn_refshow.setText("◉" if shown else "○")
-            self.btn_refshow.setToolTip(
-                "Hide the frozen reference spectrum" if shown else
-                "Show the frozen reference spectrum")
-        # Its visibility just changed, and the header row is packed
-        # right-to-left around whatever is showing.
-        self._position_panel_buttons()
-
-    def _refresh_logscale_button(self):
-        """Label and tooltip of the log/linear toggle. Reads the checkbox, not
-        the axes: chk_log is the single source of truth for the scale."""
-        on = self.dlg_graphics.log_scale
-        self.btn_logscale.setText("log" if on else "lin")
-        self.btn_logscale.setToolTip(
-            "Spectrum Y axis is LOGARITHMIC — click for linear." if on else
-            "Spectrum Y axis is LINEAR — click for logarithmic.")
-
-    def _on_autoscale_clicked(self):
-        """Toggle the spectrum panel's auto-scale.
-
-        Routed through the canvas' own reset_axes rather than set_autoscale_y:
-        that is exactly what a right-click on the panel does, so the button and
-        the right-click cannot end up meaning different things. It emits
-        limits_changed on the way out, which is what puts the button's own
-        checked state back in agreement with the canvas — including when the
-        canvas refuses to move.
-        """
-        self.canvas.reset_axes(self.canvas.ax_spec)
-
-    def _refresh_autoscale_button(self):
-        """Show the canvas' auto-scale state on the header toggle.
-
-        Signals blocked: this is called FROM limits_changed, which reset_axes
-        emits, so letting the setChecked re-enter the click handler would
-        toggle the mode straight back off again.
-        """
-        on = bool(self.canvas.autoscale_y)
-        with QSignalBlocker(self.btn_autoscale):
-            self.btn_autoscale.setChecked(on)
-        self._refresh_autoscale_icon()   # the padlock IS the state readout
-        self.btn_autoscale.setToolTip(
-            ("Y axis UNLOCKED — the spectrum's Y axis follows the live signal.\n"
-             "Click to lock it where it is."
-             if on else
-             "Y axis LOCKED — the spectrum's Y axis stays where it is.\n"
-             "Click to unlock it: fit the data, then follow it.")
-            + "\n" + RIGHT_CLICK_HINT)
-
-    def _refresh_align_refresh_icon(self):
-        """Per-theme mark on the re-run button, with the usual text fallback."""
-        icon = REFRESH_ICON[self._theme]
-        if icon.exists():
-            self.btn_align_refresh.setIcon(QIcon(str(icon)))
-            self.btn_align_refresh.setText("")
-        else:
-            self.btn_align_refresh.setIcon(QIcon())
-            self.btn_align_refresh.setText("⟳")
-
-    def _refresh_align_button(self):
-        """Per-theme crosshair on the alignment-sweep toggle.
-
-        Unlike the overlay and layout buttons this one depicts a MODE, so the
-        mark does not change with the button's state — only with the theme,
-        each file carrying that theme's accent. Falls back to the Δ it used to
-        show if the icons are missing from the bundle.
-        """
-        icon = ALIGN_ICON[self._theme]
-        if icon.exists():
-            self.btn_align_spec.setIcon(QIcon(str(icon)))
-            self.btn_align_spec.setText("")
-        else:
-            self.btn_align_spec.setIcon(QIcon())
-            self.btn_align_spec.setText("Δ")
-
-    def _refresh_feed_button(self):
-        """Icon, colour and tooltip of the live-feed toggle.
-
-        Like the theme and layout buttons it advertises the CURRENT state, not
-        the state a click produces: a running feed is the red stop square, a
-        stopped one the accent play triangle. Both glyphs are drawn from the
-        live PALETTE, so a theme switch re-generates them.
-        """
-        running = self.btn_feed.isChecked()
-        self.btn_feed.setIcon(_glyph_icon(
-            "stop" if running else "play",
-            PALETTE["danger"] if running else PALETTE["accent"]))
-        self.btn_feed.setToolTip("Stop the live spectrum feed" if running
-                                 else "Start the live spectrum feed")
-        # Colour via objectName + repolish, not setStyleSheet, so a later theme
-        # switch restyles it along with everything else.
-        name = "overlaydanger" if running else "overlay"
-        if self.btn_feed.objectName() != name:
-            self.btn_feed.setObjectName(name)
-            self.btn_feed.style().unpolish(self.btn_feed)
-            self.btn_feed.style().polish(self.btn_feed)
-
-    def _refresh_align_trace_button(self):
-        """Show the RAW toggle only for a stitched pair, and only enable it
-        once there is a scan whose raw member columns were recorded."""
-        stitched = self._pair_live()
-        self.btn_align_trace.setVisible(stitched)
-        self._position_panel_buttons()   # visibility drives the header row
-        if not stitched:
-            return
-        ready = self._align_trace is not None
-        self.btn_align_trace.setEnabled(ready)
-        self.btn_align_trace.setToolTip(
-            "Raw counts — no calibration, no dark subtraction. Each "
-            "spectrometer is normalised to its own maximum and the two are "
-            "cut (not blended) at the middle of the overlap, so features "
-            "buried in the background show up.\nDisplay only: the recorded "
-            "trace and every export are unaffected."
-            if ready else
-            "Run a scan first — the raw per-spectrometer columns are recorded "
-            "as it goes.")
-
-    def _on_align_trace_toggled(self, on):
-        if on and self._align_trace is None:
-            self.btn_align_trace.blockSignals(True)
-            self.btn_align_trace.setChecked(False)
-            self.btn_align_trace.blockSignals(False)
-            self.status.showMessage(
-                "No raw trace yet — run a scan in multi-spectrometer mode.", 4000)
-            return
-        self._align_trace_on = bool(on)
-        if self._align_trace_on and self.btn_symmetry.isChecked():
-            self._clear_symmetry()      # one trace-view mode at a time
-        # Re-render at once rather than waiting for the next column, so the
-        # toggle also works on a finished trace.
-        if self._align_trace_on:
-            self.canvas.update_trace(self._align_trace_view(), 1.0)
-        elif self._scan_trace is not None:
-            self.canvas.update_trace(self._scan_trace, self._scan_peak)
-        self.status.showMessage(
-            "FROG trace: raw counts, per-spectrometer normalised." if on else
-            "FROG trace: calibrated, stitched.", 4000)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     # ── Symmetry mode ────────────────────────────────────────────────────────
     def _symmetry_center(self, ac, delays):
@@ -3297,224 +1282,17 @@ class FrogWindow(QMainWindow):
                  / total) if total > 0 else 0.0
         return out, peak, score, fold
 
-    def _current_symmetry_view(self):
-        """The symmetry view of the finished scan, or None if there is none."""
-        if self.result is None:
-            return None
-        return self._symmetry_view(self._result_view, self._result_ac,
-                                   self.result.delays_fs)
 
-    def _show_symmetry(self):
-        """Push the symmetry view, its fold line and its score to the canvas."""
-        view = self._current_symmetry_view()
-        if view is None:
-            return
-        data, peak, score, fold = view
-        with self.canvas.batch():
-            self.canvas.update_trace(data, peak)
-            self.canvas.set_fold_line(fold)
-            self.canvas.set_symmetry_score(
-                f"Asymmetry  {100 * score:.2f} %   @ {fold:+.0f} fs")
 
-    def _on_fold_dragged(self, x_fs):
-        """The fold line was dragged. Re-render only when it has actually
-        changed COLUMN: a drag reports every pixel it crosses, and recomputing
-        a trace-sized difference for a move that lands on the same column would
-        be work with nothing to show for it."""
-        if self.result is None or not self._symmetry_on:
-            return
-        before = self._symmetry_center(self._result_ac, self.result.delays_fs)
-        self._fold_fs = float(x_fs)
-        after = self._symmetry_center(self._result_ac, self.result.delays_fs)
-        if after != before:
-            self._show_symmetry()
 
-    def _on_fold_reset(self):
-        """Double-click on the line: back to the autocorrelation peak."""
-        if self._fold_fs is None or not self._symmetry_on:
-            return
-        self._fold_fs = None
-        self._show_symmetry()
-        self.status.showMessage("Fold line back on the autocorrelation peak.", 3000)
 
-    def _refresh_symmetry_button(self, running=None):
-        """Enable the symmetry toggle only when there is a finished scan to fold.
 
-        A scan in progress is excluded even though self.result may still hold the
-        PREVIOUS one: the panel is showing the new trace being filled in, and a
-        symmetry view of the old result over the top of it would be a picture of
-        something the operator is no longer looking at.
 
-        `running` overrides the inferred state at the two moments _scan_running()
-        cannot answer for it. A scan about to start has not created its worker
-        yet, so the flag still describes the PREVIOUS scan and reads False; and
-        _reset_scan_ui runs from the worker's own finished signal, by which point
-        the QThread has not necessarily left run() and it reads True. Inferring
-        at either would leave the button in the wrong state until some unrelated
-        refresh happened along.
-        """
-        if running is None:
-            running = self._scan_running()
-        ready = self.result is not None and not running
-        self.btn_symmetry.setEnabled(ready)
-        self.btn_symmetry.setToolTip(
-            "Symmetry mode — the measured trace left of the fold line, and "
-            "|T(+d) − T(−d)| right of it: how far the two temporal halves are "
-            "from being each other's mirror image.\nBoth halves share one "
-            "colour scale, so a dark right half genuinely means a symmetric "
-            "trace. The corner readout is the asymmetry as a fraction of the "
-            "whole trace.\nThe line starts on the autocorrelation peak — drag "
-            "it to fold somewhere else, double-click it to put it back.\n"
-            "Display only: the recorded trace and every export are unaffected."
-            if ready else
-            "Run a scan first — symmetry mode folds a finished trace about its "
-            "autocorrelation peak.")
 
-    def _on_symmetry_toggled(self, on):
-        # Switching the mode re-centres the fold, in BOTH directions. A
-        # hand-dragged position belongs to the look the operator was taking at
-        # the time; turning the mode off ends that look, so coming back to it
-        # should start from the autocorrelation peak rather than resurrect a
-        # fold placed for a question already answered. Before the view is
-        # computed on the next line, so the `on` path folds about the peak.
-        self._fold_fs = None
-        view = self._current_symmetry_view() if on else None
-        if on and view is None:
-            self.btn_symmetry.blockSignals(True)
-            self.btn_symmetry.setChecked(False)
-            self.btn_symmetry.blockSignals(False)
-            self.status.showMessage("No finished scan to fold yet.", 4000)
-            return
-        self._symmetry_on = bool(on)
-        if self._symmetry_on and self.btn_align_trace.isChecked():
-            # One trace-view mode at a time: both write the same image, so the
-            # last one switched on would silently win on the next re-render.
-            self.btn_align_trace.blockSignals(True)
-            self.btn_align_trace.setChecked(False)
-            self.btn_align_trace.blockSignals(False)
-            self._align_trace_on = False
-            self._refresh_align_trace_button()
-        if self._symmetry_on:
-            self._show_symmetry()
-        else:
-            self.canvas.set_fold_line(None)
-            self.canvas.set_symmetry_score("")
-            self._restore_trace_view()
-        self.status.showMessage(
-            "Symmetry — measured trace left of the fold, |T(+d) − T(−d)| "
-            "right of it. Drag the line to move it, double-click to re-centre."
-            if on else "FROG trace: measured counts.", 6000)
 
-    def _restore_trace_view(self):
-        """Put the ordinary trace back after a display mode is switched off."""
-        if self.result is not None:
-            self.canvas.update_trace(self._result_view)
-        elif self._scan_trace is not None:
-            self.canvas.update_trace(self._scan_trace, self._scan_peak)
 
-    def _clear_symmetry(self, running=None):
-        """Drop out of symmetry mode. Called when a scan starts: the fold line
-        belongs to the result it was computed from, and the panel is about to
-        start showing a different trace entirely."""
-        if self.btn_symmetry.isChecked():
-            self.btn_symmetry.blockSignals(True)
-            self.btn_symmetry.setChecked(False)
-            self.btn_symmetry.blockSignals(False)
-        self._symmetry_on = False
-        # A hand-placed fold belongs to the trace it was placed on, so a new
-        # scan starts back on the autocorrelation peak.
-        self._fold_fs = None
-        self.canvas.set_fold_line(None)
-        self.canvas.set_symmetry_score("")
-        self._refresh_symmetry_button(running)
 
-    def _init_align_trace(self, wl, n_delays):
-        """Allocate the raw trace for a scan about to start, or drop it.
 
-        The cut is fixed HERE, for the whole scan: every column is
-        interpolated and sliced on arrival, so moving the overlap band
-        mid-scan cannot retroactively re-cut what is already stored. The next
-        scan picks up wherever the band has been left.
-        """
-        spec = self.spec
-        if not isinstance(spec, StitchedSpectrometer):
-            self._clear_align_trace()
-            return
-        w = np.asarray(wl, float)
-        cut = 0.5 * (spec.band_lo_nm + spec.band_hi_nm)
-        # Below the cut comes from spec1 (the bluer member), above from spec2.
-        # Neither half extrapolates: the common grid starts at spec1's first
-        # pixel, and the cut sits inside the overlap, so spec2 covers w[k:].
-        self._align_cut   = int(np.searchsorted(w, cut))
-        self._align_trace = np.zeros((w.size, n_delays), np.float32)
-        self._align_view  = None
-        self._align_peak  = [0.0, 0.0]
-        self._align_wl    = [np.asarray(m.wavelengths, float) for m in spec.members]
-        self._refresh_align_trace_button()
-
-    def _store_align_column(self, i, members_raw):
-        """Fold one column's member frames into the raw trace. O(n_wl).
-
-        The recorded dark comes off each member BEFORE interpolation, at member
-        level, because that is the only place it can be taken off without
-        involving either calibration or the crossfade — which is the whole point
-        of this view. Everything else stays raw: no calibration, no stitch
-        factor, a hard cut rather than a blend, each half on its own scale.
-        """
-        if self._align_trace is None or members_raw is None:
-            return
-        w = self._scan_wl
-        k = self._align_cut
-        wl1, wl2 = self._align_wl
-        m1, m2 = (np.asarray(f, float) for f in members_raw)
-        darks = self._scan_member_dark
-        if darks is not None and len(darks) == 2:
-            d1, d2 = (np.asarray(d, float) for d in darks)
-            if d1.shape == m1.shape and d2.shape == m2.shape:
-                m1 = m1 - d1
-                m2 = m2 - d2
-        lo = np.interp(w[:k], wl1, m1)
-        hi = np.interp(w[k:], wl2, m2)
-        self._align_trace[:k, i] = lo
-        self._align_trace[k:, i] = hi
-        if lo.size:
-            self._align_peak[0] = max(self._align_peak[0], float(lo.max()))
-        if hi.size:
-            self._align_peak[1] = max(self._align_peak[1], float(hi.max()))
-
-    def _align_trace_view(self):
-        """The raw trace with each member's half normalised to its own max.
-
-        Normalisation happens HERE, not when a column is stored: the two
-        maxima only grow as a scan runs, so scaling on arrival would leave
-        every earlier column on a stale factor. Written into a reused buffer —
-        this runs once per column during a live scan.
-        """
-        raw = self._align_trace
-        k   = self._align_cut
-        if self._align_view is None or self._align_view.shape != raw.shape:
-            self._align_view = np.empty_like(raw)
-        buf = self._align_view
-        np.divide(raw[:k], max(self._align_peak[0], 1.0), out=buf[:k])
-        np.divide(raw[k:], max(self._align_peak[1], 1.0), out=buf[k:])
-        return buf
-
-    def _clear_align_trace(self):
-        """Forget the raw trace and drop out of the raw view.
-
-        Called on a device swap: a raw trace belongs to the pair that measured
-        it — its cut, its grid and its two normalisations all describe those
-        two spectrometers.
-        """
-        self._align_trace = None
-        self._align_view  = None
-        self._align_peak  = [0.0, 0.0]
-        if self.btn_align_trace.isChecked():
-            self.btn_align_trace.blockSignals(True)
-            self.btn_align_trace.setChecked(False)
-            self.btn_align_trace.blockSignals(False)
-        self._align_trace_on = False
-        self._refresh_align_trace_button()
 
     # Whether the live feed is meant to be running. The toolbar button is the
     # one piece of state that answers that, but callers outside this file (the
@@ -3530,181 +1308,10 @@ class FrogWindow(QMainWindow):
         the button's icon and its tooltip all follow."""
         self.btn_feed.setChecked(bool(on))
 
-    def _toggle_feed(self, on):
-        if on:
-            # During a scan the worker owns the hardware; arm the feed and let
-            # _reset_scan_ui start it once the scan hands the devices back.
-            if not self._scan_running():
-                self._feed.resume()
-        else:
-            self._feed.pause()
-        self._refresh_feed_button()
 
-    def _apply_integration_time(self):
-        """Push the (debounced) integration time(s) to the spectrometer.
 
-        A stitched pair takes one value per member, from the S1/S2 spinboxes
-        in slot order; anything else takes the single spinbox. Both boxes
-        share this one debounce, so editing them together costs a single feed
-        handover.
-        """
-        if self._scan_running():
-            self.status.showMessage(
-                "A scan is running — integration time applies to the next scan.", 4000)
-            return
-        if not self._have_spec():
-            return
-        slots = self._slot_members() if self._pair_live() else []
-        changed = []
-        with self._device_lock() as ok:
-            if not ok:
-                self.status.showMessage(FEED_BUSY_MSG, 4000)
-                return
-            try:
-                if len(slots) == 2:
-                    for i, (mem, spin) in enumerate(
-                            zip(slots, (self.spin_integration,
-                                        self.spin_integration2))):
-                        ms = float(spin.value())
-                        # Compared at the box's own resolution, not exactly:
-                        # the Avantes stores the exposure as a C float, so
-                        # 0.02 ms reads back as 0.019999999552965164 and an
-                        # equality test would rewrite both devices — and take
-                        # a feed handover — every time the debounce fired.
-                        dp = spin.decimals()
-                        if round(_exposure_ms(mem), dp) == round(ms, dp):
-                            continue   # already there — don't disturb the device
-                        self.spec.set_member_integration_time(
-                            self.spec.member_index(mem), ms)
-                        changed.append(f"S{i + 1} {ms:g} ms")
-                else:
-                    ms = float(self.spin_integration.value())
-                    # Same resolution-limited compare as the pair branch above,
-                    # and for the same reason — but here it also decides whether
-                    # the dark is thrown away, so a debounce that fires without
-                    # the value having moved must not cost the operator a dark.
-                    dp = self.spin_integration.decimals()
-                    if round(_exposure_ms(self.spec), dp) != round(ms, dp):
-                        self.spec.set_integration_time(ms)
-                        changed.append(f"{ms:g} ms")
-            except Exception as e:
-                self.status.showMessage(f"Integration time failed: {e}", 5000)
-                return
-        if not changed:
-            return
-        # Signal scales with exposure, so the counts axis is now the wrong size
-        # — dropping the exposure 10x leaves the trace in the bottom tenth of
-        # the panel. Refit once, on the next frame rather than now: the frame on
-        # screen was taken at the OLD exposure and fitting to it would just
-        # reproduce the range being escaped.
-        self._pending_rescale = True
-        # And drop the frame already in flight for the same reason — it was
-        # acquired before the device was rewritten, so the fit must not land on
-        # it. Latest-frame-wins means nothing else is waiting behind it.
-        self._live_frame = None
-        # A dark holds the pedestal of the exposure it was taken at, so it is
-        # now wrong — on a single device as much as on a pair, which used to go
-        # unmentioned entirely.
-        had_dark = (self.background is not None
-                    or self.background_members is not None)
-        if len(slots) == 2:
-            # Frames stay in raw counts, so stitch_factor now carries the wrong
-            # exposure ratio and the seam will show. Say so rather than let the
-            # user discover it in the data.
-            self._stitch_stale = True
-            self.status.showMessage(
-                f"{', '.join(changed)} — the two spectrometers no longer "
-                f"share a scale; re-run Auto-stitch (⇌ above the spectrum, or "
-                f"the Spectrometer window).", 8000)
-        if had_dark:
-            # Last, so its persistent message is the one left standing.
-            self._invalidate_dark(f"integration time changed to "
-                                  f"{', '.join(changed)}")
 
-    def _capture_dark(self):
-        """Record the dark from a FRESH frame.
 
-        Always acquires rather than reusing self.last_spectrum: that field only
-        moves while the display ticks, so with the feed stopped it holds the
-        last LIT frame and "Record Dark" recorded the light. Acquiring also
-        means the merged frame and the member frames come from one exposure
-        instead of two different ones.
-        """
-        if self._scan_running():
-            self.status.showMessage("A scan is running — spectrometer is busy.", 3000)
-            return
-        if not self._have_spec():
-            self.status.showMessage("Connect a spectrometer first.", 4000)
-            return
-        with self._device_lock() as ok:
-            if not ok:
-                self.status.showMessage(FEED_BUSY_MSG, 4000)
-                return
-            try:
-                frame = np.asarray(self.spec.acquire(), float)
-            except Exception as e:
-                self.status.showMessage(f"Dark capture failed: {e}", 5000)
-                return
-            # Inside the lock: the frames belong to the acquire above, and the
-            # feed must not overwrite last_member_raw before we have copied it.
-            members = self._slot_members()
-            frames = getattr(self.spec, "last_member_raw", None)
-            if len(members) == 2 and frames is not None:
-                # Stored positionally in self.spec.members order — NOT keyed by
-                # id(), which is recycled across reconnects; _apply_spectrometer
-                # clears the field on every swap, so the order cannot go stale.
-                self.background = None
-                self.background_members = tuple(np.asarray(f, float).copy()
-                                                for f in frames)
-                exposures = tuple(_exposure_ms(m) for m in self.spec.members)
-                where = ", ".join(
-                    f"S{i + 1} {_exposure_ms(m):g} ms"
-                    for i, m in enumerate(members))
-            else:
-                self.background = frame
-                self.background_members = None
-                exposures = (_exposure_ms(self.spec),)
-                where = f"{_exposure_ms(self.spec):g} ms"
-        self.background_exposures = exposures
-        self.last_spectrum = frame
-        self._dark_member_warned = False
-        self.chk_dark.setEnabled(True); self.chk_dark.setChecked(True)
-        self.status.showMessage(f"Dark recorded — {where}.", 4000)
-
-    def _invalidate_dark(self, reason):
-        """Throw the recorded dark away and say why.
-
-        Used when something changes what a frame CONTAINS — an exposure, or an
-        Avantes on-board correction. A dark is offset + dark-current x t, so
-        rescaling it by an exposure ratio is wrong in general and would leave a
-        plausible-looking but incorrect baseline; better to have none. No-op
-        when there is nothing recorded, so callers need not check.
-
-        Not needed for a stitch-factor or overlap-band change: the merged dark
-        is derived from the member frames, so it follows both on its own.
-        """
-        if (self.background is None and self.background_members is None):
-            return
-        self.background = None
-        self.background_members = None
-        self.background_exposures = None
-        self._dark_member_warned = False
-        self.chk_dark.setChecked(False); self.chk_dark.setEnabled(False)
-        # Timeout 0 — a silently dropped dark is exactly the kind of thing that
-        # should not scroll away before the operator looks up.
-        self.status.showMessage(f"Dark discarded — {reason}. Re-record it.", 0)
-
-    def _set_hardware_buttons_enabled(self, on):
-        """Every route to a device swap, locked together.
-
-        A scan and an alignment sweep both capture the stage and spectrometer
-        for their duration, so nothing may connect, disconnect or simulate
-        underneath them — and that is now five buttons across the toolbar and
-        the two side panels rather than the one it used to be.
-        """
-        for w in (self.btn_spec_dlg, self.btn_stage_dlg, self.btn_sim_dlg,
-                  self.btn_connect_spec, self.btn_connect_stage):
-            w.setEnabled(on)
 
     # ── Manual stage ──────────────────────────────────────────────────────────
     def _set_stage_controls_enabled(self, on):
@@ -3713,22 +1320,6 @@ class FrogWindow(QMainWindow):
                   self.btn_units, self.spin_backlash):
             w.setEnabled(on)
 
-    def _size_moving_label(self):
-        """Reserve the width of the WIDER of the stage label's two states.
-
-        The label shows "IDLE" at rest, so its own size hint asks for four
-        characters — and the layout, which has no reason to expect a fifth,
-        hands it exactly that when the row is tight. "MOVING" then does not fit,
-        and because the label is centred it is clipped at both ends, which is
-        what turned it into "OVING".
-
-        Measured rather than hard-coded: the #idle/#moving rules set the size
-        and weight in the stylesheet, so the number changes with the theme —
-        hence the call from _apply_theme as well as from the build.
-        """
-        fm = self.lbl_moving.fontMetrics()
-        # +4: QLabel's own text margin, which fontMetrics does not include.
-        self.lbl_moving.setMinimumWidth(fm.horizontalAdvance("MOVING") + 4)
 
     def _moving(self, on):
         self.lbl_moving.setText("MOVING" if on else "IDLE")
@@ -3756,7 +1347,7 @@ class FrogWindow(QMainWindow):
         self._set_stage_controls_enabled(False)
         self._moving(True)
         try:
-            with self._device_lock() as ok:
+            with self.devices.device_lock() as ok:
                 if not ok:
                     self.status.showMessage(FEED_BUSY_MSG, 5000)
                     return
@@ -3790,8 +1381,8 @@ class FrogWindow(QMainWindow):
         adapter reports none.
         """
         t = getattr(self.stage, "travel_mm", None)
-        hi = _stage_to_um(t if t else 300.0)
-        lo = _stage_to_um(float(getattr(self.stage, "travel_min_mm", 0.0) or 0.0)
+        hi = stage_to_um(t if t else 300.0)
+        lo = stage_to_um(float(getattr(self.stage, "travel_min_mm", 0.0) or 0.0)
                           + float(getattr(self.stage, "backlash_mm", 0.0) or 0.0))
         return lo, hi
 
@@ -3819,7 +1410,7 @@ class FrogWindow(QMainWindow):
 
         Blocks signals: this reflects the stage, it must not write back to it.
         """
-        b_um = _stage_to_um(float(getattr(self.stage, "backlash_mm", 0.0) or 0.0))
+        b_um = stage_to_um(float(getattr(self.stage, "backlash_mm", 0.0) or 0.0))
         self.spin_backlash.blockSignals(True)
         self.spin_backlash.setValue(b_um)
         self.spin_backlash.blockSignals(False)
@@ -3843,7 +1434,7 @@ class FrogWindow(QMainWindow):
             return
         # Plain attribute write, no device I/O — no lock needed. Ranges shift
         # because the low end reserves the margin.
-        self.stage.backlash_mm = _um_to_stage(float(value_um))
+        self.stage.backlash_mm = um_to_stage(float(value_um))
         self._refresh_backlash_hint(float(value_um))
         self._update_stage_unit_ranges()
 
@@ -3874,9 +1465,9 @@ class FrogWindow(QMainWindow):
         def do():
             # Clamped move_to instead of move_by: the target can never leave
             # the travel range. get_position() runs inside the device lock.
-            cur = _stage_to_um(self.stage.get_position())
+            cur = stage_to_um(self.stage.get_position())
             target = min(max(cur + sign * step_um, lo), hi)
-            self.stage.move_to(_um_to_stage(target))
+            self.stage.move_to(um_to_stage(target))
         self._stage_action(do)
 
     def _move_absolute(self):
@@ -3885,11 +1476,11 @@ class FrogWindow(QMainWindow):
         target_um = float(delay_to_position_um(v, z, pf)) if self._stage_units_fs else v
         lo, hi = self._travel_range_um()
         target_um = min(max(target_um, lo), hi)
-        self._stage_action(lambda: self.stage.move_to(_um_to_stage(target_um)))
+        self._stage_action(lambda: self.stage.move_to(um_to_stage(target_um)))
 
     def _move_to_zero(self):
         self._stage_action(
-            lambda: self.stage.move_to(_um_to_stage(self.scan_cfg.zero_pos_um)))
+            lambda: self.stage.move_to(um_to_stage(self.scan_cfg.zero_pos_um)))
 
     def _home_stage(self):
         """Home the axis, and drop a zero that homing has invalidated.
@@ -3905,7 +1496,7 @@ class FrogWindow(QMainWindow):
             self.stage.home()
             # Read it here, inside the lock — get_position() is device I/O and
             # the live feed drives the same stage from its own thread.
-            landed.append(_stage_to_um(self.stage.get_position()))
+            landed.append(stage_to_um(self.stage.get_position()))
 
         self._stage_action(do)
         if not landed:
@@ -3926,7 +1517,7 @@ class FrogWindow(QMainWindow):
     def _mark_zero(self):
         def mark():
             # get_position() is a device read like any other — take the lock.
-            self.scan_cfg.zero_pos_um = _stage_to_um(self.stage.get_position())
+            self.scan_cfg.zero_pos_um = stage_to_um(self.stage.get_position())
         self._stage_action(mark)
         # fs-mode values are delays and stay as typed — the zero moved, so the
         # same delay now maps to the new (correct) absolute position. Only the
@@ -3937,7 +1528,7 @@ class FrogWindow(QMainWindow):
 
     def _refresh_positions(self):
         self.lbl_pos.setText(
-            f"{_stage_to_um(self.stage.get_position()):.2f} um"
+            f"{stage_to_um(self.stage.get_position()):.2f} um"
             if self._have_stage() else "— um")
         self.lbl_zero.setText(f"{self.scan_cfg.zero_pos_um:.2f} um")
 
@@ -3959,7 +1550,7 @@ class FrogWindow(QMainWindow):
         if not self._have_stage():
             self.status.showMessage("Connect a stage first — a FROG scan has "
                                     "to sweep the delay.", 4000); return
-        if self._align_running():
+        if self.alignment._align_running():
             self.status.showMessage(
                 "An alignment sweep is running — the stage is busy.", 3000); return
         # An unreferenced axis has no usable coordinate frame: every delay the
@@ -3995,7 +1586,7 @@ class FrogWindow(QMainWindow):
         # anything moves, and let the operator decide. Asked here rather than
         # refused outright because a deliberately uncorrected scan is a
         # legitimate thing to want; the .npz records which it was either way.
-        if self._display_dark() is None and not self._confirm_no_dark():
+        if self.feed.display_dark() is None and not self._confirm_no_dark():
             return
 
         # Hand the shared stage/spectrometer over to the scan worker: pause the
@@ -4011,13 +1602,13 @@ class FrogWindow(QMainWindow):
 
         # The worker captures these devices for the whole scan, so lock out
         # everything that could swap or drive them underneath it.
-        self._set_hardware_buttons_enabled(False)
+        self.appearance._set_hardware_buttons_enabled(False)
         self._set_stage_controls_enabled(False)
         # The fold line belongs to the result it came from, and the panel is
         # about to start showing a different trace. running=True is asserted:
         # the worker for THIS scan does not exist yet, so _scan_running() would
         # still be answering for the previous one.
-        self._clear_symmetry(running=True)
+        self.alignment._clear_symmetry(running=True)
 
         self._scan_trace  = np.zeros((wl.size, delays.size))
         self._scan_delays = delays
@@ -4038,7 +1629,7 @@ class FrogWindow(QMainWindow):
         # duration. The one thing an operator CAN still do is untick Subtract
         # Dark, and that now takes effect on the next scan rather than striping
         # this one.
-        self._scan_dark   = self._display_dark()
+        self._scan_dark   = self.feed.display_dark()
         # The same dark at MEMBER level, for the RAW view. RAW shows the two
         # detectors uncalibrated and unstitched, so the pedestal has to come off
         # each member's own raw frame — the combined dark above has already been
@@ -4057,13 +1648,13 @@ class FrogWindow(QMainWindow):
         self._scan_last_i = -1
         self._scan_members_raw = None   # …and the last scan's member frames
         self._live_frame  = None     # park any leftover live-feed frame too
-        self._init_align_trace(wl, delays.size)
+        self.alignment._init_align_trace(wl, delays.size)
         self.canvas.init_trace(delays, wl)
-        self._reset_saturation(); self.progress.setValue(0)
+        self.feed.reset_saturation(); self.progress.setValue(0)
         # A difference measured at the old position says nothing about the
         # scan that is starting, and the scan owns the stage the sweep needs.
         if self.btn_align_spec.isChecked() or self.canvas.dev_visible():
-            self._close_align_mode()
+            self.alignment._close_align_mode()
 
         self.btn_scan.setObjectName("danger"); self.btn_scan.setText("Abort Scan")
         self.btn_scan.style().unpolish(self.btn_scan); self.btn_scan.style().polish(self.btn_scan)
@@ -4087,11 +1678,11 @@ class FrogWindow(QMainWindow):
         # Auto-stitch drives the pair the worker now owns, so it greys out for
         # the duration. The per-spectrometer view does not — the scan carries
         # its own member frames, and _render_scan_frame draws them.
-        self._refresh_overlay_button()
+        self.appearance._refresh_overlay_button()
         # Explicit, not inferred: this happens to run after _worker.start(), so
         # _scan_running() would answer True — but that is an ordering accident,
         # and the same call one line earlier would have greyed nothing.
-        self._refresh_autostitch_button(running=True)
+        self.appearance._refresh_autostitch_button(running=True)
         self.status.showMessage(f"FROG scan: {delays.size} points…", 0)
 
     def _on_progress(self, done, total):
@@ -4115,7 +1706,7 @@ class FrogWindow(QMainWindow):
         # The raw member frames are interpolated and cut ONCE, here, rather
         # than kept per column and re-derived at render time: that keeps the
         # memory to one trace-sized array and the work to O(n_wl) per column.
-        self._store_align_column(i, members_raw)
+        self.alignment._store_align_column(i, members_raw)
         # …but the NEWEST pair is kept as-is, so the per-spectrometer spectrum
         # view has something to draw while a scan owns the device. One tuple
         # reference, overwritten per column — the scan's cut and normalisation
@@ -4169,12 +1760,12 @@ class FrogWindow(QMainWindow):
             # rather than freezing on the last one.
             if self._scan_wl is not None:
                 if not (self._overlay_on
-                        and self._render_overlay(self._scan_members_raw)):
+                        and self.feed._render_overlay(self._scan_members_raw)):
                     # Already corrected, in _on_column, along with the column
                     # that went into the trace beside this panel.
                     self.canvas.update_spectrum(self._scan_wl, self._scan_col)
             if self._align_trace_on and self._align_trace is not None:
-                self.canvas.update_trace(self._align_trace_view(), 1.0)
+                self.canvas.update_trace(self.alignment._align_trace_view(), 1.0)
             else:
                 self.canvas.update_trace(self._scan_trace, self._scan_peak)
             self.canvas.update_ac(self._scan_delays[:i + 1], ac)
@@ -4253,7 +1844,7 @@ class FrogWindow(QMainWindow):
             self._sat_worst = (npx, delay_fs, i)
         npx_w, delay_w, i_w = self._sat_worst
         where = "background" if i_w < 0 else f"{delay_w:+.0f} fs"
-        self._set_lamp("sat",
+        self.appearance._set_lamp("sat",
                        f"⚠ SATURATED — {self._sat_frames} frame"
                        f"{'' if self._sat_frames == 1 else 's'}, "
                        f"worst @ {where} ({npx_w} px)",
@@ -4299,7 +1890,7 @@ class FrogWindow(QMainWindow):
         if self._align_trace_on and self._align_trace is not None:
             # The raw view is a display mode, not a stage of the scan: finishing
             # must not silently drop the operator back to the calibrated trace.
-            self.canvas.update_trace(self._align_trace_view(), 1.0)
+            self.canvas.update_trace(self.alignment._align_trace_view(), 1.0)
         else:
             self.canvas.update_trace(self._result_view)
         ac = self._result_ac
@@ -4329,14 +1920,14 @@ class FrogWindow(QMainWindow):
         self.btn_scan.setEnabled(True)
         self.btn_scan.setObjectName("accent"); self.btn_scan.setText("Measure FROG")
         self.btn_scan.style().unpolish(self.btn_scan); self.btn_scan.style().polish(self.btn_scan)
-        self._set_hardware_buttons_enabled(True)
+        self.appearance._set_hardware_buttons_enabled(True)
         self._set_stage_controls_enabled(True)
-        self._refresh_overlay_button()
+        self.appearance._refresh_overlay_button()
         # running=False for the same reason as the symmetry button below: the
         # worker's thread may not have left run() yet, so neither may infer it.
-        self._refresh_autostitch_button(running=False)
-        self._refresh_align_trace_button()
-        self._refresh_symmetry_button(running=False)   # a finished scan folds
+        self.appearance._refresh_autostitch_button(running=False)
+        self.appearance._refresh_align_trace_button()
+        self.appearance._refresh_symmetry_button(running=False)   # a finished scan folds
         if self._feed_was_on and self.btn_feed.isChecked():
             self._feed.resume()
 
@@ -4464,7 +2055,7 @@ class FrogWindow(QMainWindow):
             ("theme",   lambda: self._theme,    None),
             ("window",  self._window_geometry,  None),
 
-            ("layout_mode", lambda: c.layout_mode, self._set_layout),
+            ("layout_mode", lambda: c.layout_mode, self.appearance._set_layout),
             ("spec_frac",   lambda: float(c.spec_fraction()),
                             lambda v: g.sld_prop.setValue(int(round(float(v) * 100)))),
 

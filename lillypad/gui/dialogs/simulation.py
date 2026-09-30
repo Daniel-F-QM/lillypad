@@ -60,10 +60,10 @@ class SimulationDialog(ConnectDialog):
         b_spec = QPushButton("Spectrometer"); b_spec.setObjectName("accent")
         b_spec.setToolTip("One simulated spectrometer covering the whole "
                           "simulated signal band")
-        b_spec.clicked.connect(lambda: self._do(self.main._use_sim_spectrometer))
+        b_spec.clicked.connect(lambda: self._do(self.main.devices.use_sim_spectrometer))
         b_stage = QPushButton("Stage"); b_stage.setObjectName("accent")
         b_stage.setToolTip("A 300 mm simulated delay stage")
-        b_stage.clicked.connect(lambda: self._do(self.main._use_sim_stage))
+        b_stage.clicked.connect(lambda: self._do(self.main.devices.use_sim_stage))
         grid.addWidget(b_spec, 0, 0); grid.addWidget(b_stage, 0, 1)
         b_pair = QPushButton("Stitched pair"); b_pair.setObjectName("accent")
         b_pair.setToolTip(
@@ -71,7 +71,7 @@ class SimulationDialog(ConnectDialog):
             "the only way to exercise multi-spectrometer mode without two on "
             "the bench. Overlapping halves of the band, or the pair of real "
             "instruments the beam names (see the description above)")
-        b_pair.clicked.connect(lambda: self._do(self.main._use_sim_pair))
+        b_pair.clicked.connect(lambda: self._do(self.main.devices.use_sim_pair))
         grid.addWidget(b_pair, 1, 0, 1, 2)
         lay.addLayout(grid)
 
@@ -84,11 +84,11 @@ class SimulationDialog(ConnectDialog):
         self.state.sim_gate  = self.cmb_gate.currentData()
         spec = self.state.spec
         if isinstance(spec, SimulatedSpectrometer):
-            self._do(self.main._use_sim_spectrometer)
+            self._do(self.main.devices.use_sim_spectrometer)
         elif (isinstance(spec, StitchedSpectrometer)
               and all(isinstance(m, SimulatedSpectrometer)
                       for m in spec.members)):
-            self._do(self.main._use_sim_pair)
+            self._do(self.main.devices.use_sim_pair)
         else:
             # Real hardware (or nothing) is connected — remember the choice for
             # the next time a simulator is asked for, rather than swapping the

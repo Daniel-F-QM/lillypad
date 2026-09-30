@@ -71,14 +71,14 @@ class TestThemeSwitchOnALiveWindow:
         whose artists were built under the other theme."""
         before = id(PALETTE)
         for name in ("light", "dark", "light", "dark"):
-            window._apply_theme(name)
+            window.appearance._apply_theme(name)
             assert id(PALETTE) == before
 
     @pytest.mark.parametrize("name,expected", [("light", LIGHT_PALETTE),
                                               ("dark", DARK_PALETTE)])
     def test_switching_reaches_the_palette_and_the_stylesheet(self, window, app,
                                                              name, expected):
-        window._apply_theme(name)
+        window.appearance._apply_theme(name)
         assert PALETTE["bg"] == expected["bg"]
         assert expected["bg"] in app.styleSheet()
 
@@ -86,7 +86,7 @@ class TestThemeSwitchOnALiveWindow:
         """A draw is what runs every artist that reads PALETTE at paint time, so
         a colour left dangling by the extraction surfaces here."""
         for name in ("light", "dark"):
-            window._apply_theme(name)
+            window.appearance._apply_theme(name)
             window.canvas.draw()
 
 

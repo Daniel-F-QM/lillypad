@@ -93,7 +93,7 @@ class StageDialog(ConnectDialog):
         self.btn_disconnect = QPushButton("Disconnect")
         self.btn_disconnect.setObjectName("danger")
         self.btn_disconnect.clicked.connect(
-            lambda: self._do(self.main._disconnect_stage))
+            lambda: self._do(self.main.devices.disconnect_stage))
         btn_close = QPushButton("Close"); btn_close.clicked.connect(self.hide)
         frow.addWidget(self.btn_disconnect); frow.addWidget(btn_close)
         lay.addLayout(frow)
@@ -145,15 +145,15 @@ class StageDialog(ConnectDialog):
             self._do(lambda: (False, "No Kinesis controller selected — press "
                                      "Rescan."))
             return
-        self._do(lambda: self.main._connect_real_stage(conn))
+        self._do(lambda: self.main.devices.connect_kinesis_stage(conn))
 
     def _connect_zaber(self):
         port = self.edit_zaber_port.text().strip() or None
-        return self.main._connect_zaber_stage(port)
+        return self.main.devices.connect_zaber_stage(port)
 
     def _connect_piezo(self):
         port = self.edit_piezo_port.text().strip() or None
-        return self.main._connect_piezo_jena_stage(port)
+        return self.main.devices.connect_piezo_jena_stage(port)
 
     @property
     def backlash_um(self):

@@ -200,7 +200,7 @@ class AvantesSettingsDialog(QDialog):
         The combo carries the tagged id rather than the device object for the
         same reason — widget data must not keep a closed device alive.
         """
-        devices = self.main._avantes_devices()
+        devices = self.main.devices.avantes_devices()
         if not devices:
             return None
         want = self.cmb_target.currentData()
@@ -265,7 +265,7 @@ class AvantesSettingsDialog(QDialog):
             self._do(False, "A scan is running — stop it before changing "
                             "spectrometer settings.")
             return
-        with self.main._device_lock() as ok:
+        with self.main.devices.device_lock() as ok:
             if not ok:
                 self._do(False, FEED_BUSY_MSG)
                 return
@@ -276,7 +276,7 @@ class AvantesSettingsDialog(QDialog):
                 return
         self._do(True, f"{label}: applied.")
         if voids_dark:
-            self.main._invalidate_dark(f"{label.lower()} changed")
+            self.main.feed.invalidate_dark(f"{label.lower()} changed")
         if refresh:
             self.refresh()
 
@@ -299,7 +299,7 @@ class AvantesSettingsDialog(QDialog):
         # On-board averaging multiplies the frame time, and the main
         # integration spinbox shows what one acquire costs — reseed it, or it
         # disagrees with what the feed is actually pacing to.
-        self.main._sync_integration_ui()
+        self.main.feed.sync_integration_ui()
 
     # ── control handlers ────────────────────────────────────────────────────
     def _on_hires(self, on):
@@ -315,7 +315,7 @@ class AvantesSettingsDialog(QDialog):
             result["on"] = dev.set_high_res_adc(on)
 
         self._write("ADC resolution", apply, refresh=False, voids_dark=True)
-        self.main._reset_saturation()
+        self.main.feed.reset_saturation()
         # Announced rather than reached for. The Spectrometer window shows the
         # device's full scale as its override placeholder, so it has to be told
         # the ceiling moved — but this dialog has no business knowing that
@@ -368,7 +368,7 @@ class AvantesSettingsDialog(QDialog):
         dev = self._target()
         if dev is None or self.main._scan_running():
             return
-        with self.main._device_lock() as ok:
+        with self.main.devices.device_lock() as ok:
             if not ok:
                 if not quiet:
                     self._do(False, FEED_BUSY_MSG)
@@ -387,7 +387,7 @@ class AvantesSettingsDialog(QDialog):
     def refresh(self):
         """Seed every widget from the device. `_loading` suppresses the write
         handlers throughout, so reading the state cannot write it back."""
-        devices = self.main._avantes_devices()
+        devices = self.main.devices.avantes_devices()
         self._loading = True
         try:
             self._sync_target_combo(devices)
