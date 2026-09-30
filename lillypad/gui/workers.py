@@ -24,6 +24,7 @@ import time
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
+from lillypad.gui.text import FEED_BUSY_MSG
 from lillypad.scan.core import (delay_to_position_um, stage_to_um,
                                 um_to_stage)
 
@@ -167,11 +168,6 @@ class LiveFeedWorker(QThread):
         self._run = False
         with self._lock:
             self._paused = True
-
-# Shown whenever a device operation has to be refused because the live feed did
-# not release the hardware in time.
-FEED_BUSY_MSG = ("Live feed is still mid-acquisition — try again in a moment "
-                 "(or stop the feed first).")
 
 # Workers that would not stop before the window closed. Parked here so their
 # QThread objects outlive the window: destroying one while its run() is still
