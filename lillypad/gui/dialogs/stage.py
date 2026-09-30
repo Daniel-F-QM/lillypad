@@ -5,11 +5,11 @@ from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QVBoxLayout)
 
 from lillypad.hardware import list_kinesis_stages
-from lillypad.gui.dialogs.base import _ConnectDialog
+from lillypad.gui.dialogs.base import ConnectDialog
 from lillypad.gui.widgets import ComboBox, DoubleSpinBox, _hline
 
 
-class StageDialog(_ConnectDialog):
+class StageDialog(ConnectDialog):
     """Connect a delay stage, and hold the one setting that belongs to it.
 
     Kinesis controllers enumerate, so they get a scanned list. Zaber and Piezo
@@ -155,8 +155,13 @@ class StageDialog(_ConnectDialog):
         port = self.edit_piezo_port.text().strip() or None
         return self.main._connect_piezo_jena_stage(port)
 
-    def _refresh(self):
-        stage = self.main.stage
+    @property
+    def backlash_um(self):
+        """The approach margin the connected stage is being driven with."""
+        return float(self.spin_backlash.value())
+
+    def refresh(self):
+        stage = self.state.stage
         self.lbl_stage.setText(stage.name if stage is not None
                                else "Not connected.")
         self.btn_disconnect.setEnabled(stage is not None)

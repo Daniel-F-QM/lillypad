@@ -231,6 +231,11 @@ class GraphicsSettingsDialog(QDialog):
         lbl.setObjectName("hdr")
         return lbl
 
+    @property
+    def log_scale(self):
+        """Whether the spectrum panel is on a logarithmic y axis."""
+        return self.chk_log.isChecked()
+
     def _fit_to_content(self):
         """Size to the content: wide enough that no row is cut off (hence no
         horizontal scrolling), tall enough to show what the screen allows.

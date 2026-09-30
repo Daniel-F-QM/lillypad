@@ -9,11 +9,11 @@ from PySide6.QtWidgets import (QGridLayout, QLabel, QPushButton, QVBoxLayout)
 from lillypad.hardware import StitchedSpectrometer
 from lillypad.sim import (PULSE_SHAPES, SIM_SPECTROMETERS,
                           SimulatedSpectrometer, sim_spectrometer_pair)
-from lillypad.gui.dialogs.base import _ConnectDialog
+from lillypad.gui.dialogs.base import ConnectDialog
 from lillypad.gui.widgets import ComboBox, _hline
 
 
-class SimulationDialog(_ConnectDialog):
+class SimulationDialog(ConnectDialog):
     """Run the app against simulated hardware, on purpose.
 
     Simulation used to be the startup default, which meant a fake spectrum
@@ -38,13 +38,13 @@ class SimulationDialog(_ConnectDialog):
         for key, shape in PULSE_SHAPES.items():
             self.cmb_pulse.addItem(shape["label"], key)
         self.cmb_pulse.setCurrentIndex(
-            max(0, self.cmb_pulse.findData(self.main.sim_pulse)))
+            max(0, self.cmb_pulse.findData(self.state.sim_pulse)))
         self.cmb_pulse.currentIndexChanged.connect(self._on_beam)
         self.cmb_gate = ComboBox()
         self.cmb_gate.addItem("SHG", "shg")
         self.cmb_gate.addItem("PG", "pg")
         self.cmb_gate.setCurrentIndex(
-            max(0, self.cmb_gate.findData(self.main.sim_gate)))
+            max(0, self.cmb_gate.findData(self.state.sim_gate)))
         self.cmb_gate.currentIndexChanged.connect(self._on_beam)
         brow.addWidget(self.cmb_pulse, 0, 0); brow.addWidget(self.cmb_gate, 0, 1)
         lay.addLayout(brow)
@@ -80,9 +80,9 @@ class SimulationDialog(_ConnectDialog):
         lay.addWidget(btn_close)
 
     def _on_beam(self):
-        self.main.sim_pulse = self.cmb_pulse.currentData()
-        self.main.sim_gate  = self.cmb_gate.currentData()
-        spec = self.main.spec
+        self.state.sim_pulse = self.cmb_pulse.currentData()
+        self.state.sim_gate  = self.cmb_gate.currentData()
+        spec = self.state.spec
         if isinstance(spec, SimulatedSpectrometer):
             self._do(self.main._use_sim_spectrometer)
         elif (isinstance(spec, StitchedSpectrometer)
@@ -93,16 +93,16 @@ class SimulationDialog(_ConnectDialog):
             # Real hardware (or nothing) is connected — remember the choice for
             # the next time a simulator is asked for, rather than swapping the
             # device out from under the operator.
-            self._refresh()
+            self.refresh()
             self.lbl_msg.setText("Beam saved — press Spectrometer to use it.")
 
-    def _refresh(self):
-        desc = PULSE_SHAPES[self.main.sim_pulse]["desc"]
-        spec = self.main.spec
+    def refresh(self):
+        desc = PULSE_SHAPES[self.state.sim_pulse]["desc"]
+        spec = self.state.spec
         if isinstance(spec, SimulatedSpectrometer):
             desc += (f"\nSuggested scan: ±{spec.suggested_delay_fs:.0f} fs   ·   "
                      f"{spec.wavelengths[0]:.0f}–{spec.wavelengths[-1]:.0f} nm")
-        models = sim_spectrometer_pair(self.main.sim_pulse, self.main.sim_gate)
+        models = sim_spectrometer_pair(self.state.sim_pulse, self.state.sim_gate)
         if models is not None:
             # Named here rather than only in the tooltip: which two instruments
             # Stitched pair is about to stand in for is part of the beam.

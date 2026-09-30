@@ -112,6 +112,42 @@ class AcquisitionSettingsDialog(QDialog):
         l = QLabel(text); l.setObjectName("hdr")
         return l
 
+    # ── What the window reads back ───────────────────────────────────────────
+    # Named values rather than widgets. The caller wants "how many averages",
+    # not "the spinbox that happens to hold it", and a reader of _start_scan
+    # should not have to know which of the seven boxes in this window is which.
+    # Read live at scan start, so there is nothing to keep in sync.
+    @property
+    def n_average(self):
+        return int(self.spin_avg.value())
+
+    @property
+    def idle_shots(self):
+        return int(self.spin_idle.value())
+
+    @property
+    def settle_ms(self):
+        return int(self.spin_wait.value())
+
+    @property
+    def sat_percent(self):
+        """Saturation threshold as typed, in percent of full scale."""
+        return float(self.spin_sat.value())
+
+    @property
+    def abort_on_saturation(self):
+        return self.chk_abort_sat.isChecked()
+
+    @property
+    def abort_on_stage_fault(self):
+        return self.chk_abort_stage_fault.isChecked()
+
+    @property
+    def take_delay_reference(self):
+        """Whether to record a frame at each end of the sweep. Diagnostic only
+        — nothing is ever subtracted from it (see the hint in this window)."""
+        return self.chk_ref.isChecked()
+
     def toggle(self):
         if self.isVisible():
             self.hide()

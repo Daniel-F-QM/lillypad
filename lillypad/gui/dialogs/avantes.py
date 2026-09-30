@@ -5,7 +5,7 @@ spectrometer has. Writes are debounced, because each one is a USB round trip to
 a device the live feed may also be driving.
 """
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (QCheckBox, QDialog, QGridLayout, QHBoxLayout,
                                QLabel, QPushButton, QScrollArea, QVBoxLayout,
                                QWidget)
@@ -30,10 +30,14 @@ class AvantesSettingsDialog(QDialog):
 
     None of these device settings are written to settings.json — that file
     holds the app's own preferences, not the spectrometer's state — so
-    `_refresh` reads the device's current state INTO the widgets. Pushing
+    `refresh` reads the device's current state INTO the widgets. Pushing
     widget defaults the other way would mean that merely opening this dialog
     silently reconfigured the spectrometer.
     """
+
+    # The device's full scale moved (a 14-bit <-> 16-bit ADC switch). Anything
+    # that displays or judges against the ceiling has to re-read it.
+    full_scale_changed = Signal()
 
     # Scrubbable controls are debounced through one shared timer: a
     # valueChanged per spinbox tick would park and restart the live feed on
@@ -56,7 +60,7 @@ class AvantesSettingsDialog(QDialog):
         # connected, which is the normal case; a two-Avantes stitched pair is
         # the reason it exists at all.
         self.cmb_target = ComboBox()
-        self.cmb_target.currentIndexChanged.connect(lambda _=0: self._refresh())
+        self.cmb_target.currentIndexChanged.connect(lambda _=0: self.refresh())
         lay.addWidget(self.cmb_target)
 
         # ── Acquisition ─────────────────────────────────────────────────────
@@ -180,7 +184,7 @@ class AvantesSettingsDialog(QDialog):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(self.WRITE_DEBOUNCE_MS)
         self._debounce.timeout.connect(self._flush_writes)
-        self._loading = False        # True while _refresh seeds the widgets
+        self._loading = False        # True while refresh seeds the widgets
         self._target_ids = None      # device list the target combo was built from
 
     # ── plumbing ────────────────────────────────────────────────────────────
@@ -209,7 +213,7 @@ class AvantesSettingsDialog(QDialog):
         """Rebuild the target list only when the devices actually changed.
 
         An unconditional clear()/addItem() would reset the selection to the
-        first device on every _refresh — and _refresh runs after every write,
+        first device on every refresh — and refresh runs after every write,
         so a setting applied while member 2 was selected would land on member 2
         and then silently snap the UI back to member 1, with the next write
         going to the wrong device.
@@ -252,7 +256,7 @@ class AvantesSettingsDialog(QDialog):
         rather than left to be subtracted from data it does not match.
         """
         if self._loading:
-            return                      # _refresh is seeding widgets, not a user edit
+            return                      # refresh is seeding widgets, not a user edit
         dev = self._target()
         if dev is None:
             self._do(False, "No Avantes spectrometer is connected.")
@@ -274,7 +278,7 @@ class AvantesSettingsDialog(QDialog):
         if voids_dark:
             self.main._invalidate_dark(f"{label.lower()} changed")
         if refresh:
-            self._refresh()
+            self.refresh()
 
     def _queue_write(self, _value=None):
         """Debounce a scrubbable control."""
@@ -312,11 +316,14 @@ class AvantesSettingsDialog(QDialog):
 
         self._write("ADC resolution", apply, refresh=False, voids_dark=True)
         self.main._reset_saturation()
-        if self.main.dlg_spec.isVisible():
-            self.main.dlg_spec._refresh()   # its full-scale placeholder moved
+        # Announced rather than reached for. The Spectrometer window shows the
+        # device's full scale as its override placeholder, so it has to be told
+        # the ceiling moved — but this dialog has no business knowing that
+        # window exists, let alone whether it is open. The window connects them.
+        self.full_scale_changed.emit()
         if result.get("on") is False and on:
             self._do(False, "This device has no 16-bit ADC — staying at 14-bit.")
-        self._refresh()
+        self.refresh()
 
     def _on_trigger(self, _idx=None):
         if self._loading:
@@ -331,8 +338,8 @@ class AvantesSettingsDialog(QDialog):
         stopped = False
         opts = avantes_trigger_options()
         hw = dict(opts["mode"]).get("Hardware trigger")
-        if mode == hw and self.main.btn_feed.isChecked():
-            self.main.btn_feed.setChecked(False)     # runs _toggle_feed
+        if mode == hw and self.main.feed_enabled:
+            self.main.set_feed_enabled(False)
             stopped = True
         self._write("Trigger",
                     lambda d: d.set_trigger(mode, src, typ))
@@ -377,7 +384,7 @@ class AvantesSettingsDialog(QDialog):
                                else f"{temp:.1f} °C"))
 
     # ── state ───────────────────────────────────────────────────────────────
-    def _refresh(self):
+    def refresh(self):
         """Seed every widget from the device. `_loading` suppresses the write
         handlers throughout, so reading the state cannot write it back."""
         devices = self.main._avantes_devices()
@@ -451,11 +458,11 @@ class AvantesSettingsDialog(QDialog):
         if self.isVisible():
             self.hide()
         else:
-            self._refresh(); self.lbl_msg.setText(""); self.show(); self.raise_()
+            self.refresh(); self.lbl_msg.setText(""); self.show(); self.raise_()
 
     def showEvent(self, event):
         super().showEvent(event)
-        self._refresh()
+        self.refresh()
         self._refresh_readback(quiet=True)
         if self.chk_poll.isChecked():
             self._timer.start()

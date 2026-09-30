@@ -133,6 +133,11 @@ class ExportDialog(QDialog):
         return l
 
     # ── The name ──────────────────────────────────────────────────────────
+    @property
+    def date_stamped(self):
+        """Whether the composed name carries today's date as a prefix."""
+        return self.chk_date.isChecked()
+
     def active_key(self):
         """The format key whose radio is ticked."""
         for key, rb in self.radios.items():

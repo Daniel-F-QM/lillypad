@@ -54,6 +54,11 @@ class AlignmentDialog(QDialog):
         l = QLabel(text); l.setObjectName("hdr")
         return l
 
+    @property
+    def step_fs(self):
+        """Half-width x of the four-point sweep, in fs."""
+        return float(self.spin_align_step.value())
+
     def toggle(self):
         if self.isVisible():
             self.hide()

@@ -9,11 +9,11 @@ from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QVBoxLayout)
 
 from lillypad.hardware import SEABREEZE_BACKENDS, StitchedSpectrometer
-from lillypad.gui.dialogs.base import _ConnectDialog
+from lillypad.gui.dialogs.base import ConnectDialog
 from lillypad.gui.widgets import ComboBox, _hline
 
 
-class SpectrometerDialog(_ConnectDialog):
+class SpectrometerDialog(ConnectDialog):
     """Connect one or two spectrometers, and manage the stitch between them.
 
     Two slots are offered from the start, because a pair is not a separate mode
@@ -120,7 +120,7 @@ class SpectrometerDialog(_ConnectDialog):
         for name in SEABREEZE_BACKENDS:
             self.cmb_backend.addItem(name, name)
         self.cmb_backend.setCurrentIndex(
-            max(0, self.cmb_backend.findData(self.main.seabreeze_backend)))
+            max(0, self.cmb_backend.findData(self.state.seabreeze_backend)))
         self.cmb_backend.currentIndexChanged.connect(self._on_backend)
         brow.addWidget(self.cmb_backend, 0, 1)
         # Full-scale override. Without this, a spectrometer that does not
@@ -184,7 +184,7 @@ class SpectrometerDialog(_ConnectDialog):
     def _on_device_picked(self, slot):
         ident = self.cmb_dev[slot].currentData()
         label = self.cmb_dev[slot].currentText()
-        if ident == self.main._multi["serials"][slot]:
+        if ident == self.state.multi["serials"][slot]:
             return                       # re-picked what is already there
         if ident is None:
             self._do(lambda: self.main._clear_slot(slot))
@@ -194,7 +194,7 @@ class SpectrometerDialog(_ConnectDialog):
     def _on_cal_picked(self, slot):
         path = self.cmb_cal[slot].currentData()
         self.main._select_slot_calibration(slot, path)
-        self._refresh()
+        self.refresh()
 
     def _disconnect(self):
         self._do(self.main._disconnect_spectrometer)
@@ -202,18 +202,18 @@ class SpectrometerDialog(_ConnectDialog):
     # ── Stitching handlers ───────────────────────────────────────────────────
     def _manual_stitch(self):
         self.main._set_stitch_factor()
-        self._refresh()
+        self.refresh()
 
     def _set_band(self):
         self.main._set_overlap_band()
-        self._refresh()
+        self.refresh()
 
     # ── Device-wide settings ─────────────────────────────────────────────────
     def _on_full_scale(self):
         """Apply the typed full-scale override (blank clears it back to auto)."""
         text = self.edit_full_scale.text().strip()
         if not text:
-            self.main.scan_cfg.saturation_counts = None
+            self.state.scan_cfg.saturation_counts = None
         else:
             try:
                 value = float(text)
@@ -225,15 +225,15 @@ class SpectrometerDialog(_ConnectDialog):
                 self._do(lambda: (False, f"Full scale must be a positive "
                                          f"number of counts (got {text!r})."))
                 return
-            self.main.scan_cfg.saturation_counts = value
+            self.state.scan_cfg.saturation_counts = value
         self.main._reset_saturation()
         self._do(lambda: (True, "Full scale: " + (
-            f"{self.main.scan_cfg.saturation_counts:.0f} counts (override)."
-            if self.main.scan_cfg.saturation_counts else "auto (from device).")))
+            f"{self.state.scan_cfg.saturation_counts:.0f} counts (override)."
+            if self.state.scan_cfg.saturation_counts else "auto (from device).")))
 
     def _on_backend(self):
         backend = self.cmb_backend.currentData()
-        if backend == self.main.seabreeze_backend:
+        if backend == self.state.seabreeze_backend:
             return
         # A device opened through the other backend cannot survive the switch
         # (selecting a backend shuts the previous backend's API down), so
@@ -245,23 +245,23 @@ class SpectrometerDialog(_ConnectDialog):
                 # Refused (scan running / feed busy) — keep the old choice.
                 self.cmb_backend.setCurrentIndex(
                     max(0, self.cmb_backend.findData(
-                        self.main.seabreeze_backend)))
+                        self.state.seabreeze_backend)))
                 self._do(lambda: (False, err))
                 return
-            self.main.seabreeze_backend = backend
+            self.state.seabreeze_backend = backend
             self._scan()      # the new backend enumerates its own devices
             self._do(lambda: (True, f"Backend: {backend}. The spectrometer "
                                     f"was released — pick it again in slot 1 "
                                     f"to reconnect through it."))
         else:
-            self.main.seabreeze_backend = backend
+            self.state.seabreeze_backend = backend
             self._scan()
             self._do(lambda: (True, f"Backend: {backend} — used on the next "
                                     f"connect."))
 
     # ── Display ──────────────────────────────────────────────────────────────
-    def _refresh(self):
-        spec = self.main.spec
+    def refresh(self):
+        spec = self.state.spec
         self.lbl_spec.setText(spec.name if spec is not None
                               else "Not connected.")
         self.btn_disconnect.setEnabled(spec is not None)
@@ -284,9 +284,9 @@ class SpectrometerDialog(_ConnectDialog):
         was empty while the device was live.
         """
         cmb = self.cmb_dev[slot]
-        ident = self.main._multi["serials"][slot]
-        label = self.main._multi["labels"][slot]
-        other = self.main._multi["serials"][1 - slot]
+        ident = self.state.multi["serials"][slot]
+        label = self.state.multi["labels"][slot]
+        other = self.state.multi["serials"][1 - slot]
         with QSignalBlocker(cmb):
             cmb.clear()
             cmb.addItem(self.NONE_LABEL, None)
@@ -305,7 +305,7 @@ class SpectrometerDialog(_ConnectDialog):
 
     def _fill_cal_combo(self, slot):
         cmb = self.cmb_cal[slot]
-        cal = self.main._multi["cals"][slot]
+        cal = self.state.multi["cals"][slot]
         with QSignalBlocker(cmb):
             cmb.clear()
             cmb.addItem("No calibration", None)
@@ -323,7 +323,7 @@ class SpectrometerDialog(_ConnectDialog):
         pair?", so it belongs next to the factor rather than in a status
         message that has already scrolled away.
         """
-        spec = self.main.spec
+        spec = self.state.spec
         live = isinstance(spec, StitchedSpectrometer)
         for b in (self.btn_fit, self.btn_manual, self.btn_band):
             b.setEnabled(live)
@@ -335,7 +335,7 @@ class SpectrometerDialog(_ConnectDialog):
         quality = ("not fitted yet" if res is None
                    else f"mismatch {res * 100:.1f}%")
         stale = ("  ·  STALE — integration times changed"
-                 if self.main._stitch_stale else "")
+                 if self.state.stitch_stale else "")
         lo, hi = spec.overlap_band
         glo, ghi = spec.geometric_overlap
         self.lbl_stitch.setText(

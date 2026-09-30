@@ -1,6 +1,6 @@
 """The pop-up windows: connection, settings, and export.
 
-    base          _ConnectDialog (the shared base) + DevicePickerDialog
+    base          ConnectDialog (the shared base) + DevicePickerDialog
     spectrometer  stage  simulation     connecting devices
     acquisition   alignment  graphics   settings
     avantes                             vendor-specific device settings

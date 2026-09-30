@@ -92,12 +92,12 @@ class TestConstructionOrder:
         assert n == 3, f"expected 3 init-order guards, found {n}"
 
     def test_the_connect_dialogs_share_one_base(self):
-        from lillypad.gui.dialogs.base import _ConnectDialog
+        from lillypad.gui.dialogs.base import ConnectDialog
         from lillypad.gui.dialogs.simulation import SimulationDialog
         from lillypad.gui.dialogs.spectrometer import SpectrometerDialog
         from lillypad.gui.dialogs.stage import StageDialog
         for cls in (SpectrometerDialog, StageDialog, SimulationDialog):
-            assert issubclass(cls, _ConnectDialog)
+            assert issubclass(cls, ConnectDialog)
 
 
 class TestDialogsStayOutOfTheDesignLayer:

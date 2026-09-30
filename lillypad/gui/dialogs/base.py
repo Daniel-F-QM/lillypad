@@ -1,10 +1,15 @@
 """The shared dialog base, and the modal device picker.
 
-_ConnectDialog is what the three connection dialogs are built on: a header, an
+ConnectDialog is what the three connection dialogs are built on: a header, an
 error-reporting wrapper, and the open/toggle behaviour they share. It takes
 `main` and `parent` separately — `main` is the window it drives, `parent` is the
 Qt parent — which is the author's existing (partial) answer to which way the
 dependency runs.
+
+It also lifts `main.state` onto `self.state`, so a subclass reads the instrument
+through InstrumentState and calls the window only to *act*. That split is the
+point: a dialog asking what is connected should not be able to reach a widget on
+the way.
 
 DevicePickerDialog is modal and shown only when enumeration finds more than one
 device, so it is the one dialog here that asks a question and returns.
@@ -20,16 +25,19 @@ from lillypad.gui.widgets import ComboBox
 # ─────────────────────────────────────────────────────────────────────────────
 # Connection dialogs
 # ─────────────────────────────────────────────────────────────────────────────
-class _ConnectDialog(QDialog):
+class ConnectDialog(QDialog):
     """Shared plumbing for the three connection windows.
 
     They all do the same three things: run an (ok, msg) action and colour the
     result inline, draw a small section header, and refresh themselves whenever
-    they are shown. Only `_refresh` differs, so only `_refresh` is overridden.
+    they are shown. Only `refresh` differs, so only `refresh` is overridden.
     """
     def __init__(self, main, parent=None, title="", width=380):
         super().__init__(parent, Qt.Tool)
         self.main = main
+        # What is connected, read through InstrumentState rather than off the
+        # window. `main` stays for the actions — connect, disconnect, fit.
+        self.state = main.state
         self.setWindowTitle(title)
         self.setFixedWidth(width)
         # Created here rather than in each subclass: _do() writes to it, and
@@ -53,7 +61,7 @@ class _ConnectDialog(QDialog):
         self.lbl_msg.style().unpolish(self.lbl_msg)
         self.lbl_msg.style().polish(self.lbl_msg)
         self.lbl_msg.setText(msg)
-        self._refresh()
+        self.refresh()
         self._refit()
 
     def _refit(self):
@@ -81,13 +89,13 @@ class _ConnectDialog(QDialog):
         that happens to be up already.
         """
         self.lbl_msg.setText("")
-        self._refresh()
+        self.refresh()
         self._refit()
         self.show()
         self.raise_()
         self.activateWindow()
 
-    def _refresh(self):
+    def refresh(self):
         pass
 
 

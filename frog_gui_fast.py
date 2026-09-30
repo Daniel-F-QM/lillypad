@@ -63,8 +63,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QLabel, QCheckBox, QPushButton,
     QProgressBar, QScrollArea, QSizePolicy, QStatusBar, QFileDialog,
-    QDialog, QToolBar, QSlider, QLineEdit, QMenu, QRubberBand,
-    QMessageBox, QInputDialog, QAbstractSpinBox, QRadioButton
+    QToolBar, QMenu, QRubberBand,
+    QMessageBox, QInputDialog, QAbstractSpinBox
 )
 from PySide6.QtCore import (Qt, QTimer, Signal, QSize, QRect, QPoint,
                             QSignalBlocker)
@@ -108,14 +108,14 @@ from lillypad.gui.dialogs.acquisition import AcquisitionSettingsDialog
 from lillypad.gui.dialogs.alignment import AlignmentDialog
 from lillypad.gui.dialogs.avantes import AvantesSettingsDialog
 from lillypad.gui.dialogs.base import DevicePickerDialog
-from lillypad.gui.dialogs.export import (DEFAULT_EXPORT_NAME, EXPORT_FORMATS,
-                                         ExportDialog)
+from lillypad.gui.dialogs.export import EXPORT_FORMATS, ExportDialog
 from lillypad.gui.dialogs.graphics import GraphicsSettingsDialog
 from lillypad.gui.dialogs.simulation import SimulationDialog
 from lillypad.gui.dialogs.spectrometer import SpectrometerDialog
 from lillypad.gui.dialogs.stage import StageDialog
 from lillypad.gui.perf import PERF, install_probe, perf_tick
-from lillypad.gui.widgets import (SAT_WARN_FRACTION, AxisBoundEditor, ComboBox,
+from lillypad.gui.state import InstrumentState
+from lillypad.gui.widgets import (SAT_WARN_FRACTION, AxisBoundEditor,
                                   DoubleSpinBox, NoDeviceOverlay, PlotSplitHandle,
                                   Slider, SpinBox, StatusLamp, _hline)
 from lillypad.gui.text import FEED_BUSY_MSG, RIGHT_CLICK_HINT
@@ -133,13 +133,11 @@ from hardware import (SimulatedStage, SimulatedSpectrometer,
                       list_kinesis_stages, list_spectrometers,
                       list_avantes_spectrometers, list_seabreeze_spectrometers,
                       open_spectrometer,
-                      avantes_trigger_options,
-                      load_calibration_file, SEABREEZE_BACKENDS,
-                      PULSE_SHAPES, DEFAULT_PULSE,
+                      load_calibration_file,
+                      PULSE_SHAPES,
                       SIM_SPECTROMETERS, sim_spectrometer_pair)
-from scan import (FrogScanConfig, FrogScanWorker, fwhm, autocorrelation,
+from scan import (FrogScanWorker, fwhm, autocorrelation,
                   position_to_delay_fs, delay_to_position_um,
-                  write_dwc, write_npz, write_csv,
                   _um_to_stage, _stage_to_um)
 
 
@@ -2259,52 +2257,26 @@ class FrogWindow(QMainWindow):
         self._settings_saved = {}
         self._theme = startup_theme(self._settings)
 
-        self.scan_cfg      = FrogScanConfig(delay_start_fs=-500, delay_stop_fs=500,
-                                            delay_step_fs=1.0, zero_pos_um=150000.0)
+        # Everything about the instrument itself — the two devices, the scan
+        # configuration, the recorded dark, the spectrometer slots, what the
+        # simulator stands in for. See lillypad/gui/state.py for why these are
+        # gathered and the display scratch below is not. The @property
+        # forwarders further down keep `self.spec`, `self.background` and the
+        # rest reading exactly as they always did.
+        #
+        # NOTHING is connected at startup: state.spec and state.stage stay None
+        # until the operator connects a device (or asks for a simulator by name,
+        # in the Simulation window), and _sync_connection_ui puts a "no
+        # spectrometer connected" panel up in the meantime.
+        self.state = InstrumentState()
         self._stage_units_fs = True     # jog/move fields default to fs
-        # The recorded dark, in exactly one of two forms — never both.
-        #   single device:  self.background, one RAW frame.
-        #   stitched pair:  self.background_members, the two RAW member frames,
-        #                   and self.background stays None.
-        # A pair's dark is kept per member because the pedestal has to come off
-        # BEFORE each member's own calibration, and because the merged
-        # background is then derived (StitchedSpectrometer.combined_dark) at
-        # whatever stitch factor and band are current. Storing the merged frame
-        # instead baked both into its overlap region, where the two devices are
-        # already mixed, and it went silently wrong on the next re-fit.
-        self.background    = None
-        self.background_members = None
-        # Exposure(s) the dark was recorded at — (exp,) or (exp1, exp2) in
-        # self.spec.members order. A dark is offset + dark-current x t, so it
-        # is only valid at its own exposure; _invalidate_dark drops it when
-        # that changes rather than rescaling something that is not a pure ratio.
-        self.background_exposures = None
         self._dark_member_warned = False
         self._overlay_on   = False   # spectrum panel showing the members apart
         self._pair_seen    = False   # a live pair has already had its default
-        # Set when an integration time changes under a stitched pair: frames
-        # are raw counts, so stitch_factor carries the exposure ratio and goes
-        # stale. Surfaced in the Spectrometer window's Stitching block rather
-        # than silently re-fitted.
-        self._stitch_stale = False
         self.last_spectrum = None
         self.result        = None
         self._worker       = None
         self._export_worker = None
-        # The two spectrometer slots, each holding a device choice and a
-        # calibration choice; _multi_members are the live spectrometer objects
-        # in SLOT order once a stitched pair is connected.
-        # "serials" holds tagged ids ("vendor:serial", see hardware.spec_ident)
-        # or one of the SIM_SLOT_DEVICES sentinels — the two slots may hold
-        # devices from different vendors.
-        #
-        # There is no "multi-spectrometer mode" flag: both slots exist from the
-        # start, slot 1 alone IS single-spectrometer mode, and "is a pair live"
-        # is answered by _pair_live() off the connected device rather than by a
-        # second piece of state that could disagree with it.
-        self._multi = {"serials": [None, None],
-                       "labels": [None, None], "cals": [None, None]}
-        self._multi_members = [None, None]
         self._scan_trace   = None
         self._scan_delays  = None
         self._scan_ac      = None    # running per-column sums (see _on_column)
@@ -2351,25 +2323,6 @@ class FrogWindow(QMainWindow):
         # but leave the auto-scale flags exactly as the operator set them.
         self._pending_rescale = False
         self._export_fmt   = "dwc"
-        # Which beam the simulated spectrometer measures (see PULSE_SHAPES).
-        # Kept on the window, not the simulator, so the choice survives a swap
-        # to real hardware and back.
-        self.sim_pulse     = DEFAULT_PULSE
-        self.sim_gate      = "shg"
-        # seabreeze backend used for every enumeration/connect. pyseabreeze
-        # (the default, SEABREEZE_BACKENDS[0]) also covers the newer Ocean
-        # Insight models that cseabreeze does not know about.
-        self.seabreeze_backend = SEABREEZE_BACKENDS[0]
-
-        # NOTHING is connected at startup. The app used to open on a simulated
-        # stage and spectrometer, which meant a fake spectrum was on screen
-        # before anyone had chosen anything and looked exactly like a
-        # measurement. Both stay None until the operator connects a device (or
-        # asks for a simulator by name, in the Simulation window), and
-        # _sync_connection_ui puts a "no spectrometer connected" panel up in
-        # the meantime.
-        self.spec  = None
-        self.stage = None
 
         self.dlg_settings = AcquisitionSettingsDialog(self)
         self.dlg_align    = AlignmentDialog(self)
@@ -2384,15 +2337,20 @@ class FrogWindow(QMainWindow):
         # Vendor-specific controls, opened from a toolbar button that stays
         # hidden until an Avantes is actually connected.
         self.dlg_avantes  = AvantesSettingsDialog(self, self)
-        self.spin_avg  = self.dlg_settings.spin_avg
-        self.spin_idle = self.dlg_settings.spin_idle
-        self.spin_wait = self.dlg_settings.spin_wait
-        # Controls that moved into sub-windows but are still driven from here.
-        # Aliased rather than reached through the dialog at every call site, so
-        # _sync_backlash_ui, _on_backlash_changed, _set_stage_controls_enabled
-        # and the alignment sweep read exactly what they always did. Both
-        # dialogs are built above _build_ui(), which is what needs them.
-        self.spin_align_step = self.dlg_align.spin_align_step
+        # The Avantes window announces a full-scale change; the Spectrometer
+        # window shows full scale as its override placeholder. Neither knows
+        # about the other — this is the one place that knows both exist.
+        self.dlg_avantes.full_scale_changed.connect(
+            lambda: self.dlg_spec.isVisible() and self.dlg_spec.refresh())
+        # Two WIDGETS that moved into a sub-window but are still driven from
+        # here, aliased because the widget itself is what is needed —
+        # _sync_backlash_ui blocks its signals and writes a value into it, and
+        # _set_stage_controls_enabled puts it in a tuple with six others. Every
+        # other cross-window read is a named value property on the dialog
+        # (dlg_settings.n_average, dlg_align.step_fs, dlg_graphics.log_scale …),
+        # which is what a caller actually wants and what keeps this window from
+        # knowing which spinbox holds what. Both dialogs are built above
+        # _build_ui(), which is what needs them.
         self.spin_backlash   = self.dlg_stage.spin_backlash
         self.lbl_backlash_fs = self.dlg_stage.lbl_backlash_fs
         # The threshold is applied live, not just at scan start, so the lamp
@@ -2459,21 +2417,128 @@ class FrogWindow(QMainWindow):
         self._settings_timer.timeout.connect(self._autosave_settings)
         self._settings_timer.start()
 
+    # ── Instrument state ─────────────────────────────────────────────────────
+    # One forwarder per InstrumentState field. Read lillypad/gui/state.py for
+    # what is in there and why; these exist so that the window's own ~200 uses
+    # of `self.spec`, `self.background`, `self.scan_cfg` and the rest read as
+    # they always did while a dialog or a controller can be handed the state
+    # object alone and be unable to reach the widgets.
+    #
+    # Both directions on purpose. Several of these are assigned in ordinary
+    # control flow (`self.spec = new_spec`, `self.background = None`), and a
+    # read-only property would turn each of those into a silent shadowing bug
+    # the first time one was missed.
+    @property
+    def spec(self):
+        return self.state.spec
+
+    @spec.setter
+    def spec(self, value):
+        self.state.spec = value
+
+    @property
+    def stage(self):
+        return self.state.stage
+
+    @stage.setter
+    def stage(self, value):
+        self.state.stage = value
+
+    @property
+    def scan_cfg(self):
+        return self.state.scan_cfg
+
+    @scan_cfg.setter
+    def scan_cfg(self, value):
+        self.state.scan_cfg = value
+
+    @property
+    def background(self):
+        return self.state.background
+
+    @background.setter
+    def background(self, value):
+        self.state.background = value
+
+    @property
+    def background_members(self):
+        return self.state.background_members
+
+    @background_members.setter
+    def background_members(self, value):
+        self.state.background_members = value
+
+    @property
+    def background_exposures(self):
+        return self.state.background_exposures
+
+    @background_exposures.setter
+    def background_exposures(self, value):
+        self.state.background_exposures = value
+
+    @property
+    def _multi(self):
+        return self.state.multi
+
+    @_multi.setter
+    def _multi(self, value):
+        self.state.multi = value
+
+    @property
+    def _multi_members(self):
+        return self.state.multi_members
+
+    @_multi_members.setter
+    def _multi_members(self, value):
+        self.state.multi_members = value
+
+    @property
+    def _stitch_stale(self):
+        return self.state.stitch_stale
+
+    @_stitch_stale.setter
+    def _stitch_stale(self, value):
+        self.state.stitch_stale = value
+
+    @property
+    def sim_pulse(self):
+        return self.state.sim_pulse
+
+    @sim_pulse.setter
+    def sim_pulse(self, value):
+        self.state.sim_pulse = value
+
+    @property
+    def sim_gate(self):
+        return self.state.sim_gate
+
+    @sim_gate.setter
+    def sim_gate(self, value):
+        self.state.sim_gate = value
+
+    @property
+    def seabreeze_backend(self):
+        return self.state.seabreeze_backend
+
+    @seabreeze_backend.setter
+    def seabreeze_backend(self, value):
+        self.state.seabreeze_backend = value
+
     # ── Connection state ─────────────────────────────────────────────────────
-    # self.spec and self.stage are None when nothing is connected — a real
-    # absence rather than a stand-in device, so nothing can quietly return
-    # plausible-looking counts or positions for hardware that is not there.
-    # Everything that reaches a device goes through one of these three.
+    # spec and stage are None when nothing is connected — a real absence rather
+    # than a stand-in device, so nothing can quietly return plausible-looking
+    # counts or positions for hardware that is not there. Everything that
+    # reaches a device goes through one of these three.
     def _have_spec(self):
-        return self.spec is not None
+        return self.state.have_spec()
 
     def _have_stage(self):
-        return self.stage is not None
+        return self.state.have_stage()
 
     def _pair_live(self):
         """True while two spectrometers are connected as one stitched device.
         This is the ONLY definition of multi-spectrometer mode."""
-        return isinstance(self.spec, StitchedSpectrometer)
+        return self.state.pair_live()
 
     # ── Shared-device access ─────────────────────────────────────────────────
     def _scan_running(self):
@@ -4206,11 +4271,11 @@ class FrogWindow(QMainWindow):
             b.setEnabled(have_spec)
         self._position_panel_buttons()
         if self.dlg_spec.isVisible():
-            self.dlg_spec._refresh()
+            self.dlg_spec.refresh()
         if self.dlg_stage.isVisible():
-            self.dlg_stage._refresh()
+            self.dlg_stage.refresh()
         if self.dlg_sim.isVisible():
-            self.dlg_sim._refresh()
+            self.dlg_sim.refresh()
 
     def _sync_multi_ui(self):
         """Bring every stitched-vs-single widget into line with self.spec.
@@ -4320,7 +4385,7 @@ class FrogWindow(QMainWindow):
         if not devices and self.dlg_avantes.isVisible():
             self.dlg_avantes.hide()      # its target just went away
         elif devices and self.dlg_avantes.isVisible():
-            self.dlg_avantes._refresh()  # a swap may have changed which device
+            self.dlg_avantes.refresh()  # a swap may have changed which device
 
     @staticmethod
     def _seed_integration_spin(spin, dev):
@@ -4829,7 +4894,7 @@ class FrogWindow(QMainWindow):
         # parked, so nothing else is talking to it. Checked BEFORE moving:
         # clamping a target would quietly destroy the +/- symmetry the whole
         # measurement is about, so an out-of-range sweep is refused instead.
-        step = float(self.spin_align_step.value())
+        step = self.dlg_align.step_fs
         pf   = self.scan_cfg.pass_factor
         try:
             start_um = _stage_to_um(self.stage.get_position())
@@ -4890,7 +4955,7 @@ class FrogWindow(QMainWindow):
             self.status.showMessage(f"Alignment differences failed: {e}", 5000)
             return
         self.canvas.show_diff(wl, d1, d2)
-        step = float(self.spin_align_step.value())
+        step = self.dlg_align.step_fs
         # Peak absolute imbalance as a fraction of the largest measured signal:
         # the one number that says "symmetric" or "not" without reading the
         # curves off the panel.
@@ -5093,7 +5158,7 @@ class FrogWindow(QMainWindow):
     def _refresh_logscale_button(self):
         """Label and tooltip of the log/linear toggle. Reads the checkbox, not
         the axes: chk_log is the single source of truth for the scale."""
-        on = self.dlg_graphics.chk_log.isChecked()
+        on = self.dlg_graphics.log_scale
         self.btn_logscale.setText("log" if on else "lin")
         self.btn_logscale.setToolTip(
             "Spectrum Y axis is LOGARITHMIC — click for linear." if on else
@@ -5517,6 +5582,20 @@ class FrogWindow(QMainWindow):
             self.btn_align_trace.blockSignals(False)
         self._align_trace_on = False
         self._refresh_align_trace_button()
+
+    # Whether the live feed is meant to be running. The toolbar button is the
+    # one piece of state that answers that, but callers outside this file (the
+    # Avantes window has to stop the feed before arming a hardware trigger)
+    # should ask in these terms rather than reaching for the widget.
+    @property
+    def feed_enabled(self):
+        return self.btn_feed.isChecked()
+
+    def set_feed_enabled(self, on):
+        """Turn the live feed on or off as if the button had been clicked —
+        setChecked runs _toggle_feed through the toggled signal, so the feed,
+        the button's icon and its tooltip all follow."""
+        self.btn_feed.setChecked(bool(on))
 
     def _toggle_feed(self, on):
         if on:
@@ -5963,13 +6042,13 @@ class FrogWindow(QMainWindow):
         c.delay_start_fs = self.spin_start.value()
         c.delay_stop_fs  = self.spin_stop.value()
         c.delay_step_fs  = self.spin_step_fs.value()
-        c.n_average      = self.spin_avg.value()
-        c.idle_shots     = self.spin_idle.value()
-        c.wait_after_move_s = self.spin_wait.value() / 1000.0
-        c.capture_delay_reference = self.dlg_settings.chk_ref.isChecked()
-        c.saturation_fraction  = self.dlg_settings.spin_sat.value() / 100.0
-        c.abort_on_saturation  = self.dlg_settings.chk_abort_sat.isChecked()
-        c.abort_on_stage_fault = self.dlg_settings.chk_abort_stage_fault.isChecked()
+        c.n_average      = self.dlg_settings.n_average
+        c.idle_shots     = self.dlg_settings.idle_shots
+        c.wait_after_move_s = self.dlg_settings.settle_ms / 1000.0
+        c.capture_delay_reference = self.dlg_settings.take_delay_reference
+        c.saturation_fraction  = self.dlg_settings.sat_percent / 100.0
+        c.abort_on_saturation  = self.dlg_settings.abort_on_saturation
+        c.abort_on_stage_fault = self.dlg_settings.abort_on_stage_fault
         # c.saturation_counts is owned by the Hardware dialog's override field.
 
         try:
@@ -6464,7 +6543,7 @@ class FrogWindow(QMainWindow):
             # a zoom taken to read one feature survived the restart and the
             # program came back still zoomed into it, on data that had gone.
             # Every launch starts on the normal view and fits to what is there.
-            ("log_scale",  g.chk_log.isChecked,
+            ("log_scale",  lambda: g.log_scale,
                            lambda v: g.chk_log.setChecked(as_bool(v))),
             # setCurrentText is a silent no-op on a non-editable combo for a name
             # that is not in the list, so a colormap dropped from
@@ -6483,21 +6562,21 @@ class FrogWindow(QMainWindow):
             # save, so storing it would bring back the day this was written.
             ("export_name", self.dlg_export.edit_name.text,
                             lambda v: self.dlg_export.edit_name.setText(str(v))),
-            ("export_date_prefix", self.dlg_export.chk_date.isChecked,
+            ("export_date_prefix", lambda: self.dlg_export.date_stamped,
                                    lambda v: self.dlg_export.chk_date.setChecked(
                                        as_bool(v))),
 
-            ("avg_per_point",      d.spin_avg.value,
+            ("avg_per_point",      lambda: d.n_average,
                                    lambda v: d.spin_avg.setValue(int(v))),
-            ("idle_shots",         d.spin_idle.value,
+            ("idle_shots",         lambda: d.idle_shots,
                                    lambda v: d.spin_idle.setValue(int(v))),
-            ("wait_after_move_ms", d.spin_wait.value,
+            ("wait_after_move_ms", lambda: d.settle_ms,
                                    lambda v: d.spin_wait.setValue(int(v))),
-            ("saturation_pct",     d.spin_sat.value,
+            ("saturation_pct",     lambda: d.sat_percent,
                                    lambda v: d.spin_sat.setValue(float(v))),
-            ("abort_on_saturation",  d.chk_abort_sat.isChecked,
+            ("abort_on_saturation",  lambda: d.abort_on_saturation,
                                      lambda v: d.chk_abort_sat.setChecked(as_bool(v))),
-            ("abort_on_stage_fault", d.chk_abort_stage_fault.isChecked,
+            ("abort_on_stage_fault", lambda: d.abort_on_stage_fault,
                                      lambda v: d.chk_abort_stage_fault.setChecked(as_bool(v))),
 
             ("scan_start_fs",   self.spin_start.value,
@@ -6506,11 +6585,11 @@ class FrogWindow(QMainWindow):
                                 lambda v: self.spin_stop.setValue(float(v))),
             ("scan_step_fs",    self.spin_step_fs.value,
                                 lambda v: self.spin_step_fs.setValue(float(v))),
-            ("scan_delay_reference", self.dlg_settings.chk_ref.isChecked,
+            ("scan_delay_reference", lambda: d.take_delay_reference,
                                 lambda v: self.dlg_settings.chk_ref.setChecked(
                                     as_bool(v))),
-            ("align_step_fs",   self.spin_align_step.value,
-                                lambda v: self.spin_align_step.setValue(float(v))),
+            ("align_step_fs",   lambda: self.dlg_align.step_fs,
+                                lambda v: self.dlg_align.spin_align_step.setValue(float(v))),
         ]
 
     def _window_geometry(self):
