@@ -129,7 +129,7 @@ stage reported a fault, since "zero" would no longer mean anything.
 | --- | --- |
 | `.dwc` | The FROG trace, Femtosoft-style. **Background subtracted.** |
 | `.csv` | The same trace as a spreadsheet table. **Background subtracted.** |
-| `.npz` | Everything: **raw counts**, both background frames kept separately, the per-column saturation and stage-fault record, and full metadata. |
+| `.npz` | Everything: **raw counts**, the **dark** that was subtracted from the other two files, any delay-extreme reference frames, the per-column saturation and stage-fault record, and full metadata. |
 
 If you want untouched numbers, use `.npz`. The two text formats have fixed
 layouts that cannot carry the extras, so they get the subtracted trace.
@@ -170,27 +170,38 @@ dialled in, the log scale, the AC width, a frozen reference curve, the symmetry
 fold. There is no need to wait for a scan: the live spectrum prints just as
 well.
 
-## Two kinds of "background"
+## Dark correction, and the delay-extreme reference
 
-Easy to mix up:
+One dark, used everywhere:
 
-- **Record Dark** (Spectrum panel) takes a dark frame *now* and, with
-  **Subtract Dark** ticked, removes it from what you see and from the stitching
-  fit. A display and fitting aid.
-- **Background** (Acquisition Settings) records a frame *before and after* each
-  scan. These are stored with the measurement, not silently folded into it.
+- **Record Dark** (Spectrum panel) takes a dark frame *now*. With **Subtract
+  Dark** ticked it comes off what you see, off the stitching fit, **and off the
+  `.dwc` and `.csv` you export**. It is sampled once when a scan starts, so
+  every column of a trace is corrected the same way — unticking mid-scan
+  therefore applies to the *next* one.
+- A dark is only valid for the exposure it was taken at, so changing the
+  integration time throws it away and says why. Record it again.
+- Starting a scan with no dark, or with **Subtract Dark** off, asks first. You
+  can go ahead; the `.npz` then records `dark_subtracted: false`, which is the
+  one thing a reader of a `.dwc` cannot otherwise tell.
 
-A dark is only valid for the exposure it was taken at, so changing the
-integration time throws it away and says why. Record it again.
+**Delay-extreme reference** (Acquisition Settings) is optional and off by
+default. It records one frame at each end of the delay sweep and archives both
+in the `.npz` beside the dark that was actually subtracted. **Nothing subtracts
+it.** It is there so a real pedestal can be told from delay-independent scatter
+after the fact.
 
-**What the trace panel shows.** Every panel is drawn with the pedestal taken
-off. While a scan runs that is the recorded dark, sampled once when the scan
-starts so the whole trace is corrected the same way — unticking **Subtract
-Dark** mid-scan therefore applies to the *next* one. When the scan finishes the
-panel switches to the scan's own bracketed background, which was measured with
-the beam blocked and already contains the dark, so the two are never subtracted
-together. With **Background** unticked it stays on the dark; with neither, the
-trace is drawn as measured.
+> This used to be called **Background**, lived on the scan panel, was on by
+> default, and was what the `.dwc` and `.csv` were corrected with. It is
+> measured with the beam exactly as it is, at the first and last delay — not
+> with the beam blocked, despite what the old tooltip promised — so subtracting
+> it also removed any real signal still present at the ends of the sweep, and
+> gave a different answer from other software. If you have older `.npz` files,
+> their frames are under `background_before` / `background_after`; new ones use
+> `delay_reference_before` / `delay_reference_after`, and add `dark`.
+
+**What the panels show.** Every panel is drawn with the pedestal taken off, using
+that same dark. With **Subtract Dark** off, the trace is drawn as measured.
 
 This matters most on a **stitched pair**, where it is the difference between a
 readable trace and a mystery. The two detectors have very different dark
@@ -200,12 +211,11 @@ uncorrected merged frame therefore carries a *step* across the crossfade band,
 at the same wavelengths in every column, which draws as a hard horizontal line
 across the whole FROG trace.
 
-All of this is display only. `result.trace`, the `.npz` and the exports are
-untouched: the `.dwc` and `.csv` have always been written background-subtracted
-(the panel now agrees with them), and the `.npz` still archives raw counts with
-both background frames kept separately. One thing has *not* followed: the
-`fwhm_ac_fs` field inside the `.npz` metadata is still computed from the raw
-trace, so it can differ slightly from the **AC FWHM** shown on the panel.
+`result.trace` and the `.npz` are still archived raw: the archive keeps the raw
+counts **and** the dark, so `trace - dark` reproduces exactly what the `.dwc`
+and `.csv` contain. One thing has *not* followed: the `fwhm_ac_fs` field inside
+the `.npz` metadata is computed from the raw trace. In practice it agrees with
+the panel, because the autocorrelation baseline-subtracts anyway.
 
 ---
 
@@ -268,14 +278,16 @@ does not report its own offset as asymmetry. Drag the fold line to move it.
 ### RAW — what the detectors actually saw
 
 *Top-right of the FROG Trace panel, two spectrometers only.* The normal trace is
-dark-subtracted, calibrated and blended at the stitch factor. All three tidy away
-the low-level background — exactly where alignment problems hide: satellite
-pulses, scatter, an arm that is not really seeing the beam.
+calibrated and blended at the stitch factor. Both tidy away the low-level
+structure — exactly where alignment problems hide: satellite pulses, scatter, an
+arm that is not really seeing the beam.
 
-**RAW** shows the unprocessed version: no dark subtraction, no calibration, each
-half scaled to its own maximum, and the two hard-**cut** at the middle of the
-overlap instead of blended. The visible seam and raised background are
-deliberate.
+**RAW** shows the unprocessed version: **no calibration and no stitching** —
+each half dark-corrected on its own detector, scaled to its own maximum, and the
+two hard-**cut** at the middle of the overlap instead of blended. The visible
+seam is deliberate. The dark comes off at member level, before either
+calibration, which is the only place it can be removed without involving the
+thing this view exists to show you.
 
 Hidden with a single spectrometer, and greyed out until a scan has recorded
 something. The cut is fixed when the scan starts — moving the overlap band

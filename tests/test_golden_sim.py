@@ -26,7 +26,8 @@ import pytest
 from hardware import PULSE_SHAPES, SimulatedSpectrometer, SimulatedStage
 from scan import FrogScanConfig, FrogScanWorker, write_npz
 
-from .golden.capture_golden import (COLUMN_DELAY_MM, N_PIXELS, SCAN, SEED)
+from .golden.capture_golden import (COLUMN_DELAY_MM, N_PIXELS, SCAN, SEED,
+                                    scan_dark)
 
 GOLDEN = Path(__file__).resolve().parent / "golden"
 
@@ -46,7 +47,8 @@ def fresh_scan(tmp_path_factory):
     stage = SimulatedStage(travel_mm=300.0)
     spec = SimulatedSpectrometer(stage, gate="shg", pulse="tl_sech",
                                  n_pixels=N_PIXELS)
-    worker = FrogScanWorker(stage, spec, FrogScanConfig(**SCAN))
+    worker = FrogScanWorker(stage, spec, FrogScanConfig(**SCAN),
+                            dark=scan_dark())
     out = {}
     worker.finished_scan.connect(lambda r: out.__setitem__("r", r))
     worker.error.connect(lambda m: out.__setitem__("err", m))
@@ -75,7 +77,7 @@ class TestScanBaseline:
     @pytest.mark.parametrize("key", [
         "trace", "delays_fs", "wavelengths_nm",
         "positions_cmd_um", "positions_readback_um",
-        "background_before", "background_after",
+        "dark", "delay_reference_before", "delay_reference_after",
     ])
     def test_array_is_bit_identical(self, pair, key):
         want, got = pair

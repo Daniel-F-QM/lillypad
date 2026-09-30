@@ -39,7 +39,16 @@ SEED = 20260929
 # few enough pixels to keep the baseline around 100 kB in git.
 N_PIXELS = 512
 SCAN = dict(delay_start_fs=-60.0, delay_stop_fs=60.0, delay_step_fs=6.0,
-            zero_pos_um=150000.0, capture_background=True)
+            zero_pos_um=150000.0, capture_delay_reference=True)
+
+# A synthetic dark for the baseline to be corrected with. Sloped rather than
+# flat so a transposed or broadcast-wrong subtraction cannot pass, and fixed
+# rather than measured so the baseline stays reproducible. The dark does not
+# enter the acquisition sequence at all, so the recorded TRACE is unaffected by
+# it — which is what lets this baseline stay comparable across the change that
+# introduced it.
+def scan_dark(n_pixels=None):
+    return np.linspace(100.0, 300.0, n_pixels or N_PIXELS)
 
 # One acquired column per beam, all at the same delay, so the whole beam library
 # is pinned in one small file rather than one scan per beam.
@@ -54,7 +63,7 @@ def capture_scan(path: Path) -> None:
     spec = SimulatedSpectrometer(stage, gate="shg", pulse="tl_sech",
                                  n_pixels=N_PIXELS)
     cfg = FrogScanConfig(**SCAN)
-    worker = FrogScanWorker(stage, spec, cfg)
+    worker = FrogScanWorker(stage, spec, cfg, dark=scan_dark())
     out = {}
     worker.finished_scan.connect(lambda r: out.__setitem__("r", r))
     worker.error.connect(lambda m: out.__setitem__("err", m))

@@ -22,7 +22,7 @@ from scan import (FrogResult, FrogScanConfig, write_csv, write_dwc, write_npz)
 N_WL, N_DELAY = 6, 5
 
 
-def make_result(descending=False, background=True, **kw):
+def make_result(descending=False, dark=True, reference=False, **kw):
     """A small, fully-populated FrogResult with recognisable values.
 
     `descending` models the SAME physical measurement taken high-to-low, so the
@@ -43,15 +43,17 @@ def make_result(descending=False, background=True, **kw):
     cfg = FrogScanConfig(delay_start_fs=float(delays[0]),
                          delay_stop_fs=float(delays[-1]),
                          delay_step_fs=10.0, zero_pos_um=150000.0)
-    bg = np.full(N_WL, 50.0) if background else None
+    the_dark = np.full(N_WL, 50.0) if dark else None
+    ref = np.full(N_WL, 70.0) if reference else None
     defaults = dict(
         delays_fs=delays,
         positions_cmd_um=cmd,
         positions_readback_um=readback,
         wavelengths_nm=wl,
         trace=trace,
-        background_before=bg,
-        background_after=bg,
+        dark=the_dark,
+        delay_reference_before=ref,
+        delay_reference_after=ref,
         config=cfg,
         stage_name="SimulatedStage",
         stage_backlash_um=8.0,
@@ -61,20 +63,31 @@ def make_result(descending=False, background=True, **kw):
 
 
 class TestResultModel:
-    def test_background_is_the_mean_of_the_bracket(self):
-        r = make_result()
-        assert np.allclose(r.background(), 50.0)
-
-    def test_background_is_none_without_frames(self):
-        assert make_result(background=False).background() is None
-
-    def test_corrected_trace_subtracts_the_background_per_wavelength(self):
+    def test_corrected_trace_subtracts_the_dark_per_wavelength(self):
         r = make_result()
         assert np.allclose(r.corrected_trace(), np.asarray(r.trace) - 50.0)
 
-    def test_corrected_trace_is_the_raw_trace_without_a_background(self):
-        r = make_result(background=False)
+    def test_corrected_trace_is_the_raw_trace_without_a_dark(self):
+        r = make_result(dark=False)
         assert np.allclose(r.corrected_trace(), r.trace)
+
+    def test_dark_subtracted_reports_which_it_was(self):
+        """The one thing a reader of a .dwc cannot otherwise tell."""
+        assert make_result(dark=True).dark_subtracted is True
+        assert make_result(dark=False).dark_subtracted is False
+
+    def test_the_delay_reference_is_never_subtracted(self):
+        """Archived for provenance only. A result carrying a reference and no
+        dark must still export raw counts."""
+        r = make_result(dark=False, reference=True)
+        assert r.delay_reference() is not None
+        assert np.allclose(r.corrected_trace(), r.trace)
+
+    def test_delay_reference_is_the_mean_of_the_two_frames(self):
+        assert np.allclose(make_result(reference=True).delay_reference(), 70.0)
+
+    def test_delay_reference_is_none_when_not_taken(self):
+        assert make_result().delay_reference() is None
 
     def test_saturation_unchecked_is_distinct_from_clean(self):
         """A scan that could not check at all is NOT the same as a clean scan,
@@ -182,8 +195,7 @@ class TestNpz:
         with np.load(p, allow_pickle=False) as z:
             assert np.array_equal(z["trace"], r.trace)
             assert not np.allclose(z["trace"], r.corrected_trace())
-            assert np.array_equal(z["background_before"], r.background_before)
-            assert np.array_equal(z["background_after"], r.background_after)
+            assert np.array_equal(z["dark"], r.dark)
 
     def test_keeps_acquisition_order_for_a_descending_scan(self, tmp_path):
         """Unlike .dwc and .csv. Line up an archive against a .dwc by delay
@@ -197,9 +209,10 @@ class TestNpz:
 
     def test_omits_optional_arrays_that_were_never_recorded(self, tmp_path):
         p = tmp_path / "t.npz"
-        write_npz(p, make_result(background=False))
+        write_npz(p, make_result(dark=False))
         with np.load(p, allow_pickle=False) as z:
-            assert "background_before" not in z
+            assert "dark" not in z
+            assert "delay_reference_before" not in z
             assert "n_saturated" not in z
             assert "stage_faults" not in z
 
@@ -224,7 +237,8 @@ class TestNpz:
         assert meta["n_pixels"] == N_WL
         assert meta["stage_name"] == "SimulatedStage"
         assert meta["stage_backlash_um"] == 8.0
-        assert meta["has_background"] is True
+        assert meta["dark_subtracted"] is True
+        assert meta["has_delay_reference"] is False
         assert meta["saturation_checked"] is False
 
 

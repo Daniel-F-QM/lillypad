@@ -114,10 +114,17 @@ def write_npz(path, result):
         # Also per column: "" is clean, anything else names what the stage
         # reported and means that column's delay label cannot be trusted.
         data["stage_faults"] = np.asarray(result.stage_faults, dtype=str)
-    if result.background_before is not None:
-        data["background_before"] = result.background_before
-    if result.background_after is not None:
-        data["background_after"] = result.background_after
+    # The dark that WAS subtracted from .dwc/.csv, so an archive can reproduce
+    # either form: trace - dark is what the other two files contain.
+    if result.dark is not None:
+        data["dark"] = np.asarray(result.dark, float)
+    # The delay-extreme reference frames, which nothing subtracted. Named for
+    # what they are: they used to be called background_before/after, back when
+    # they were what the exports were corrected with.
+    if result.delay_reference_before is not None:
+        data["delay_reference_before"] = result.delay_reference_before
+    if result.delay_reference_after is not None:
+        data["delay_reference_after"] = result.delay_reference_after
     np.savez(path, **data)
 
 

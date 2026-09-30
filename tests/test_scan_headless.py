@@ -29,22 +29,22 @@ def small_cfg():
     without paying for a real trace."""
     return FrogScanConfig(delay_start_fs=-30, delay_stop_fs=30,
                           delay_step_fs=10.0, zero_pos_um=150000.0,
-                          capture_background=False)
+                          capture_delay_reference=False)
 
 
-def run_scan(stage, spec, cfg):
+def run_scan(stage, spec, cfg, dark=None):
     """Run a scan synchronously and collect everything it emitted."""
-    worker = FrogScanWorker(stage, spec, cfg)
+    worker = FrogScanWorker(stage, spec, cfg, dark=dark)
     out = {"result": None, "error": None, "faults": [], "columns": [],
-           "backgrounds": [], "saturations": [], "progress": []}
+           "references": [], "saturations": [], "progress": []}
     worker.finished_scan.connect(lambda r: out.__setitem__("result", r))
     worker.error.connect(lambda m: out.__setitem__("error", m))
     worker.stage_fault.connect(
         lambda i, delay, why: out["faults"].append((i, why)))
     worker.column_ready.connect(
         lambda i, *rest: out["columns"].append(i))
-    worker.background_ready.connect(
-        lambda which, frame: out["backgrounds"].append(which))
+    worker.delay_reference_ready.connect(
+        lambda which, frame: out["references"].append(which))
     worker.saturation_warning.connect(
         lambda i, *rest: out["saturations"].append(i))
     worker.progress.connect(lambda i, n: out["progress"].append((i, n)))
@@ -115,16 +115,25 @@ class TestCleanScan:
         assert _stage_to_um(stage.get_position()) == pytest.approx(
             small_cfg.zero_pos_um, abs=1.0)
 
-    def test_captures_both_background_brackets_when_asked(self, small_cfg):
+    def test_captures_both_delay_references_when_asked(self, small_cfg):
         stage = SimulatedStage(travel_mm=300.0)
         spec = SimulatedSpectrometer(stage, gate="shg")
-        cfg = replace(small_cfg, capture_background=True)
+        cfg = replace(small_cfg, capture_delay_reference=True)
         out = run_scan(stage, spec, cfg)
         r = out["result"]
-        assert r.background_before is not None
-        assert r.background_after is not None
-        assert len(out["backgrounds"]) == 2
-        assert r.background().size == spec.n_pixels
+        assert r.delay_reference_before is not None
+        assert r.delay_reference_after is not None
+        assert len(out["references"]) == 2
+        assert r.delay_reference().size == spec.n_pixels
+
+    def test_no_delay_reference_by_default(self, small_cfg):
+        """It costs two acquisitions and is diagnostic only, so it is opt-in."""
+        assert FrogScanConfig.capture_delay_reference is False
+        stage = SimulatedStage(travel_mm=300.0)
+        spec = SimulatedSpectrometer(stage, gate="shg")
+        out = run_scan(stage, spec, small_cfg)
+        assert out["references"] == []
+        assert out["result"].delay_reference() is None
 
     def test_abort_stops_the_scan(self, small_cfg):
         stage = SimulatedStage(travel_mm=300.0)
@@ -226,7 +235,7 @@ class TestTravelGuard:
         fit rather than losing half a scan to a limit stop."""
         cfg = FrogScanConfig(delay_start_fs=-1e7, delay_stop_fs=1e7,
                              delay_step_fs=1e6, zero_pos_um=150000.0,
-                             capture_background=False)
+                             capture_delay_reference=False)
         stage = SimulatedStage(travel_mm=300.0)
         spec = SimulatedSpectrometer(stage, gate="shg")
         start = stage.get_position()

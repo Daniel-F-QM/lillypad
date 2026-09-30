@@ -41,26 +41,33 @@ class FrogScanWorker(QThread):
       progress(done, total)
       column_ready(i, delay_fs, readback_um, column, members)  # for the live plot
         members: the two RAW member frames (stitched pair) or None
-      background_ready("before"|"after", spectrum)
-      saturation_warning(i, delay_fs, n_pixels, peak)       # i = -1 for a bg frame
+      delay_reference_ready("before"|"after", spectrum)
+      saturation_warning(i, delay_fs, n_pixels, peak)       # i = -1 for a ref frame
       stage_fault(i, delay_fs, reason)                      # i = -1 outside the sweep
       finished_scan(FrogResult)
       error(message)
     """
     progress           = Signal(int, int)
     column_ready       = Signal(int, float, float, object, object)
-    background_ready   = Signal(str, object)
+    delay_reference_ready = Signal(str, object)
     saturation_warning = Signal(int, float, int, float)
     stage_fault        = Signal(int, float, str)
     finished_scan      = Signal(object)
     error              = Signal(str)
 
     def __init__(self, stage: StageBase, spectrometer: SpectrometerBase,
-                 config: FrogScanConfig, parent=None):
+                 config: FrogScanConfig, dark=None, parent=None):
         super().__init__(parent)
         self.stage    = stage
         self.spec     = spectrometer
         self.cfg      = config
+        # The frame to subtract from the exported trace, or None to export raw
+        # counts. Passed IN rather than measured here: it is the same dark the
+        # Spectrum panel is using, snapshotted by the caller when the scan
+        # started, so the picture on screen and the file on disk agree. A scan
+        # never records its own — that is what made the old bracketed
+        # "background" a second, silently different notion of the same word.
+        self.dark     = None if dark is None else np.asarray(dark, float)
         self._abort   = False
         self._sat_thr = None      # full-scale threshold, set in run()
         self._member_thr = None   # per-member thresholds (stitched), set in run()
@@ -180,7 +187,7 @@ class FrogScanWorker(QThread):
             n_wl     = self.spec.wavelengths.size
             trace    = np.zeros((n_wl, total))
             readback = np.zeros(total)
-            bg_before = bg_after = None
+            ref_before = ref_after = None
             # Recorded for EVERY frame, not just the clipped ones, so the saved
             # archive carries a per-column map of what is trustworthy.
             n_sat_col = np.zeros(total, dtype=int)
@@ -249,13 +256,14 @@ class FrogScanWorker(QThread):
                     return True
                 return False
 
-            # Background BEFORE — captured at the start position.
+            # Delay-extreme reference BEFORE — captured at the start position.
+            # Archived, never subtracted (see FrogScanConfig.capture_delay_reference).
             self.stage.move_to(um_to_stage(targets[0]))
             if check_fault(-1, delays[0]):
                 return
-            if cfg.capture_background:
-                bg_before, peak, n_sat, _ = self._measure()
-                self.background_ready.emit("before", bg_before)
+            if cfg.capture_delay_reference:
+                ref_before, peak, n_sat, _ = self._measure()
+                self.delay_reference_ready.emit("before", ref_before)
                 if check_sat(-1, delays[0], peak, n_sat, bg="before"):
                     return
 
@@ -276,10 +284,10 @@ class FrogScanWorker(QThread):
                 if check_fault(i, delays[i], targets[i], pos_um):
                     return
 
-            # Background AFTER — captured at the end position.
-            if cfg.capture_background and not self._abort:
-                bg_after, peak, n_sat, _ = self._measure()
-                self.background_ready.emit("after", bg_after)
+            # Delay-extreme reference AFTER — captured at the end position.
+            if cfg.capture_delay_reference and not self._abort:
+                ref_after, peak, n_sat, _ = self._measure()
+                self.delay_reference_ready.emit("after", ref_after)
                 check_sat(-1, delays[-1], peak, n_sat, bg="after")
 
             self.finished_scan.emit(FrogResult(
@@ -288,13 +296,14 @@ class FrogScanWorker(QThread):
                 positions_readback_um=readback,
                 wavelengths_nm=np.asarray(self.spec.wavelengths, float),
                 trace=trace,
-                background_before=bg_before,
-                background_after=bg_after,
+                dark=self.dark,
+                delay_reference_before=ref_before,
+                delay_reference_after=ref_after,
                 config=cfg,
                 saturation_threshold=self._sat_thr,
                 n_saturated=n_sat_col,
-                n_saturated_bg_before=bg_sat["before"],
-                n_saturated_bg_after=bg_sat["after"],
+                n_saturated_ref_before=bg_sat["before"],
+                n_saturated_ref_after=bg_sat["after"],
                 stage_faults=faults,
                 stage_name=str(getattr(self.stage, "name", "")),
                 stage_backlash_um=backlash_um,

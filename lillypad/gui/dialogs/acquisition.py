@@ -82,6 +82,29 @@ class AcquisitionSettingsDialog(QDialog):
         stage_hint.setObjectName("dim"); stage_hint.setWordWrap(True)
         lay.addWidget(stage_hint)
 
+        lay.addWidget(_hline())
+
+        # ── Delay-extreme reference ──────────────────────────────────────────
+        lay.addWidget(self._hdr("Delay-extreme reference"))
+        self.chk_ref = QCheckBox("Record a reference frame at each end of the sweep")
+        self.chk_ref.setChecked(FrogScanConfig.capture_delay_reference)
+        lay.addWidget(self.chk_ref)
+
+        ref_hint = QLabel(
+            "Diagnostic only — NOTHING is subtracted from it. The exported "
+            "trace is corrected with the dark recorded in the Spectrum panel, "
+            "and these two frames are archived in the .npz beside that dark so "
+            "a real pedestal can be told from delay-independent scatter after "
+            "the fact.\n\n"
+            "This used to be called “Background”, sat on the scan "
+            "panel, and was what the .dwc and .csv were corrected with — "
+            "even though it is measured with the beam exactly as it is, at the "
+            "first and last delay. Subtracting it also removed any real signal "
+            "still present at the ends of the sweep. Costs two extra "
+            "acquisitions.")
+        ref_hint.setObjectName("dim"); ref_hint.setWordWrap(True)
+        lay.addWidget(ref_hint)
+
         btn = QPushButton("Close"); btn.clicked.connect(self.hide)
         lay.addWidget(btn)
 

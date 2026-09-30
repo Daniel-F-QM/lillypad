@@ -2316,6 +2316,7 @@ class FrogWindow(QMainWindow):
         # The pedestal the running scan's columns are drawn against, sampled
         # once when it starts (see _start_scan). None = draw them as measured.
         self._scan_dark    = None
+        self._scan_member_dark = None
         # The finished scan as the panels show it — pedestal removed — and its
         # autocorrelation. Every view of a finished trace (the trace itself,
         # the symmetry fold, the width readout) is built from these two rather
@@ -3981,11 +3982,6 @@ class FrogWindow(QMainWindow):
         g.addWidget(self.eq_start, 1, 1)
         g.addWidget(self.eq_stop,  1, 3)
         cell(2, 0, "Step", self.spin_step_fs, " fs", 1, 0.1, 1e5, 1.0)
-        self.chk_bg = QCheckBox("Background")
-        self.chk_bg.setChecked(True)
-        self.chk_bg.setToolTip("Record a background frame before and after the "
-                               "scan, with the beam blocked when prompted.")
-        g.addWidget(self.chk_bg, 2, 3, Qt.AlignLeft | Qt.AlignVCenter)
         lay.addLayout(g)
         for s in (self.spin_start, self.spin_stop):
             s.valueChanged.connect(self._refresh_scan_um)
@@ -5459,15 +5455,28 @@ class FrogWindow(QMainWindow):
         self._refresh_align_trace_button()
 
     def _store_align_column(self, i, members_raw):
-        """Fold one column's RAW member frames into the raw trace. O(n_wl)."""
+        """Fold one column's member frames into the raw trace. O(n_wl).
+
+        The recorded dark comes off each member BEFORE interpolation, at member
+        level, because that is the only place it can be taken off without
+        involving either calibration or the crossfade — which is the whole point
+        of this view. Everything else stays raw: no calibration, no stitch
+        factor, a hard cut rather than a blend, each half on its own scale.
+        """
         if self._align_trace is None or members_raw is None:
             return
         w = self._scan_wl
         k = self._align_cut
         wl1, wl2 = self._align_wl
-        m1, m2 = members_raw
-        lo = np.interp(w[:k], wl1, np.asarray(m1, float))
-        hi = np.interp(w[k:], wl2, np.asarray(m2, float))
+        m1, m2 = (np.asarray(f, float) for f in members_raw)
+        darks = self._scan_member_dark
+        if darks is not None and len(darks) == 2:
+            d1, d2 = (np.asarray(d, float) for d in darks)
+            if d1.shape == m1.shape and d2.shape == m2.shape:
+                m1 = m1 - d1
+                m2 = m2 - d2
+        lo = np.interp(w[:k], wl1, m1)
+        hi = np.interp(w[k:], wl2, m2)
         self._align_trace[:k, i] = lo
         self._align_trace[k:, i] = hi
         if lo.size:
@@ -5957,7 +5966,7 @@ class FrogWindow(QMainWindow):
         c.n_average      = self.spin_avg.value()
         c.idle_shots     = self.spin_idle.value()
         c.wait_after_move_s = self.spin_wait.value() / 1000.0
-        c.capture_background = self.chk_bg.isChecked()
+        c.capture_delay_reference = self.dlg_settings.chk_ref.isChecked()
         c.saturation_fraction  = self.dlg_settings.spin_sat.value() / 100.0
         c.abort_on_saturation  = self.dlg_settings.chk_abort_sat.isChecked()
         c.abort_on_stage_fault = self.dlg_settings.chk_abort_stage_fault.isChecked()
@@ -5968,6 +5977,14 @@ class FrogWindow(QMainWindow):
         except ValueError as e:
             self.status.showMessage(f"Bad scan range: {e}", 4000); return
         wl = np.asarray(self.spec.wavelengths, float)
+
+        # No dark means the exported trace carries the full pedestal, which on
+        # a typical bench is several times the signal — so say so ONCE, before
+        # anything moves, and let the operator decide. Asked here rather than
+        # refused outright because a deliberately uncorrected scan is a
+        # legitimate thing to want; the .npz records which it was either way.
+        if self._display_dark() is None and not self._confirm_no_dark():
+            return
 
         # Hand the shared stage/spectrometer over to the scan worker: pause the
         # live feed and wait for any in-flight acquire to finish first. If it
@@ -6010,6 +6027,13 @@ class FrogWindow(QMainWindow):
         # Dark, and that now takes effect on the next scan rather than striping
         # this one.
         self._scan_dark   = self._display_dark()
+        # The same dark at MEMBER level, for the RAW view. RAW shows the two
+        # detectors uncalibrated and unstitched, so the pedestal has to come off
+        # each member's own raw frame — the combined dark above has already been
+        # through both calibrations and the crossfade.
+        self._scan_member_dark = (
+            self.background_members
+            if (self.chk_dark.isChecked() and self._pair_live()) else None)
         # Running reductions _on_column keeps current, so the per-column render
         # never has to walk the trace. Reallocated with the trace: an aborted
         # scan leaves these sized to the OLD delay axis.
@@ -6033,10 +6057,11 @@ class FrogWindow(QMainWindow):
         self.btn_scan.style().unpolish(self.btn_scan); self.btn_scan.style().polish(self.btn_scan)
         self._set_save_enabled(False)
 
-        self._worker = FrogScanWorker(self.stage, self.spec, c)
+        self._worker = FrogScanWorker(self.stage, self.spec, c,
+                                      dark=self._scan_dark)
         self._worker.progress.connect(self._on_progress)
         self._worker.column_ready.connect(self._on_column)
-        self._worker.background_ready.connect(self._on_background)
+        self._worker.delay_reference_ready.connect(self._on_delay_reference)
         self._worker.saturation_warning.connect(self._on_saturation)
         self._worker.stage_fault.connect(self._on_stage_fault)
         self._worker.finished_scan.connect(self._on_finished)
@@ -6163,8 +6188,32 @@ class FrogWindow(QMainWindow):
             return col
         return np.clip(col - bg, 0, None)
 
-    def _on_background(self, which, spectrum):
-        self.status.showMessage(f"Background ({which}) captured.", 2500)
+    def _confirm_no_dark(self):
+        """Ask before running a scan whose export will not be dark-corrected.
+
+        Two distinct reasons land here and the message names both, because the
+        fix differs: no dark has been recorded at all, or one has but Subtract
+        Dark is off. Answering No leaves everything untouched.
+        """
+        if self.background is None and self.background_members is None:
+            why = ("No dark has been recorded.")
+            fix = ("Record Dark in the Spectrum panel first, or continue and "
+                   "the .dwc and .csv will carry the raw pedestal.")
+        else:
+            why = ("A dark is recorded, but Subtract Dark is switched off.")
+            fix = ("Tick Subtract Dark to correct this scan, or continue and "
+                   "the .dwc and .csv will carry the raw pedestal.")
+        return QMessageBox.question(
+            self, "Scan without a dark?",
+            f"{why}\n\n{fix}\n\nThe .npz records that no dark was "
+            f"subtracted either way.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No) == QMessageBox.Yes
+
+    def _on_delay_reference(self, which, spectrum):
+        self.status.showMessage(
+            f"Delay-extreme reference ({which}) captured — archived, not "
+            f"subtracted.", 2500)
 
     def _on_stage_fault(self, i, delay_fs, reason):
         """Slot for FrogScanWorker.stage_fault.
@@ -6174,7 +6223,7 @@ class FrogWindow(QMainWindow):
         scan carries on and this is the only live sign that it has stopped
         tracking. Timeout 0 — it must not quietly disappear.
         """
-        where = "the background frame" if i < 0 else f"{delay_fs:+.0f} fs"
+        where = "the reference frame" if i < 0 else f"{delay_fs:+.0f} fs"
         self.status.showMessage(f"⚠ STAGE FAULT @ {where} — {reason}", 0)
 
     def _on_saturation(self, i, delay_fs, npx, peak):
@@ -6220,12 +6269,9 @@ class FrogWindow(QMainWindow):
         Display only. result.trace is untouched, and the .npz still archives
         the raw counts with both background frames kept separately.
         """
-        if result.background() is not None:
-            return np.clip(result.corrected_trace(), 0, None)
-        bg = self._scan_dark
-        if bg is None or np.shape(bg)[0] != np.shape(result.trace)[0]:
+        if result.dark is None:
             return result.trace
-        return np.clip(np.asarray(result.trace, float) - bg[:, None], 0, None)
+        return np.clip(result.corrected_trace(), 0, None)
 
     def _on_finished(self, result):
         self.result = result
@@ -6460,8 +6506,9 @@ class FrogWindow(QMainWindow):
                                 lambda v: self.spin_stop.setValue(float(v))),
             ("scan_step_fs",    self.spin_step_fs.value,
                                 lambda v: self.spin_step_fs.setValue(float(v))),
-            ("scan_background", self.chk_bg.isChecked,
-                                lambda v: self.chk_bg.setChecked(as_bool(v))),
+            ("scan_delay_reference", self.dlg_settings.chk_ref.isChecked,
+                                lambda v: self.dlg_settings.chk_ref.setChecked(
+                                    as_bool(v))),
             ("align_step_fs",   self.spin_align_step.value,
                                 lambda v: self.spin_align_step.setValue(float(v))),
         ]

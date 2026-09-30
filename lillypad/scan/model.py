@@ -32,7 +32,11 @@ class FrogScanConfig:
     idle_shots:        int   = 0     # frames discarded after each move
     wait_after_move_s: float = 0.0   # extra settle after the blocking move
     # Background — bracketed before/after, stored separately, not subtracted
-    capture_background: bool = True
+    # Take one frame at each end of the delay sweep and archive it in the .npz.
+    # Provenance only: nothing subtracts it, and the exports are corrected with
+    # the recorded dark instead. Off by default because it costs two extra
+    # acquisitions and no longer affects the data.
+    capture_delay_reference: bool = False
     # Saturation alert
     saturation_fraction: float = 0.99       # fraction of full-scale = saturated
     saturation_counts: float | None = None  # explicit full-scale; None -> use
@@ -70,16 +74,25 @@ class FrogResult:
     positions_readback_um: np.ndarray   # actual, read back per column
     wavelengths_nm:        np.ndarray
     trace:                 np.ndarray   # (n_wl, n_delays), raw counts
-    background_before:     np.ndarray | None
-    background_after:      np.ndarray | None
+    # The dark ACTUALLY SUBTRACTED from the exports, or None when none was.
+    # Trace-row shaped, already combined and calibrated for a stitched pair —
+    # i.e. exactly the frame the Spectrum panel is subtracting, snapshotted when
+    # the scan started so every column is corrected the same way.
+    dark:                  np.ndarray | None
+    # OPTIONAL provenance, never subtracted from anything: one frame at each end
+    # of the delay sweep, taken with the beam as it was. Useful for telling a
+    # real pedestal from delay-independent scatter after the fact, which is why
+    # it is archived in the .npz beside the dark rather than folded in.
+    delay_reference_before: np.ndarray | None
+    delay_reference_after:  np.ndarray | None
     config:                FrogScanConfig
     # Saturation record. `saturation_threshold` is None when the scan could not
     # check at all (no full scale known) — which is NOT the same as a clean
     # scan, and the two must stay distinguishable once the data is on disk.
     saturation_threshold:  float | None = None      # counts
     n_saturated:           np.ndarray | None = None # clipped px per column
-    n_saturated_bg_before: int = 0
-    n_saturated_bg_after:  int = 0
+    n_saturated_ref_before: int = 0
+    n_saturated_ref_after:  int = 0
     # Per-column stage-health report, "" where the column was clean. Non-empty
     # entries mean the delay label on that column is not trustworthy.
     stage_faults:          np.ndarray | None = None
@@ -100,7 +113,7 @@ class FrogResult:
 
     def is_saturated(self) -> bool:
         return bool(self.saturated_columns().size
-                    or self.n_saturated_bg_before or self.n_saturated_bg_after)
+                    or self.n_saturated_ref_before or self.n_saturated_ref_after)
 
     def faulted_columns(self) -> np.ndarray:
         """Indices of the columns the stage reported a position fault at."""
@@ -128,7 +141,11 @@ class FrogResult:
             wl_start_nm=float(self.wavelengths_nm[0]),
             wl_end_nm=float(self.wavelengths_nm[-1]),
             fwhm_ac_fs=float(self.fwhm_fs()),
-            has_background=bool(self.background_before is not None),
+            # How the exported trace was corrected. False means .dwc and .csv
+            # carry raw counts, pedestal and all — the one thing a reader of
+            # those files cannot otherwise tell.
+            dark_subtracted=self.dark_subtracted,
+            has_delay_reference=bool(self.delay_reference_before is not None),
             # Saturation summary. Carried here (and in the npz arrays) so a
             # clipped scan is self-identifying on disk instead of only in a
             # status-bar label that vanishes with the session.
@@ -139,8 +156,8 @@ class FrogResult:
             n_saturated_columns=int(self.saturated_columns().size),
             n_saturated_pixels_max=(0 if self.n_saturated is None
                                     else int(np.max(self.n_saturated, initial=0))),
-            n_saturated_bg_before=int(self.n_saturated_bg_before),
-            n_saturated_bg_after=int(self.n_saturated_bg_after),
+            n_saturated_ref_before=int(self.n_saturated_ref_before),
+            n_saturated_ref_after=int(self.n_saturated_ref_after),
             # Stage provenance. backlash_um is what makes a trace's delay axis
             # comparable to another one's: a scan taken without the approach
             # correction carries an unknown zero offset of that order.
@@ -151,19 +168,33 @@ class FrogResult:
         )
         return d
 
-    def background(self):
-        """Mean of the bracketing background spectra (whichever were captured),
-        or None if the scan ran without background frames."""
-        bgs = [b for b in (self.background_before, self.background_after)
-               if b is not None]
-        if not bgs:
+    @property
+    def dark_subtracted(self) -> bool:
+        """Whether the exports carry a dark subtraction.
+
+        Distinct from "the scan recorded a dark": Subtract Dark can be off, or
+        no dark may have been recorded at all. A file that was NOT corrected has
+        to say so, because at these levels an uncorrected trace is not slightly
+        wrong but mostly pedestal.
+        """
+        return self.dark is not None
+
+    def delay_reference(self):
+        """Mean of the delay-extreme reference frames, or None if none were
+        taken. Provenance only — nothing subtracts this."""
+        refs = [r for r in (self.delay_reference_before, self.delay_reference_after)
+                if r is not None]
+        if not refs:
             return None
-        return np.mean(np.asarray(bgs, float), axis=0)
+        return np.mean(np.asarray(refs, float), axis=0)
 
     def corrected_trace(self):
-        """Trace with the bracketed background removed; raw trace if there is
-        none. This is what the file exporters write by default."""
-        bg = self.background()
-        if bg is None:
+        """Trace with the recorded dark removed; the raw trace if none was
+        subtracted. This is what .dwc and .csv are written from.
+
+        The dark is the same frame the Spectrum panel uses, so the picture on
+        screen and the file on disk are corrected identically.
+        """
+        if self.dark is None:
             return np.asarray(self.trace, float)
-        return np.asarray(self.trace, float) - np.asarray(bg, float)[:, None]
+        return np.asarray(self.trace, float) - np.asarray(self.dark, float)[:, None]
