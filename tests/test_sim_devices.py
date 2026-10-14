@@ -12,10 +12,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from hardware import (SimulatedSpectrometer, SimulatedStage,
-                      StitchedSpectrometer)
-from scan import (FrogScanConfig, delay_to_position_um, position_to_delay_fs,
-                  _stage_to_um, _um_to_stage)
+from lillypad.hardware import StitchedSpectrometer
+from lillypad.sim import SimulatedSpectrometer, SimulatedStage
+from lillypad.scan import (FrogScanConfig, delay_to_position_um,
+                           position_to_delay_fs, stage_to_um, um_to_stage)
 
 # 8 um — Zaber X-LSM class spec, as used by scan.py's self-test.
 SLACK_MM = 0.008
@@ -52,11 +52,11 @@ class TestBacklashZeroShift:
                                backlash_mm=correction_mm)
         stage.move_to(160.0)                 # park above
         stage.move_to(150.0)                 # jog DOWN onto zero delay
-        zero_um = _stage_to_um(stage.get_position())   # "set current position as 0 fs"
+        zero_um = stage_to_um(stage.get_position())   # "set current position as 0 fs"
         landed = []
         for t in delay_to_position_um(delays, zero_um, pass_factor):
-            stage.move_to(_um_to_stage(t))   # the scan: monotonic, upward
-            landed.append(_stage_to_um(stage.get_position()))
+            stage.move_to(um_to_stage(t))   # the scan: monotonic, upward
+            landed.append(stage_to_um(stage.get_position()))
         # True zero delay is at 150 mm. Compare the delay each column REALLY
         # sampled against the delay it is labelled with. Column 0 is skipped: it
         # is the one point the sweep arrives at from above, so it carries an
@@ -88,7 +88,7 @@ class TestBacklashZeroShift:
         stage.move_to(150.0)
         n = move_counter(stage)
         for t in delay_to_position_um(d, 150000.0, pf):
-            stage.move_to(_um_to_stage(t))
+            stage.move_to(um_to_stage(t))
         assert n[0] == d.size + 1, (
             f"{n[0]} moves for {d.size} points; expected one pre-move "
             f"entering the range")

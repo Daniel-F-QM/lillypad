@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from hardware import (list_spectrometers, open_spectrometer, spec_ident,
-                      split_spec_ident)
+from lillypad.hardware import (list_spectrometers, open_spectrometer,
+                               spec_ident, split_spec_ident)
 
 
 def test_spec_ident_tags_the_serial():

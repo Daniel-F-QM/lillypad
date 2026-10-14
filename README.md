@@ -66,7 +66,7 @@ python -m venv .venv                    # an isolated environment
 pip install --no-deps -r requirements.txt
 seabreeze_os_setup                      # Ocean Optics only — Avantes has its own driver
 
-python frog_gui_fast.py
+python main.py
 ```
 
 > [!IMPORTANT]
@@ -429,7 +429,7 @@ It then **verifies** the resulting units. A rotational or uncalibrated stage is
 *refused* rather than driven with someone else's steps-per-millimetre — a wrong
 scale would silently stretch your delay axis instead of failing visibly. For a
 stage that matches neither route, add a `STAGE_CONFIGS` entry in
-[hardware.py](hardware.py).
+[lillypad/hardware/stages/kinesis.py](lillypad/hardware/stages/kinesis.py).
 </details>
 
 <details>
@@ -580,7 +580,7 @@ Mixing these up gives a plausible-looking trace with a wrong time axis:
 - **Wavelength: nanometres.** Spectra are raw counts.
 - Stage adapters talk **millimetres** internally, because that is what the vendor
   libraries use. The conversion lives in one pair of functions in
-  [scan.py](scan.py).
+  [lillypad/scan/core.py](lillypad/scan/core.py).
 
 Delays assume a **double-pass** geometry — the beam goes to a retroreflector and
 back, so moving the stage by *x* changes the path by *2x*. For another geometry,
@@ -658,46 +658,84 @@ instrument each time.
 
 ## Layout
 
+At the repository root:
+
 | File | Role |
 | --- | --- |
-| [frog_gui_fast.py](frog_gui_fast.py) | The PySide6 GUI — the entry point |
-| [hardware.py](hardware.py) | Device adapters and the pulse simulator |
-| [scan.py](scan.py) | Scan engine: optics conversions, scan worker, file writers |
-| [avantes.py](avantes.py) | Standalone ctypes wrapper around `AvaSpecX64.dll` |
-| [zaber_diagnostics.py](zaber_diagnostics.py) | Backlash diagnostics for Zaber stages |
+| [main.py](main.py) | The launcher. `python main.py`, or `python -m lillypad` |
+| [lillypad/](lillypad/) | Everything else |
+| [zaber_diagnostics.py](zaber_diagnostics.py) | Backlash diagnostics for Zaber stages — its own command-line tool |
 | [Lillypad.spec](Lillypad.spec) | PyInstaller recipe for a Windows build |
 | [requirements.txt](requirements.txt) | Pinned lockfile — install with `--no-deps` |
+| [pyproject.toml](pyproject.toml) | pytest configuration, nothing else |
 
-Imports run one way: `frog_gui_fast` → `scan` → `hardware`, with the GUI also
-using `hardware` directly for the adapter classes, and `zaber_diagnostics.py` a
-separate command-line consumer of both. `hardware.py` has **no Qt dependency at
-all**, and no vendor SDK is ever imported by the GUI — every adapter sits behind
-one of two abstract base classes, and vendor libraries load lazily.
+Inside the package, in dependency order — **nothing on a line imports anything
+below it:**
 
-`scan.py` holds a device-free, GUI-free core — conversions, the delay grid,
-autocorrelation, the dataclasses and the file writers — with a thin
-`FrogScanWorker(QThread)` on top. The core needs no hardware and opens no
-window, but importing the module needs PySide6 installed, because the worker's
-import sits at module level.
+| Module | Role |
+| --- | --- |
+| [lillypad/paths.py](lillypad/paths.py) | The *only* `__file__` anchor in the repo. Bundled resources vs. the writable folder beside the program |
+| [lillypad/settings.py](lillypad/settings.py) | Reading and writing `settings.json` |
+| [lillypad/design/](lillypad/design/) | Every colour, font, icon and figure constant, plus the stylesheet as an external `.qss` |
+| [lillypad/hardware/](lillypad/hardware/) | Two abstract base classes, one module per vendor, the stitched pair, and the registry |
+| [lillypad/sim/](lillypad/sim/) | The pulse physics, the beam presets, and two drop-in simulated devices |
+| [lillypad/scan/](lillypad/scan/) | Optics conversions, the data model, the three writers, and the scan worker |
+| [lillypad/gui/](lillypad/gui/) | Widgets, worker threads, the canvas, the dialogs, the controllers, the window |
+| [lillypad/app/main.py](lillypad/app/main.py) | The startup sequence, in the order it has to happen in |
 
-**To add a device:** implement `StageBase` or `SpectrometerBase` in
-[hardware.py](hardware.py). Moves must block until the stage has settled, so the
-scan loop can read back a position it can trust on the next line.
+Four properties hold throughout, and each is enforced by a test rather than by
+convention:
+
+- **`lillypad/design/` never imports the GUI.** The tokens and the matplotlib
+  style have to be readable without a `QApplication`.
+- **`lillypad/hardware/` has no Qt and no vendor SDK at module scope.** Every
+  driver loads inside the function that needs it, so `import lillypad.hardware`
+  succeeds with only numpy installed and a missing DLL costs you exactly one
+  device's connect call — not the program.
+- **`lillypad/scan/core.py` has no Qt.** The conversions, the delay grid, the
+  autocorrelation and the symmetry folding are importable without PySide6
+  installed. `FrogScanWorker` is the only Qt in that package and is deliberately
+  not re-exported from `lillypad/scan/__init__.py`.
+- **`lillypad/sim/` depends on `lillypad/hardware/base.py` and nothing else.**
+  It reads no files and does not know where the program is installed.
+
+[ARCHITECTURE.md](ARCHITECTURE.md) has the layer map in full, plus recipes for
+adding a device, a theme token or a panel.
+
+**To add a device:** implement `StageBase` or `SpectrometerBase` under
+[lillypad/hardware/](lillypad/hardware/) and register it in
+[registry.py](lillypad/hardware/registry.py). Moves must block until the stage
+has settled, so the scan loop can read back a position it can trust on the next
+line.
 
 ## Self-tests
 
-All three non-GUI modules check themselves — no hardware, no window:
+One suite, no hardware and no window:
 
 ```bash
-python hardware.py    # simulator, stage logic, stitching, calibration parsing
-python scan.py        # delay grid, conversions, backlash, fault handling
-python avantes.py     # ctypes struct layout and error table; DLL optional
+pip install -r requirements-dev.txt
+pytest
 ```
 
-`hardware.py` and `avantes.py` run with only numpy installed. `scan.py` also
-needs PySide6, since it exercises the scan worker. `avantes.py` reports what to
-install if the DLL is missing, and enumerates, connects and acquires if a
-spectrometer is attached.
+About 600 tests in under a minute. They run offscreen (`QT_QPA_PLATFORM`), drive
+the real scan worker against the simulator, and check the layer boundaries above
+in subprocesses with the relevant package blocked from importing.
+
+Two of them are worth knowing about before you change anything:
+
+- **`tests/test_golden_sim.py`** re-runs a fixed-seed simulated scan and asserts
+  the `.npz` is **bit-identical** to a committed baseline. Because the seed pins
+  the order *and the number* of random draws, it also catches a change that
+  acquires the same spectra in a different sequence, or slips in one extra frame.
+  If it fails, the first question is "should the output have changed?" — not
+  "how do I regenerate the baseline". Regenerating is
+  `python tests/golden/capture_golden.py`, and is a deliberate act.
+- **`tests/test_app_smoke.py`** constructs the real window. It is the slowest
+  file in the suite and it earns it: it is the only test that catches a design
+  constant or an import that the unit tests never reach.
+
+The Avantes DLL is optional — `tests/test_avantes_sdk.py` checks the ctypes
+struct layout and the error table with no DLL present.
 
 ## Building a standalone executable
 
@@ -706,12 +744,28 @@ pyinstaller Lillypad.spec
 ```
 
 Run this **from the repository root** — the spec picks up `calibration_files/`
-by a relative path. It produces `dist/Lillypad/Lillypad.exe` with the icons and
-calibration files bundled; the calibration files are copied out next to the
-`.exe` on first run so they stay editable.
+and the stylesheet by relative paths. It produces `dist/Lillypad/Lillypad.exe`
+with the icons, the calibration files and `app.qss` bundled; the calibration
+files are copied out next to the `.exe` on first run so they stay editable.
 
+`lillypad/paths.py` is the single place that knows where anything is.
 `resource_path()` resolves bundled assets through `sys._MEIPASS`, so the same
-code works frozen and from source. User-editable things (`calibration_files/`,
-`settings.json`) deliberately use a different path beside the executable. The
-spec excludes `PyQt5`, `PyQt6` and `PySide2`, so a stray Qt binding cannot end
-up in the bundle even if something reinstalls one.
+code works frozen and from source; `app_dir()` answers the different question of
+where to *write*, and user-editable things (`calibration_files/`,
+`settings.json`) go beside the executable. The spec excludes `PyQt5`, `PyQt6`
+and `PySide2`, so a stray Qt binding cannot end up in the bundle even if
+something reinstalls one.
+
+**After a build, check three things that a launch alone will not tell you:**
+
+1. `_internal/icons/`, `_internal/calibration_files/*.txt` and
+   `_internal/lillypad/design/qss/app.qss` all exist. A missing `app.qss` does
+   not crash — Qt simply gets no stylesheet — so the app comes up working but
+   unstyled.
+2. A `calibration_files/` folder appeared **next to** `Lillypad.exe`.
+3. The Spectrometer and Stage windows enumerate without a traceback.
+
+If a driver has gone missing from the bundle, `build/Lillypad/xref-Lillypad.html`
+is the only thing that will say so, and the fix is a literal `import` in the
+module that needs it — **not** a `hiddenimports` entry, which only hides the
+regression.

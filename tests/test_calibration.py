@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from hardware import load_calibration_file
+from lillypad.hardware import load_calibration_file
 
 
 def test_clean_file_loads_sorted(tmp_path):

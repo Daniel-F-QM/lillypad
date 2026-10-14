@@ -19,8 +19,9 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from hardware import SimulatedSpectrometer, SimulatedStage
-from scan import FrogScanConfig, FrogScanWorker, _stage_to_um
+from lillypad.sim import SimulatedSpectrometer, SimulatedStage
+from lillypad.scan import FrogScanConfig, stage_to_um
+from lillypad.scan.worker import FrogScanWorker
 
 
 @pytest.fixture
@@ -62,7 +63,7 @@ class _FaultingStage(SimulatedStage):
 
     def _move_to_raw(self, position_mm):
         self._fault = None
-        if abs(_stage_to_um(position_mm) - self._fault_at) < 1e-6:
+        if abs(stage_to_um(position_mm) - self._fault_at) < 1e-6:
             super()._move_to_raw(position_mm - 0.002)     # 2 um short
             self._fault = "stage did not reach the commanded position"
             return
@@ -112,7 +113,7 @@ class TestCleanScan:
         stage = SimulatedStage(travel_mm=300.0)
         spec = SimulatedSpectrometer(stage, gate="shg")
         run_scan(stage, spec, small_cfg)
-        assert _stage_to_um(stage.get_position()) == pytest.approx(
+        assert stage_to_um(stage.get_position()) == pytest.approx(
             small_cfg.zero_pos_um, abs=1.0)
 
     def test_captures_both_delay_references_when_asked(self, small_cfg):

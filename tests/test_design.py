@@ -192,8 +192,8 @@ class TestLayerBoundary:
             encoding="utf-8")
         body = "\n".join(l for l in src.splitlines()
                          if not l.lstrip().startswith("#"))
-        for forbidden in ("frog_gui_fast", "lillypad.gui", "import hardware",
-                          "import scan"):
+        for forbidden in ("lillypad.gui", "lillypad.hardware", "lillypad.scan",
+                          "lillypad.sim"):
             assert forbidden not in body, f"{module} imports {forbidden}"
 
     def test_tokens_needs_no_qt(self):

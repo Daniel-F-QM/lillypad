@@ -17,9 +17,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from hardware import (OVERLAP_BAND_FRAC, SIM_SPECTROMETERS, SimulatedSpectrometer,
-                      SimulatedStage, SpectrometerBase, StitchedSpectrometer,
-                      sim_spectrometer_pair)
+from lillypad.hardware import (OVERLAP_BAND_FRAC, SpectrometerBase,
+                               StitchedSpectrometer)
+from lillypad.sim import (SIM_SPECTROMETERS, SimulatedSpectrometer,
+                          SimulatedStage, sim_spectrometer_pair)
 
 
 def _true_spectrum(wl):

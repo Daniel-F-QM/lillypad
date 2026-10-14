@@ -43,8 +43,8 @@ def app():
 
 @pytest.fixture(scope="module")
 def window(app):
-    import frog_gui_fast
-    win = frog_gui_fast.FrogWindow()
+    from lillypad.gui.window import FrogWindow
+    win = FrogWindow()
     yield win
     win.close()
 
@@ -91,7 +91,7 @@ class TestConstructionOrder:
         startup."""
         import pathlib
         root = pathlib.Path(__file__).resolve().parents[1]
-        paths = ([root / "frog_gui_fast.py"]
+        paths = (sorted((root / "lillypad" / "gui" / "window").glob("*.py"))
                  + sorted((root / "lillypad" / "gui" / "controllers").glob("*.py")))
         n = sum(len(re.findall(r"hasattr\(self(?:\.win)?, ['\"]dlg_graphics['\"]\)",
                                p.read_text(encoding="utf-8"))) for p in paths)

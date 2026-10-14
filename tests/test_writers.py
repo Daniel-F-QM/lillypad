@@ -17,7 +17,8 @@ import ast
 import numpy as np
 import pytest
 
-from scan import (FrogResult, FrogScanConfig, write_csv, write_dwc, write_npz)
+from lillypad.scan import (FrogResult, FrogScanConfig, write_csv, write_dwc,
+                           write_npz)
 
 N_WL, N_DELAY = 6, 5
 

@@ -23,8 +23,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from hardware import PULSE_SHAPES, SimulatedSpectrometer, SimulatedStage
-from scan import FrogScanConfig, FrogScanWorker, write_npz
+from lillypad.sim import PULSE_SHAPES, SimulatedSpectrometer, SimulatedStage
+from lillypad.scan import FrogScanConfig, write_npz
+from lillypad.scan.worker import FrogScanWorker
 
 from .golden.capture_golden import (COLUMN_DELAY_MM, N_PIXELS, SCAN, SEED,
                                     scan_dark)

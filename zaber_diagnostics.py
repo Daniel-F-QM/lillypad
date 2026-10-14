@@ -35,8 +35,8 @@ import sys
 
 import numpy as np
 
-from hardware import ZaberStage
-from scan import position_to_delay_fs
+from lillypad.hardware import ZaberStage
+from lillypad.scan import position_to_delay_fs
 
 PASS_FACTOR = 2          # double pass, matching the app's default
 

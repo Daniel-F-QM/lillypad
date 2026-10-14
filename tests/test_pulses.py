@@ -12,11 +12,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from hardware import (DEFAULT_PULSE, PULSE_SHAPES, SIM_BEAM_DEFAULTS,
-                      SIM_SPECTROMETERS, SimulatedSpectrometer, SimulatedStage,
-                      sim_spectrometer_pair, _bird_envelope, _energy_window,
-                      _fourier_shift, _gauss, _misaligned_efficiency, _sech,
-                      _spectral_phase, _split_step)
+from lillypad.sim import (DEFAULT_PULSE, PULSE_SHAPES, SIM_BEAM_DEFAULTS,
+                          SIM_SPECTROMETERS, SimulatedSpectrometer,
+                          SimulatedStage, sim_spectrometer_pair)
+# The physics itself, by module: these are the units under test, not the
+# simulator's public surface, so they are imported from where they live.
+from lillypad.sim.bird import _bird_envelope
+from lillypad.sim.pulses import (_energy_window, _fourier_shift, _gauss,
+                                 _misaligned_efficiency, _sech, _spectral_phase,
+                                 _split_step)
 
 
 @pytest.fixture

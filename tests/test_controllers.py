@@ -56,8 +56,8 @@ def window():
     from lillypad.design.theme import install_theme
     app = QApplication.instance() or QApplication([])
     install_theme(app, "dark")
-    import frog_gui_fast
-    win = frog_gui_fast.FrogWindow()
+    from lillypad.gui.window import FrogWindow
+    win = FrogWindow()
     yield win
     win.close()
 
@@ -82,12 +82,12 @@ class TestTheyAreWiredUp:
         assert held == ["win"], f"{attr} also holds {held}"
 
     def test_they_are_constructed_before_the_ui_is_built(self):
-        """_build_ui connects lambdas straight to controller methods, so the
+        """build_ui connects lambdas straight to controller methods, so the
         controllers have to exist by then. The order is load-bearing and the
         failure is an AttributeError at startup."""
-        import frog_gui_fast
-        src = inspect.getsource(frog_gui_fast.FrogWindow.__init__)
-        built_at = src.index("self._build_ui()")
+        from lillypad.gui.window import main_window
+        src = inspect.getsource(main_window.FrogWindow.__init__)
+        built_at = src.index("build_ui(self)")
         for attr, cls in EXPECTED.items():
             made = re.search(rf"(?m)^\s*self\.{attr}\s*=\s*{cls}\(self\)\s*$", src)
             assert made, f"the window never constructs .{attr}"
@@ -124,7 +124,7 @@ class TestEveryCallSiteResolves:
         classes = _controller_classes()
         pattern = re.compile(r"\.(" + "|".join(sorted(classes)) +
                              r")\.([A-Za-z_][A-Za-z0-9_]*)")
-        files = ([ROOT / "frog_gui_fast.py"]
+        files = (sorted((ROOT / "lillypad" / "gui" / "window").glob("*.py"))
                  + sorted((ROOT / "lillypad").rglob("*.py"))
                  + sorted((ROOT / "tests").glob("*.py")))
         missing, checked = [], 0

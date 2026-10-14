@@ -10,9 +10,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from scan import (FrogScanConfig, autocorrelation, build_delay_grid,
-                  delay_to_position_um, fwhm, position_to_delay_fs,
-                  _stage_to_um, _um_to_stage)
+from lillypad.scan import (FrogScanConfig, autocorrelation, build_delay_grid,
+                           delay_to_position_um, fwhm, position_to_delay_fs,
+                           stage_to_um, um_to_stage)
 
 
 def test_delay_position_round_trip_is_exact():
@@ -41,9 +41,9 @@ def test_pass_factor_halves_the_travel():
 
 
 def test_mm_um_conversions_are_inverses():
-    assert _um_to_stage(150000.0) == pytest.approx(150.0)
-    assert _stage_to_um(150.0) == pytest.approx(150000.0)
-    assert _stage_to_um(_um_to_stage(1234.5)) == pytest.approx(1234.5)
+    assert um_to_stage(150000.0) == pytest.approx(150.0)
+    assert stage_to_um(150.0) == pytest.approx(150000.0)
+    assert stage_to_um(um_to_stage(1234.5)) == pytest.approx(1234.5)
 
 
 class TestDelayGrid:

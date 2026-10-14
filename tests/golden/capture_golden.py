@@ -28,8 +28,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from hardware import PULSE_SHAPES, SimulatedSpectrometer, SimulatedStage
-from scan import FrogScanConfig, FrogScanWorker, write_npz
+from lillypad.sim import PULSE_SHAPES, SimulatedSpectrometer, SimulatedStage
+from lillypad.scan import FrogScanConfig, write_npz
+from lillypad.scan.worker import FrogScanWorker
 
 HERE = Path(__file__).resolve().parent
 

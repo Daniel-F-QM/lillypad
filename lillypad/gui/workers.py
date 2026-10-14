@@ -24,7 +24,6 @@ import time
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
-from lillypad.gui.text import FEED_BUSY_MSG
 from lillypad.scan.core import (delay_to_position_um, stage_to_um,
                                 um_to_stage)
 

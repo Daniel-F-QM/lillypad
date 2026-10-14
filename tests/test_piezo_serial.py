@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import pytest
 
-from hardware import PiezoJenaStage
+from lillypad.hardware import PiezoJenaStage
 
 
 class FakePiezoSerial:

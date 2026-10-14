@@ -2,8 +2,8 @@
 
 Every other test in this suite exercises a module. None of them had ever
 CONSTRUCTED the window, which is how the design extraction managed to remove
-`import matplotlib` from frog_gui_fast while a colormap call still needed it: 354
-unit tests passed and the program died on the first FrogCanvas.
+`import matplotlib` from the window module while a colormap call still needed
+it: 354 unit tests passed and the program died on the first FrogCanvas.
 
 So this builds the real FrogWindow offscreen and drives the paths that read the
 design layer at construction and paint time. It is slower than the rest of the
@@ -37,8 +37,8 @@ def window(app):
     startup ORDER is what is under test — theme before the first widget, exactly
     as main() does it."""
     install_theme(app, startup_theme(load_settings()))
-    import frog_gui_fast
-    win = frog_gui_fast.FrogWindow()
+    from lillypad.gui.window import FrogWindow
+    win = FrogWindow()
     yield win
     install_theme(app, "dark")
     win.close()

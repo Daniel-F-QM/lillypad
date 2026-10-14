@@ -79,8 +79,8 @@ def window():
     from lillypad.design.theme import install_theme
     app = QApplication.instance() or QApplication([])
     install_theme(app, "dark")
-    import frog_gui_fast
-    win = frog_gui_fast.FrogWindow()
+    from lillypad.gui.window import FrogWindow
+    win = FrogWindow()
     yield win
     win.close()
 

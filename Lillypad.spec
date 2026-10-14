@@ -71,11 +71,19 @@ if not _libusb_dlls:
 # adapter with a literal if/elif over imported classes rather than a dict of
 # module names — a string-keyed lookup would drop every driver from this build
 # and fail only on the bench.
+#
+# main.py is a ten-line launcher whose only job is to call lillypad.app.main();
+# the whole lillypad package comes into the graph from there by ordinary static
+# analysis, with no pathex and no hiddenimports. It is named main.py and not
+# lillypad.py because a `lillypad.py` module and the `lillypad/` package beside
+# it shadow each other — and on a case-insensitive filesystem `Lillypad.py` does
+# not escape that either. The executable's name comes from EXE(name=...) below,
+# so it is still Lillypad.exe.
 a = Analysis(
-    ['frog_gui_fast.py'],
+    ['main.py'],
     pathex=[],
     binaries=_zaber_libs + _libusb_dlls,
-    # calibration_files/*.txt are SEED data: frog_gui_fast.seed_calibration_dir
+    # calibration_files/*.txt are SEED data: lillypad.paths.seed_calibration_dir
     # copies them from the bundle to a user-editable calibration_files/ folder
     # next to the .exe on first run (only top-level files — Old/ stays behind).
     # The stylesheet is bundled at the SAME relative path it has in the source

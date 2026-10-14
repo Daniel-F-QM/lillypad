@@ -175,13 +175,13 @@ class TestAvantesSearchDirInjection:
             avantes._extra_dirs.clear()
 
     def test_the_adapter_registers_the_program_folder(self, monkeypatch):
-        """hardware._avantes_module() is the single place that does it, so every
-        Avantes entry point gets it without having to remember."""
+        """The Avantes adapter's _avantes_module() is the single place that does
+        it, so every Avantes entry point gets it without having to remember."""
+        from lillypad.hardware.spectrometers import avantes as adapter
         from lillypad.hardware.vendor import avaspec as avantes
-        import hardware
         try:
             avantes._extra_dirs.clear()
-            hardware._avantes_module()
+            adapter._avantes_module()
             assert str(paths.app_dir()) in avantes._extra_dirs
         finally:
             avantes._extra_dirs.clear()
