@@ -54,9 +54,23 @@ class TestStartup:
     def test_the_window_constructs(self, window):
         assert window.canvas is not None
 
-    def test_the_figure_has_its_four_panels(self, window):
-        """spectrum, trace, autocorrelation, deviation."""
-        assert len(window.canvas.fig.axes) == 4
+    def test_the_figure_has_its_four_panels_and_the_colour_bar(self, window):
+        """spectrum, trace, autocorrelation, deviation — and the trace's
+        colour bar, which is an axes of its own."""
+        assert len(window.canvas.fig.axes) == 5
+
+    def test_it_comes_up_maximized(self, window, monkeypatch):
+        """Always maximized at startup, whatever the last session closed as.
+
+        showMaximized is stubbed down to the state change it makes: a shown
+        window left behind by a suite that never runs an event loop hangs the
+        process on exit."""
+        from PySide6.QtCore import Qt
+        monkeypatch.setattr(window, "showMaximized",
+                            lambda: window.setWindowState(Qt.WindowMaximized))
+        window.show_restored()
+        assert window.isMaximized()
+        assert not window.isFullScreen()
 
     def test_nothing_is_connected_at_startup(self, window):
         """The application's real initial state: a real absence, not a stand-in

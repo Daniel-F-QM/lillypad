@@ -383,6 +383,26 @@ class TracePanelMixin:
         self._apply_cmap()
         self.draw_idle()
 
+    def set_trace_normalised(self, on):
+        """Say whether the image now holds a normalised view (alignment's raw
+        trace, each spectrometer scaled to its own peak) rather than counts.
+
+        Only the colour bar's label depends on it — and the colour range: a
+        manual range typed in counts means nothing on a 0…1 image (it would
+        paint the whole trace in the bottom colour), so changing what the image
+        holds hands the range back to auto.
+        """
+        on = bool(on)
+        if on == self._trace_normalised:
+            return
+        self._trace_normalised = on
+        self.cbar.set_label("Intensity (norm.)" if on else "Intensity (counts)")
+        if not self.autoscale_clim:
+            self.set_autoscale_clim(True)
+        else:
+            self._bg_static = None
+            self._request_blit()
+
     def set_trace_threshold(self, percent):
         """Hide trace pixels below `percent` of the trace peak. Display only —
         the stored trace keeps every count."""
@@ -485,7 +505,11 @@ class TracePanelMixin:
         self.im.set_interpolation("nearest" if f > 1 else "auto")
         # set_clim invalidates the image's cached RGBA (full re-normalize +
         # re-colormap), so only touch it when the peak moved visibly (>0.5%).
-        if self._clim_peak is None or abs(peak - self._clim_peak) > 0.005 * self._clim_peak:
+        # Never under a manual colour range: that is the operator's, and the
+        # next column must not snap it back to 0…peak.
+        if self.autoscale_clim and (
+                self._clim_peak is None
+                or abs(peak - self._clim_peak) > 0.005 * self._clim_peak):
             self.im.set_clim(0, peak)
             self._clim_peak = peak
         self._bg_static = None        # trace pixels changed

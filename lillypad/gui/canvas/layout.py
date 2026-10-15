@@ -15,7 +15,9 @@ here too: it has to track a figure-fraction boundary in Qt pixel coordinates.
 # before the figure classes are imported. Module import is idempotent, so every
 # canvas module can open with it and the order stops being a rule to remember.
 from lillypad.design import mpl_style  # noqa: F401  (backend side effect)
-from lillypad.design.mpl_style import (_GEO_DEV_RATIO, _GEO_GAP_PX, _GEO_H_BOT,
+from lillypad.design.mpl_style import (_GEO_CBAR_GAP_PX, _GEO_CBAR_LBL_PX,
+                                       _GEO_CBAR_W_PX, _GEO_DEV_RATIO,
+                                       _GEO_GAP_PX, _GEO_H_BOT,
                                        _GEO_H_COLGAP, _GEO_H_ROWGAP, _GEO_L_MAX,
                                        _GEO_L_PX, _GEO_R, _GEO_ROW_RATIO,
                                        _GEO_TOP_MAX, _GEO_TOP_PX, _GEO_V_BOT,
@@ -125,13 +127,18 @@ class FigureLayoutMixin:
         spec_w  = frac * (R - L - cgap)
         right_x = L + spec_w + cgap
         right_w = R - right_x
+        # The trace's colour bar stands at the right of the column, so the
+        # trace itself ends that far short of it.
+        trace_w = right_w - self._cbar_reserve()
         if horiz:
             BOT, rgap = _GEO_H_BOT, _GEO_H_ROWGAP
             h_ac = (TOP - BOT - rgap) / (1.0 + _GEO_ROW_RATIO)
             h_tr = TOP - BOT - rgap - h_ac
             self._split_spec_cell(L, BOT, spec_w, TOP - BOT)
-            self.ax_trace.set_position([right_x, BOT + h_ac + rgap, right_w, h_tr])
-            self.ax_ac.set_position([right_x, BOT, right_w, h_ac])
+            self.ax_trace.set_position([right_x, BOT + h_ac + rgap, trace_w, h_tr])
+            # The trace's width, not the column's: the two share one delay
+            # axis, and a delay has to sit at the same x in both panels.
+            self.ax_ac.set_position([right_x, BOT, trace_w, h_ac])
             # The whole column gap is shared by both sides here.
             split_bot = BOT
         else:
@@ -144,10 +151,11 @@ class FigureLayoutMixin:
             h_ac  = rows / (1.0 + _GEO_ROW_RATIO)
             h_top = rows - h_ac
             self._split_spec_cell(L, BOT + h_ac + rgap, spec_w, h_top)
-            self.ax_trace.set_position([right_x, BOT + h_ac + rgap, right_w, h_top])
+            self.ax_trace.set_position([right_x, BOT + h_ac + rgap, trace_w, h_top])
             self.ax_ac.set_position([L, BOT, R - L, h_ac])
             # Only the top row is split — the autocorrelation spans both columns.
             split_bot = BOT + h_ac + rgap
+        self._place_cbar()
         # The deviation panel reserves a strip of its y range for the title it
         # carries inside itself, and that strip is a fixed height in inches —
         # so a panel that just changed height needs the fit done again. Only
@@ -164,14 +172,29 @@ class FigureLayoutMixin:
         # are about to be regenerated. Drop it rather than leave it floating.
         if getattr(self, "_axis_editor", None) is not None:
             self._axis_editor.cancel()
-        # Everything moved, so both cached backgrounds describe the old geometry.
+        # Everything moved, so every cached background describes the old geometry.
         self._bg = None
         self._bg_static = None
+        self._bg_cbar = None
         # Anything parented to the canvas and pinned to an axes (the trace's
         # overlay button) has to follow. Emitted last, so it reads the geometry
         # this call just set.
         self.axes_relaid.emit()
         self.draw_idle()
+
+    def _cbar_reserve(self):
+        """Width the colour bar's strip takes from the trace, as a figure
+        fraction — the gap, the bar and its labels, all fixed pixel widths."""
+        return ((_GEO_CBAR_GAP_PX + _GEO_CBAR_W_PX + _GEO_CBAR_LBL_PX)
+                / max(self.width(), 1))
+
+    def _place_cbar(self):
+        """Stand the colour bar beside the trace, over exactly its height, so
+        the bar reads as that panel's scale and nothing else's."""
+        pos = self.ax_trace.get_position()
+        w = max(self.width(), 1)
+        self.ax_cbar.set_position([pos.x1 + _GEO_CBAR_GAP_PX / w, pos.y0,
+                                   _GEO_CBAR_W_PX / w, pos.height])
 
     def _left_margin(self):
         """Left margin as a figure fraction — a fixed pixel width (see

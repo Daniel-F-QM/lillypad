@@ -9,6 +9,12 @@ Three gestures share one press/motion/release chain, so they live together:
   * **drag the symmetry fold line**, which only reports — the window decides
     what a new fold means.
 
+The trace's colour bar takes part in the first two like any panel, with the
+colour range standing in for its view: drag up or down it to pick the range,
+click an end label to type one, right-click to follow the peak again. Its one
+gesture of its own is the wheel, which stretches the top of the range — a drag
+can only ever narrow it.
+
 Nothing here decides anything about the data. A gesture either changes the axes
 through the same setters the dialog uses, or emits a signal.
 """
@@ -51,7 +57,7 @@ class CanvasInteractionMixin:
         """
         return ((self.ax_spec, "x"), (self.ax_dev, "x"),
                 (self.ax_trace, "x"), (self.ax_trace, "y"),
-                (self.ax_ac, "x"))
+                (self.ax_ac, "x"), (self.ax_cbar, "y"))
 
     def _end_tick_labels(self, ax, which):
         """The lowest and highest tick labels actually on `ax`'s `which` axis.
@@ -120,6 +126,8 @@ class CanvasInteractionMixin:
         if ax is self.ax_spec:
             self.autoscale_x = False
             self.set_xlim(lo, hi)
+        elif ax is self.ax_cbar:
+            self.set_trace_clim(lo, hi)        # switches the colour auto off
         elif which == "x":
             self.autoscale_trace = False
             self.set_trace_xlim(lo, hi)
@@ -142,7 +150,8 @@ class CanvasInteractionMixin:
                 min(max(event.y, bb.y0), bb.y1))
 
     def _on_press(self, event):
-        axes = (self.ax_spec, self.ax_trace, self.ax_ac, self.ax_dev)
+        axes = (self.ax_spec, self.ax_trace, self.ax_ac, self.ax_dev,
+                self.ax_cbar)
         if event.button == 3:
             if self._drag_ax is not None:      # right-click aborts a drag
                 self._cancel_drag()
@@ -182,9 +191,16 @@ class CanvasInteractionMixin:
             return
         x0, y0 = self._drag_start
         cx, cy = self._clamped_point(event)
+        moved = max(abs(cx - x0), abs(cy - y0))
+        if self._drag_ax is self.ax_cbar:
+            # Only a height means anything on the colour bar, and it is barely
+            # wider than a cursor: the band spans the bar's full width, and only
+            # vertical travel counts towards the click threshold.
+            bb = self.ax_cbar.get_window_extent()
+            x0, cx, moved = bb.x0, bb.x1, abs(cy - y0)
         # Show the rectangle only past the click threshold so a plain
         # click never flashes it.
-        if max(abs(cx - x0), abs(cy - y0)) < 5 * self.devicePixelRatioF():
+        if moved < 5 * self.devicePixelRatioF():
             self._rubber.hide()
             return
         self._rubber.setGeometry(
@@ -202,7 +218,9 @@ class CanvasInteractionMixin:
         cx, cy = self._clamped_point(event)
         self._cancel_drag()
         thr = 5 * self.devicePixelRatioF()
-        if abs(cx - x0) < thr or abs(cy - y0) < thr:
+        # The colour bar needs only height: a straight vertical drag down a
+        # 14 px bar is the gesture, not a degenerate one.
+        if abs(cy - y0) < thr or (ax is not self.ax_cbar and abs(cx - x0) < thr):
             return                             # plain click / degenerate drag
         inv = ax.transData.inverted()          # includes any log transform
         (dx0, dy0), (dx1, dy1) = inv.transform([(x0, y0), (cx, cy)])
@@ -211,6 +229,12 @@ class CanvasInteractionMixin:
         self._apply_zoom(ax, xlo, xhi, ylo, yhi)
 
     def _apply_zoom(self, ax, xlo, xhi, ylo, yhi):
+        if ax is self.ax_cbar:
+            # The bar's y axis IS the colour range, in the image's units; its x
+            # means nothing. Through the setter, so the auto switches off too.
+            self.set_trace_clim(ylo, yhi)
+            self.limits_changed.emit()
+            return
         ax.set_xlim(xlo, xhi)
         ax.set_ylim(ylo, yhi)
         # Freeze the matching autoscale and sync the limit caches, or the
@@ -247,6 +271,22 @@ class CanvasInteractionMixin:
             self.ax_spec.set_xlim(xlo, xhi)
             self._pin_xlim((xlo, xhi))
         self.draw_idle()
+        self.limits_changed.emit()
+
+    # Per wheel notch over the colour bar: the top of the range moves by this
+    # factor of the span. Ten notches double it, near enough, which takes a
+    # saturated-looking trace to a readable one in a flick of the wheel.
+    CBAR_WHEEL_STEP = 1.07
+
+    def _on_scroll(self, event):
+        """Wheel over the colour bar: up brightens (top of the range comes
+        down), down darkens. The bottom stays put — it is the floor the trace
+        is read against, and moving both ends at once would be a pan."""
+        if event.inaxes is not self.ax_cbar or not event.step:
+            return
+        lo, hi = self.im.get_clim()
+        span = (hi - lo) * self.CBAR_WHEEL_STEP ** (-event.step)
+        self.set_trace_clim(lo, lo + span)
         self.limits_changed.emit()
 
     def _hit_fold(self, event):

@@ -78,6 +78,10 @@ class AxesApiMixin:
             # there is nothing continuous here to freeze.
             self._autoscale_dev()
             self._sync_dev_x()
+        elif ax is self.ax_cbar:
+            # The colour range, toggled like any other panel's view: off
+            # freezes the colours where they are, on follows the peak again.
+            self.set_autoscale_clim(not self.autoscale_clim)
         self.draw_idle()
         self.limits_changed.emit()
 
@@ -171,6 +175,43 @@ class AxesApiMixin:
             self.ax_trace.set_ylim(ymin, ymax)
             self._trace_ylim_cache = (ymin, ymax)
             self.draw_idle()
+
+    def set_trace_clim(self, vmin, vmax):
+        """Colour range of the FROG trace, in the image's own units.
+
+        A MANUAL range, so it switches the follow-the-peak auto off — the same
+        pairing a typed axis bound has with its auto-scale, or the next column
+        would snap the colours straight back to 0…peak.
+
+        A blit, not a full redraw: the image is animated, the colour bar's
+        layer rebuilds itself on the new range, and nothing static moved.
+        """
+        if not (vmin < vmax):
+            return
+        self.autoscale_clim = False
+        self.im.set_clim(vmin, vmax)
+        self._bg_static = None       # composited trace pixels are now stale
+        self._request_blit()
+
+    def set_autoscale_clim(self, on):
+        """Colour range follows the trace's peak (on), or holds where it is.
+
+        Off freezes the range on screen, as switching any other auto-scale off
+        pins the current view. On re-applies 0…peak at once rather than waiting
+        for the next column, which on a finished trace would be never.
+        """
+        on = bool(on)
+        self.autoscale_clim = on
+        if not on:
+            return
+        self._clim_peak = None       # forget the last peak: re-apply it now
+        if self._trace_raw is None:
+            # No trace yet: back to the empty-state range __init__ pinned.
+            self.im.set_clim(0.0, 1.0)
+            self._bg_static = None
+            self._request_blit()
+        else:
+            self._render_trace()     # applies (0, peak) and blits
 
     def _autoscale_dev(self):
         """Fit the deviation panel to its curves AND the ghost under them.

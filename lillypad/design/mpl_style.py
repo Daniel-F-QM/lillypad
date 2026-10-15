@@ -69,6 +69,13 @@ _GEO_H_COLGAP  = 0.065      # wider: two stacked y-axes share this gap, and the
                             # trace's, so 0.055 leaves its y label touching.
 _GEO_H_ROWGAP  = 0.0        # flush: the stacked pair shares one delay axis, so
                             # the trace's bottom spine IS the AC's top spine
+# The FROG trace's colour bar, a strip at the right of the trace. Pixels again,
+# for the same reason as LEFT: it holds fixed-size text, and a fraction that
+# leaves room for the labels at 900 px wastes a strip of plot at 1920.
+_GEO_CBAR_GAP_PX = 10   # trace's right spine → the bar
+_GEO_CBAR_W_PX   = 14   # the bar itself
+_GEO_CBAR_LBL_PX = 62   # its tick labels and label, right of it — the same
+                        # 5-digit-count budget as _GEO_L_PX, mirrored
 
 # The autocorrelation panel is drawn normalized to its own peak, so its view is
 # fixed: 0…1 plus a little headroom to keep the peak off the top spine.

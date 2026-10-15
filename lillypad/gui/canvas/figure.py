@@ -20,7 +20,10 @@ What stays HERE is what cannot be split:
     autocorrelation line) are `animated`, so an ordinary draw skips them and the
     background can be cached without them; a frame then restores that background
     and re-rasterizes only those three. A full redraw happens only when
-    something STATIC changes.
+    something STATIC changes. The trace's colour bar sits between the two: its
+    range moves with the image's, so it is kept out of the background and drawn
+    into a cached layer of its own (_cbar_background), rebuilt only when what
+    it shows has changed.
 
     Do not simplify any of it. The animated-artist selection, the threshold
     before auto-Y escalates a frame to a full redraw, and the coalescing of
@@ -230,6 +233,25 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
         # uses, but "auto" picks the second and it dominated the cost of every
         # scan column (measured: 44 ms vs 15 ms on a 1024x400 trace).
         self.im.set_interpolation_stage("data")
+        # The trace's colour bar. Its own axes, positioned by _layout_axes like
+        # every other panel (the placeholder rect is overwritten there), so
+        # fig.colorbar is handed `cax` and steals no room from anything by
+        # itself. It reads the image's cmap and clim through the mappable's
+        # change callback, so a colormap switch or a new peak reaches it with
+        # no bookkeeping here. Interactive through the ordinary gestures — see
+        # interaction.py: drag a range on it, click an end label to type one,
+        # right-click to go back to following the peak.
+        self.ax_cbar = self.fig.add_axes([0.0, 0.0, 0.01, 0.01])
+        self.cbar = self.fig.colorbar(self.im, cax=self.ax_cbar)
+        # Auto: the colour range follows the trace's peak (0…peak), as the
+        # image always did. Off: a range the operator set holds until they
+        # switch it back. Like the trace bounds, a manual range outlives the
+        # scan it was set on — and like them, it is session state, not a
+        # preference, so it is never saved.
+        self.autoscale_clim = True
+        # Whether the image currently holds counts or a per-spectrometer
+        # normalised view (alignment's raw trace) — the bar's label says which.
+        self._trace_normalised = False
         # Empty-state ranges. Autoscaling an empty line gives -0.05…0.05, whose
         # delay range contradicts the trace it shares that axis with; matching
         # the image extent makes the two plots agree before the first scan. The
@@ -279,6 +301,7 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
         self.mpl_connect('button_press_event', self._on_press)
         self.mpl_connect('motion_notify_event', self._on_motion)
         self.mpl_connect('button_release_event', self._on_release)
+        self.mpl_connect('scroll_event', self._on_scroll)
 
         # ── Blitting state ────────────────────────────────────────────────
         # These are drawn by hand every frame; exclude them from draw().
@@ -305,6 +328,14 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
         # would make them appear on a blit and vanish on the next full redraw.
         self.line_fold.set_animated(True)
         self.txt_sym.set_animated(True)
+        # The colour bar's WHOLE axes is animated too, so the full draw leaves
+        # it out of _bg — but it is NOT in the per-frame list below. Its range
+        # follows the trace's peak, which during a scan moves with most of the
+        # columns up to zero delay; as a static artist every one of those moves
+        # would cost a full redraw. Drawn every blit instead, it would cost its
+        # tick labels — measured ~24 ms, more than the trace image (~9 ms).
+        # So it gets a cached layer of its own, _bg_cbar: see _cbar_background.
+        self.ax_cbar.set_animated(True)
         self._animated = [(self.ax_spec, self.line_spec),
                           (self.ax_spec, self.line_m1),
                           (self.ax_spec, self.line_m2),
@@ -315,6 +346,9 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
                           (self.ax_ac, self.line_half),
                           (self.ax_ac, self.txt_fwhm)]
         self._bg = None            # cached full-figure background (no animated)
+        # _bg with the colour bar drawn in, and what it was drawn for.
+        self._bg_cbar = None
+        self._cbar_key = None
         # Background with the trace image + AC line already composited, so a
         # live spectrum frame only has to draw the spectrum line on top.
         # Invalidated whenever either of those artists (or the figure) changes.
@@ -373,6 +407,13 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
         self.ax_spec.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
         self.ax_ac.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
         self.ax_dev.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
+        # The colour bar: same tick and label treatment as the panels, so it
+        # reads as part of the trace rather than as a legend pasted beside it.
+        self.ax_cbar.tick_params(colors=PALETTE["text_dim"], labelsize=8.5)
+        self.cbar.outline.set_edgecolor(PALETTE["border"])
+        self.cbar.set_label(
+            "Intensity (norm.)" if self._trace_normalised else "Intensity (counts)",
+            color=PALETTE["text_dim"], fontsize=9.5)
         # Last: this re-does the two decorations the loop just reset to their
         # vertical-mode defaults, so a theme switch cannot undo the layout mode.
         self._apply_mode_decorations()
@@ -433,6 +474,8 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
             return
         self._bg = self.copy_from_bbox(self.fig.bbox)
         self._bg_static = None       # figure changed; recomposite lazily
+        self._bg_cbar = None         # …and the colour bar's layer over it
+        self.restore_region(self._cbar_background())
         for ax, art in self._animated:
             ax.draw_artist(art)
         # Only a completed draw knows how much of the gap the tick labels took,
@@ -448,6 +491,29 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
         if not had_renderer and self._renderer is not None:
             self.axes_relaid.emit()
 
+    def _cbar_background(self):
+        """_bg with the colour bar drawn into it — what every blit restores.
+
+        Rebuilt only when what the bar SHOWS has changed since it was drawn:
+        the colour range, the colormap (a new object on every switch — see
+        _apply_cmap) or the label. Keyed on those rather than invalidated at
+        each place that changes them, so a new way of moving the range cannot
+        forget to. Anything else about the bar — theme colours, position —
+        changes only through a full draw, and _on_draw drops this layer.
+
+        A rebuild is one bar draw and one buffer copy; a scan pays it on the
+        columns that move the peak by more than _render_trace's 0.5 %, and
+        nothing on the rest.
+        """
+        key = (self.im.get_clim(), id(self.im.get_cmap()),
+               self.ax_cbar.get_ylabel())
+        if self._bg_cbar is None or key != self._cbar_key:
+            self.restore_region(self._bg)
+            self.fig.draw_artist(self.ax_cbar)
+            self._bg_cbar = self.copy_from_bbox(self.fig.bbox)
+            self._cbar_key = key
+        return self._bg_cbar
+
     def _blit(self):
         """Fast path: repaint the animated artists over the cached background.
         All three must be redrawn, not just the one that changed: the restore
@@ -461,7 +527,7 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
             self.draw_idle()          # nothing cached yet — force a full draw
             return
         with perf_tick("blit"):
-            self.restore_region(self._bg)
+            self.restore_region(self._cbar_background())
             for ax, art in self._animated:
                 ax.draw_artist(art)
             self.blit(self.fig.bbox)
@@ -479,7 +545,7 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
             return
         with perf_tick("blit_spec"):
             if self._bg_static is None:
-                self.restore_region(self._bg)
+                self.restore_region(self._cbar_background())
                 self.ax_trace.draw_artist(self.im)
                 # Static between live frames exactly like the image they sit
                 # on: symmetry mode only runs on a finished trace, while the
@@ -584,6 +650,10 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
         try:
             for _ax, art in self._animated:
                 art.set_animated(False)
+            # Animated for its own cached layer, not in _animated — but skipped
+            # by Figure.draw all the same, and a trace without its scale is
+            # not a result anyone can read.
+            self.ax_cbar.set_animated(False)
             if prev_dev:
                 self.set_dev_visible(False)
             self.set_layout_mode("horizontal")
@@ -596,13 +666,14 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
             self._exporting = False
             for (_ax, art), was in zip(self._animated, prev_anim):
                 art.set_animated(was)
+            self.ax_cbar.set_animated(True)
             self.set_layout_mode(prev_mode)
             if prev_dev:
                 self.set_dev_visible(True)
             self._render_trace()         # …and back to the panel's resolution
             # Both caches were taken against a geometry (and a renderer) the
             # lines above have been moving; the draw re-takes them.
-            self._bg = self._bg_static = None
+            self._bg = self._bg_static = self._bg_cbar = None
             self.draw_idle()
         # int(), not round(): this has to be the size actually written, and Agg
         # truncates the figure's pixel bbox when it sizes the renderer.

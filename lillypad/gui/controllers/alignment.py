@@ -217,6 +217,9 @@ class AlignmentController:
         self.win._align_trace_on = bool(on)
         if self.win._align_trace_on and self.win.btn_symmetry.isChecked():
             self._clear_symmetry()      # one trace-view mode at a time
+        # Before the re-render: the raw view is each half scaled to its own
+        # peak, and the colour bar has to stop calling that counts.
+        self.win.canvas.set_trace_normalised(self.win._align_trace_on)
         # Re-render at once rather than waiting for the next column, so the
         # toggle also works on a finished trace.
         if self.win._align_trace_on:
@@ -292,6 +295,7 @@ class AlignmentController:
             self.win.btn_align_trace.setChecked(False)
             self.win.btn_align_trace.blockSignals(False)
             self.win._align_trace_on = False
+            self.win.canvas.set_trace_normalised(False)
             self.win.appearance._refresh_align_trace_button()
         if self.win._symmetry_on:
             self._show_symmetry()
@@ -413,4 +417,5 @@ class AlignmentController:
             self.win.btn_align_trace.setChecked(False)
             self.win.btn_align_trace.blockSignals(False)
         self.win._align_trace_on = False
+        self.win.canvas.set_trace_normalised(False)
         self.win.appearance._refresh_align_trace_button()

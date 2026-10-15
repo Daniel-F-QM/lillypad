@@ -12,7 +12,7 @@ Six steps, and the ORDER is the whole content of this file:
      way up to have a refresh hook;
   4. seeding calibration_files/ beside the program, so the first run has the
      shipped calibrations to offer;
-  5. the window, shown where the last session left it;
+  5. the window, maximized over where the last session left it;
   6. gc.freeze(), which moves the permanent startup graph out of the
      collector's reach for good.
 
@@ -63,9 +63,9 @@ def main():
     win = FrogWindow()
     # Maximized, not fullscreen: the plots are the point and they scale with
     # whatever room there is, but the operator still needs the title bar and
-    # the taskbar to get at the acquisition software beside this one. Still the
-    # default — but a session that deliberately left the window a particular
-    # size on a particular monitor gets it back. See show_restored.
+    # the taskbar to get at the acquisition software beside this one. Always
+    # maximized at startup — un-maximizing lands on the size a session left
+    # the window at on a particular monitor. See show_restored.
     win.show_restored()
     # The startup graph — every widget, artist, stylesheet rule and Qt binding —
     # is permanent, but the live loop allocates numpy arrays continuously, so

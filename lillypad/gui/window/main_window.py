@@ -475,12 +475,14 @@ class FrogWindow(QMainWindow):
 
 
     def show_restored(self):
-        """Show the window where the last session left it, maximized by default.
+        """Show the window maximized, over where the last session left it.
+
+        Always maximized, whatever the last session closed as — the saved
+        rectangle is still restored first, so un-maximizing lands on the size
+        the operator last chose rather than on some size nobody did.
 
         Neither in __init__ nor as two calls in main(): setGeometry has to
-        happen before the first show to be honoured without a visible jump, and
-        the maximized decision has to be made in the same place or one of the
-        two silently wins.
+        happen before the first show to be honoured without a visible jump.
 
         Explicit x/y/w/h rather than a base64 saveGeometry() blob, because this
         file is meant to be readable and fixable by hand — an opaque blob cannot
@@ -489,9 +491,7 @@ class FrogWindow(QMainWindow):
         saying so.
         """
         geo = self._settings.get("window")
-        maximized = True
         if isinstance(geo, dict):
-            maximized = geo.get("maximized", True) is not False
             try:
                 r = QRect(int(geo["x"]), int(geo["y"]),
                           int(geo["w"]), int(geo["h"]))
@@ -499,10 +499,7 @@ class FrogWindow(QMainWindow):
                 r = QRect()
             if r.isValid() and _on_a_screen(r):
                 self.setGeometry(r)        # Qt clamps up to setMinimumSize itself
-        if maximized:
-            self.showMaximized()
-        else:
-            self.show()
+        self.showMaximized()
 
 
 

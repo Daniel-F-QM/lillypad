@@ -259,6 +259,22 @@ class TestThePanelsStillDraw:
         canvas.clear_reference()
         assert not canvas.has_reference()
 
+    def test_the_colour_bar_has_its_own_cached_layer(self, canvas):
+        """Its range moves with the trace's peak on most scan columns: as a
+        static artist each move would cost a full redraw, and drawn on every
+        blit its tick labels cost more than the trace image. So it is out of
+        the background AND out of the per-frame list, and its layer is reused
+        until what it shows changes."""
+        assert canvas.ax_cbar.get_animated()
+        assert all(art is not canvas.ax_cbar for _ax, art in canvas._animated)
+        canvas.draw()
+        layer = canvas._cbar_background()
+        assert canvas._cbar_background() is layer        # nothing changed
+        lo, hi = canvas.im.get_clim()
+        canvas.set_trace_clim(lo, hi + 1.0)
+        assert canvas._cbar_background() is not layer    # the range did
+        canvas.set_autoscale_clim(True)
+
     def test_the_deviation_panel_shows_and_clears(self, canvas):
         wl = np.linspace(400.0, 700.0, 128)
         canvas.set_dev_visible(True)
@@ -267,3 +283,106 @@ class TestThePanelsStillDraw:
         canvas.clear_diff()
         canvas.set_dev_visible(False)
         assert not canvas.dev_visible()
+
+
+class TestTheColourBar:
+    """The FROG trace's colour bar: where it sits, what it says, and the colour
+    range it lets the operator take over from the follow-the-peak default."""
+
+    @pytest.fixture(autouse=True)
+    def _a_trace(self, canvas):
+        wl = np.linspace(400.0, 700.0, 64)
+        delays = np.linspace(-100.0, 100.0, 21)
+        canvas.init_trace(delays, wl)
+        trace = np.random.default_rng(1).random((wl.size, delays.size)) * 4000.0
+        canvas.update_trace(trace, peak=4000.0)
+        canvas.draw()
+        yield
+        canvas.set_autoscale_clim(True)
+        canvas.set_trace_normalised(False)
+
+    @pytest.mark.parametrize("mode", ["horizontal", "vertical"])
+    def test_it_stands_beside_the_trace_over_its_height(self, canvas, mode):
+        canvas.set_layout_mode(mode)
+        tr, cb = canvas.ax_trace.get_position(), canvas.ax_cbar.get_position()
+        assert cb.x0 > tr.x1                      # clear of the trace
+        assert cb.x1 < 1.0                        # and inside the figure
+        assert cb.y0 == pytest.approx(tr.y0)
+        assert cb.y1 == pytest.approx(tr.y1)
+        canvas.set_layout_mode("horizontal")
+
+    def test_the_stacked_panels_keep_one_delay_axis(self, canvas):
+        """Horizontal mode: the AC gives up the same strip as the trace, or a
+        delay would sit at two different x positions in the two panels."""
+        canvas.set_layout_mode("horizontal")
+        tr, ac = canvas.ax_trace.get_position(), canvas.ax_ac.get_position()
+        assert (ac.x0, ac.x1) == pytest.approx((tr.x0, tr.x1))
+
+    def test_it_is_labelled_in_the_units_on_screen(self, canvas):
+        assert canvas.ax_cbar.get_ylabel() == "Intensity (counts)"
+        canvas.set_trace_normalised(True)
+        assert canvas.ax_cbar.get_ylabel() == "Intensity (norm.)"
+
+    def test_it_follows_the_peak_by_default(self, canvas):
+        assert canvas.autoscale_clim
+        assert canvas.im.get_clim() == pytest.approx((0.0, 4000.0))
+        assert canvas.ax_cbar.get_ylim() == pytest.approx((0.0, 4000.0))
+
+    def test_a_manual_range_survives_the_next_column(self, canvas):
+        canvas.set_trace_clim(500.0, 2500.0)
+        assert not canvas.autoscale_clim
+        canvas.update_trace(canvas._trace_raw * 2.0, peak=8000.0)
+        assert canvas.im.get_clim() == pytest.approx((500.0, 2500.0))
+
+    def test_an_inverted_range_is_refused(self, canvas):
+        canvas.set_trace_clim(3000.0, 1000.0)
+        assert canvas.autoscale_clim
+        assert canvas.im.get_clim() == pytest.approx((0.0, 4000.0))
+
+    def test_auto_snaps_straight_back_to_the_peak(self, canvas):
+        canvas.set_trace_clim(500.0, 2500.0)
+        canvas.set_autoscale_clim(True)
+        assert canvas.im.get_clim() == pytest.approx((0.0, 4000.0))
+
+    def test_right_click_toggles_the_follow(self, canvas):
+        canvas.reset_axes(canvas.ax_cbar)
+        assert not canvas.autoscale_clim
+        assert canvas.im.get_clim() == pytest.approx((0.0, 4000.0))  # frozen
+        canvas.reset_axes(canvas.ax_cbar)
+        assert canvas.autoscale_clim
+
+    def test_a_drag_on_the_bar_sets_the_range(self, canvas):
+        canvas._apply_zoom(canvas.ax_cbar, 0.0, 1.0, 1000.0, 3000.0)
+        assert canvas.im.get_clim() == pytest.approx((1000.0, 3000.0))
+        assert not canvas.autoscale_clim
+
+    def test_a_typed_end_label_sets_one_end(self, canvas):
+        canvas.apply_axis_bound(canvas.ax_cbar, "y", "hi", 1234.0)
+        assert canvas.im.get_clim() == pytest.approx((0.0, 1234.0))
+
+    def test_its_end_labels_are_clickable(self, canvas):
+        assert (canvas.ax_cbar, "y") in canvas._editable_axes()
+        assert canvas._end_tick_labels(canvas.ax_cbar, "y")
+
+    def test_the_wheel_stretches_only_the_top(self, canvas):
+        from types import SimpleNamespace
+        canvas.set_trace_clim(1000.0, 3000.0)
+        canvas._on_scroll(SimpleNamespace(inaxes=canvas.ax_cbar, step=1))
+        lo, hi = canvas.im.get_clim()
+        assert lo == pytest.approx(1000.0)
+        assert hi < 3000.0                       # wheel up brightens
+        canvas._on_scroll(SimpleNamespace(inaxes=canvas.ax_trace, step=1))
+        assert canvas.im.get_clim() == pytest.approx((lo, hi))  # bar only
+
+    def test_switching_to_a_normalised_view_drops_a_counts_range(self, canvas):
+        """A range in counts on a 0…1 image paints the whole trace one colour."""
+        canvas.set_trace_clim(500.0, 2500.0)
+        canvas.set_trace_normalised(True)
+        assert canvas.autoscale_clim
+
+    def test_printing_hands_the_bar_back_animated(self, canvas, tmp_path):
+        """save_picture un-animates everything in _animated for the print (an
+        animated axes is skipped by Figure.draw) and must hand the flag back,
+        or every later blit would draw the bar twice."""
+        canvas.save_picture(str(tmp_path / "p.png"), dpi=50)
+        assert canvas.ax_cbar.get_animated()
