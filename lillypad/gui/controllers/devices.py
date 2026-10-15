@@ -182,6 +182,13 @@ class DeviceController:
                 return self._make_sim_member(half)
         return open_spectrometer(ident, self.win.seabreeze_backend)
 
+    def _sim_devices(self):
+        """Every SimulatedSpectrometer the connected device is made of — itself,
+        or the members of a stitched pair. Empty for real hardware."""
+        spec = self.win.spec
+        devs = spec.members if isinstance(spec, StitchedSpectrometer) else (spec,)
+        return [d for d in devs if isinstance(d, SimulatedSpectrometer)]
+
     def _attach_stage_warnings(self, stage):
         """Route a stage's warnings into the status bar. Safe from any thread —
         emit() is what crosses back to the GUI one."""
@@ -220,8 +227,14 @@ class DeviceController:
             # A simulated spectrometer reads the live stage, so re-point it.
             # None is allowed: SimulatedSpectrometer.acquire falls back to zero
             # delay, so the simulator keeps working with no stage attached.
-            if isinstance(self.win.spec, SimulatedSpectrometer):
-                self.win.spec.stage = self.win.stage
+            #
+            # Every simulator INSIDE a stitched pair too, not just a top-level
+            # one. The pair is a StitchedSpectrometer, so checking only
+            # win.spec skipped both members: a pair connected before the stage
+            # kept stage=None, and every frame came from zero delay — a trace
+            # with the same column at every delay.
+            for dev in self._sim_devices():
+                dev.stage = self.win.stage
             if isinstance(new_stage, SimulatedStage):
                 new_stage.move_to(um_to_stage(self.win.scan_cfg.zero_pos_um))
             elif new_stage is not None:

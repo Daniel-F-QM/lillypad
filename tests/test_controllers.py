@@ -248,3 +248,49 @@ class TestNoUnreachableImports:
                        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
                       - bound)
         assert not free, free
+
+
+class TestTheSimulatedPairFollowsTheStage:
+    """A simulated spectrometer reads its delay off the LIVE stage, so every
+    stage swap has to re-point it — including both members of a simulated
+    stitched pair. Only a top-level simulator used to be re-pointed: a pair
+    connected before the stage (the app starts with nothing connected) kept
+    stage=None, and every frame came from zero delay — a trace with the same
+    column at every delay."""
+
+    @staticmethod
+    def _signal_at(win, tau_fs):
+        from lillypad.scan.core import delay_to_position_um, um_to_stage
+        cfg = win.scan_cfg
+        win.stage.move_to(um_to_stage(
+            delay_to_position_um(tau_fs, cfg.zero_pos_um, cfg.pass_factor)))
+        return sum(float(m._raw_column(m._pos_to_delay(m.stage.get_position())).sum())
+                   for m in win.spec.members)
+
+    def test_a_pair_connected_before_the_stage_sees_the_delay(self, window):
+        win = window
+        try:
+            assert win.devices.use_sim_pair()[0]
+            assert win.devices.use_sim_stage()[0]
+            for m in win.spec.members:
+                assert m.stage is win.stage
+            # Noise-free signal: the zero-delay column must outshine one far out.
+            assert self._signal_at(win, 0.0) > 10 * self._signal_at(win, 300.0)
+        finally:
+            win.devices.disconnect_spectrometer()
+            win.devices.disconnect_stage()
+
+    def test_a_stage_swap_re_points_both_members(self, window):
+        win = window
+        try:
+            assert win.devices.use_sim_stage()[0]
+            assert win.devices.use_sim_pair()[0]
+            assert win.devices.use_sim_stage()[0]     # a NEW stage object
+            for m in win.spec.members:
+                assert m.stage is win.stage
+            assert win.devices.disconnect_stage()[0]
+            for m in win.spec.members:
+                assert m.stage is None
+        finally:
+            win.devices.disconnect_spectrometer()
+            win.devices.disconnect_stage()
