@@ -339,6 +339,14 @@ class DeviceController:
                     return False, "Cancelled — stage unchanged."
             else:
                 conn = devices[0][1]
+        # Release our own handle on this controller first: the USB link opens
+        # once, so reconnecting the stage already in use would otherwise fail
+        # with an open error while the old handle sat there.
+        old = getattr(self.win, "stage", None)
+        if isinstance(old, KinesisStage) and old.conn == str(conn):
+            ok, err = self._apply_stage(None)
+            if not ok:
+                return False, err
         try:
             # Identifies the stage and refuses anything it can't calibrate in mm.
             stage = KinesisStage(serial=conn)
@@ -348,6 +356,15 @@ class DeviceController:
         if not ok:
             self._drop(stage)      # never adopted — don't leak the connection
             return False, err
+        if stage.needs_homing:
+            self.win.status.showMessage(
+                f"Stage: {stage.name} — NOT HOMED, home it before scanning.", 0)
+            return True, (
+                f"Stage connected: {stage.name}, but the controller reports the "
+                f"axis NOT HOMED (it has been power-cycled). Its position "
+                f"readback has no physical meaning until you press Home, and "
+                f"homing will move the coordinate frame — so home first, then "
+                f"set zero. Scans are blocked until then.")
         self.win.status.showMessage(f"Stage: {stage.name} — zero at current position.", 5000)
         travel = (f"Travel {stage.travel_mm:.0f} mm." if stage.travel_mm else
                   "Travel unknown — no soft range limit, set one in the scan "

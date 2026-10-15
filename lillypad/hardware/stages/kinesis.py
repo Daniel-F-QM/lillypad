@@ -9,8 +9,12 @@ is also what lets PyInstaller's analysis find it with no hiddenimports entry.
 from __future__ import annotations
 
 import re
+import time
 
 from lillypad.hardware.base import StageBase
+
+# APT message the controller sends when a home completes (MGMSG_MOT_MOVE_HOMED).
+_MOT_MOVE_HOMED = 0x0444
 
 # ===========================================================================
 # Stage calibration registry
@@ -208,6 +212,15 @@ class KinesisStage(StageBase):
             travel_mm = cfg.get("travel_mm")
             if travel_mm is None and stage_name:
                 travel_mm = KINESIS_TRAVEL_MM.get(str(stage_name).strip().upper())
+            # The controller keeps its "homed" status bit for as long as it
+            # stays powered, so this is only False after a power cycle — not
+            # on every connect. Until then the position reads 0 wherever the
+            # carriage sits, and homing later shifts the whole frame under any
+            # zero marked in the meantime.
+            try:
+                needs_homing = not bool(motor.is_homed())
+            except Exception:
+                needs_homing = False
         except Exception:
             try:
                 motor.close()
@@ -215,12 +228,14 @@ class KinesisStage(StageBase):
                 pass
             raise
 
+        self.conn         = str(conn)
         self.model        = key or reported
         self.stage_name   = str(stage_name) if stage_name else None
         self.scale_units  = units
         self.travel_mm    = travel_mm
         self.name         = f"{self._label(key, reported, stage_name)} [{conn}]"
         self.backlash_mm  = float(backlash_mm)
+        self.needs_homing = needs_homing
         self._mm_per_unit = mm_per_unit
         self._motor       = motor
 
@@ -261,9 +276,40 @@ class KinesisStage(StageBase):
     def get_position(self) -> float:
         return float(self._motor.get_position()) * self._mm_per_unit
 
-    def home(self) -> None:
-        self._motor.home()
-        self._motor.wait_for_home()
+    def home(self, timeout_s: float = 300.0) -> None:
+        """Home the axis and block until the carriage has finished.
+
+        force=True: pylablib's default skips the move entirely when the
+        controller already reports homed, which made Home a silent no-op while
+        the status bar announced a fresh home. But forcing it breaks pylablib's
+        own wait, which polls for the "homed" bit — on an axis that was already
+        homed that bit is still set from last time, so the wait returned with
+        the carriage still travelling. Completion is therefore taken from the
+        controller's MOT_MOVE_HOMED message (pylablib counts it as a background
+        message on every read), with the status bits as a fallback for a
+        controller that never sends it.
+
+        The timeout is generous because homing is slow: an LTS300 seeking its
+        switch at the 2 mm/s factory homing velocity takes 150 s end to end.
+        """
+        motor = self._motor
+        sent_before, _ = motor.check_background_comm(_MOT_MOVE_HOMED)
+        motor.home(sync=False, force=True)
+        deadline = time.monotonic() + timeout_s
+        seen_homing = False
+        while True:
+            status = motor.get_status()         # drains queued messages too
+            sent_now, _ = motor.check_background_comm(_MOT_MOVE_HOMED)
+            homing = "homing" in status
+            seen_homing = seen_homing or homing
+            if not homing and (sent_now > sent_before
+                               or (seen_homing and "homed" in status)):
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"{self.name}: homing did not finish within {timeout_s:.0f} s.")
+            time.sleep(0.05)
+        self.needs_homing = False
 
     def stop(self) -> None:
         self._motor.stop()
