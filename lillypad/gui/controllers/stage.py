@@ -37,6 +37,18 @@ class StageController:
                   self.win.btn_home, self.win.btn_goto_zero, self.win.btn_set_zero,
                   self.win.btn_units, self.win.spin_backlash):
             w.setEnabled(on)
+        self._refresh_home_button()
+
+    def _refresh_home_button(self):
+        """Grey Home out on a stage with no homing routine (the piezo), rather
+        than let it fail on click. Otherwise it follows the rest of the stage
+        controls — with no stage it stays live, like they do, and says
+        "Connect a stage first". Call after a stage swap."""
+        stage = self.win.stage
+        can = stage is None or stage.can_home
+        self.win.btn_home.setEnabled(can and self.win.btn_minus.isEnabled())
+        self.win.btn_home.setToolTip(
+            "" if can else f"{stage.name} has no homing routine.")
 
     def _moving(self, on):
         self.win.lbl_moving.setText("MOVING" if on else "IDLE")
@@ -93,14 +105,17 @@ class StageController:
         """Reachable position range (lo, hi) in um.
 
         Not [0, travel]: limit.min is not always 0 (a soft limit protecting the
-        optics is common), and the low end has to leave room for the backlash
-        pre-move to undershoot into. Falls back to 300 mm of travel when the
-        adapter reports none.
+        optics is common), an unhomed axis whose limit switches stop it may go
+        negative (StageBase.reachable_range_mm), and the low end has to leave
+        room for the backlash pre-move to undershoot into. Falls back to 300 mm
+        of travel when the adapter reports none.
         """
-        t = getattr(self.win.stage, "travel_mm", None)
-        hi = stage_to_um(t if t else 300.0)
-        lo = stage_to_um(float(getattr(self.win.stage, "travel_min_mm", 0.0) or 0.0)
-                          + float(getattr(self.win.stage, "backlash_mm", 0.0) or 0.0))
+        stage = self.win.stage          # None at build time and after disconnect
+        lo_mm, hi_mm = (stage.reachable_range_mm() if stage is not None
+                        else (0.0, None))
+        hi = stage_to_um(hi_mm if hi_mm else 300.0)
+        lo = stage_to_um(float(lo_mm or 0.0)
+                          + float(getattr(stage, "backlash_mm", 0.0) or 0.0))
         return lo, hi
 
     def _update_stage_unit_ranges(self):

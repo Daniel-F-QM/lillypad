@@ -19,6 +19,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+from lillypad.hardware.base import StageLimitError
 from lillypad.sim import SimulatedSpectrometer, SimulatedStage
 from lillypad.scan import FrogScanConfig, stage_to_um
 from lillypad.scan.worker import FrogScanWorker
@@ -245,3 +246,65 @@ class TestTravelGuard:
         assert out["error"]
         assert out["columns"] == [], "nothing should have been measured"
         assert stage.get_position() == start, "the stage should not have moved"
+
+
+class _EndStopStage(SimulatedStage):
+    """An unhomed stage whose forward switch sits at `switch_mm` in the
+    power-up frame: a move past it stops there and raises, as
+    KinesisStage._move_to_raw does."""
+
+    def __init__(self, switch_mm, **kw):
+        super().__init__(**kw)
+        self.switch_mm = switch_mm
+        self.needs_homing = True
+        self.hw_limits_stop = True
+
+    def _move_to_raw(self, position_mm):
+        if position_mm > self.switch_mm:
+            super()._move_to_raw(self.switch_mm)
+            raise StageLimitError(
+                f"{self.name}: stopped by the forward limit switch at "
+                f"{self.switch_mm:.4f} mm.")
+        super()._move_to_raw(position_mm)
+
+
+class TestUnhomedScan:
+    """An unhomed axis scans in its power-up frame, and a scan that runs into
+    an end stops there with a stage fault instead of carrying on."""
+
+    @staticmethod
+    def _cfg_at_power_up_zero(small_cfg):
+        # Zero marked where the stage powered up: half the sweep sits below 0.
+        return replace(small_cfg, zero_pos_um=0.0)
+
+    def test_a_scan_below_the_power_up_zero_runs(self, small_cfg):
+        stage = SimulatedStage(travel_mm=300.0)
+        stage.needs_homing = stage.hw_limits_stop = True
+        spec = SimulatedSpectrometer(stage, gate="shg")
+        out = run_scan(stage, spec, self._cfg_at_power_up_zero(small_cfg))
+        assert out["error"] is None
+        assert out["result"] is not None
+        assert out["result"].positions_cmd_um.min() < 0.0
+
+    def test_the_same_scan_homed_is_refused_before_moving(self, small_cfg):
+        """Homed, the frame is real and 0 is the bottom of travel."""
+        stage = SimulatedStage(travel_mm=300.0)
+        spec = SimulatedSpectrometer(stage, gate="shg")
+        out = run_scan(stage, spec, self._cfg_at_power_up_zero(small_cfg))
+        assert out["result"] is None
+        assert out["columns"] == []
+
+    def test_reaching_an_end_stops_the_scan_with_a_fault(self, small_cfg):
+        cfg = self._cfg_at_power_up_zero(small_cfg)
+        targets = cfg.positions_um()
+        # Between columns 4 and 5, so five columns land and the sixth is cut.
+        switch_um = 0.5 * (targets[4] + targets[5])
+        stage = _EndStopStage(switch_um / 1000.0, travel_mm=300.0)
+        spec = SimulatedSpectrometer(stage, gate="shg")
+        out = run_scan(stage, spec, cfg)
+        assert out["result"] is None
+        assert out["columns"] == [0, 1, 2, 3, 4]
+        assert out["error"] and "end of its travel" in out["error"]
+        assert [i for i, _ in out["faults"]] == [5]
+        # Not parked: it stays on the switch where it stopped.
+        assert stage_to_um(stage.get_position()) == pytest.approx(switch_um)

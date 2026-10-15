@@ -11,10 +11,15 @@ from __future__ import annotations
 import re
 import time
 
-from lillypad.hardware.base import StageBase
+from lillypad.hardware.base import StageBase, StageLimitError
 
 # APT message the controller sends when a home completes (MGMSG_MOT_MOVE_HOMED).
 _MOT_MOVE_HOMED = 0x0444
+
+# How far short of its target a move may end, in mm, before a limit switch that
+# is active at the end of it counts as having stopped it. A stepper's counter
+# lands exactly on the commanded position; this only absorbs unit round-off.
+_ARRIVED_MM = 1e-3
 
 # ===========================================================================
 # Stage calibration registry
@@ -221,6 +226,7 @@ class KinesisStage(StageBase):
                 needs_homing = not bool(motor.is_homed())
             except Exception:
                 needs_homing = False
+            hw_limits_stop = self._limits_stop(motor)
         except Exception:
             try:
                 motor.close()
@@ -236,8 +242,25 @@ class KinesisStage(StageBase):
         self.name         = f"{self._label(key, reported, stage_name)} [{conn}]"
         self.backlash_mm  = float(backlash_mm)
         self.needs_homing = needs_homing
+        self.hw_limits_stop = hw_limits_stop
         self._mm_per_unit = mm_per_unit
         self._motor       = motor
+
+    @staticmethod
+    def _limits_stop(motor) -> bool:
+        """Whether both hardware limit switches will stop a move.
+
+        "make"/"break" are switches the controller halts on. "ignore" means
+        no switch, and "make_home"/"break_home" are used for homing only — a
+        move runs straight through them. Anything unreadable counts as False,
+        which keeps an unhomed axis inside [0, travel] of its power-up spot.
+        """
+        try:
+            p = motor.get_limit_switch_parameters()
+        except Exception:
+            return False
+        stops = ("make", "break")
+        return p.hw_kind_cw in stops and p.hw_kind_ccw in stops
 
     @staticmethod
     def _label(key, reported, stage_name) -> str:
@@ -270,8 +293,31 @@ class KinesisStage(StageBase):
             return None
 
     def _move_to_raw(self, position_mm: float) -> None:
-        self._motor.move_to(float(position_mm) / self._mm_per_unit)
-        self._motor.wait_move()
+        """Move and wait; raise if a limit switch stopped it short.
+
+        An unhomed axis may be driven over ±travel (reachable_range_mm), and
+        the switches are what halt it at the real ends. Raising here is what
+        keeps a stepped move from pushing into the switch once per sub-move,
+        and tells the operator why the carriage is not where they asked —
+        the app's equivalent of the End Stop light in Thorlabs' Kinesis GUI.
+        """
+        motor = self._motor
+        motor.move_to(float(position_mm) / self._mm_per_unit)
+        motor.wait_move()
+        try:
+            status = motor.get_status()
+        except Exception:
+            return
+        hit = [side for side, bits in (("reverse", ("hw_bk_lim", "sw_bk_lim")),
+                                       ("forward", ("hw_fw_lim", "sw_fw_lim")))
+               if any(b in status for b in bits)]
+        if not hit:
+            return
+        pos = self.get_position()
+        if abs(pos - float(position_mm)) > _ARRIVED_MM:
+            raise StageLimitError(
+                f"{self.name}: stopped by the {hit[0]} limit switch at "
+                f"{pos:.3f} mm (target {float(position_mm):.3f} mm).")
 
     def get_position(self) -> float:
         return float(self._motor.get_position()) * self._mm_per_unit

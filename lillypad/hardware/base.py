@@ -78,6 +78,16 @@ def load_calibration_file(path) -> tuple[np.ndarray, np.ndarray, int]:
 # ===========================================================================
 # Abstract interfaces — implement these to add new hardware
 # ===========================================================================
+class StageLimitError(RuntimeError):
+    """A move was stopped by an end-of-travel switch short of its target.
+
+    Raised by adapters that can tell (KinesisStage reads the limit bits). Its
+    own type so the scan can report "reached the end of its travel" instead of
+    a generic failure — on an unhomed axis that is the expected way to find
+    out where the ends are.
+    """
+
+
 class StageBase(abc.ABC):
     """A 1-D motorised delay stage. All positions are in MILLIMETRES.
 
@@ -131,11 +141,31 @@ class StageBase(abc.ABC):
     # until homed. Adapters that can tell set this; the GUI refuses to adopt a
     # zero-delay position from a stage that reports it.
     needs_homing:  bool = False
+    # True when hardware limit switches at BOTH ends will stop any move. Only
+    # then may an axis that needs_homing be driven below its travel_min_mm —
+    # see reachable_range_mm. Adapters that cannot confirm it leave it False.
+    hw_limits_stop: bool = False
     # Smallest move the axis can resolve, in mm, or None when the adapter does
     # not know. This is what defines "arrived": a settle window narrower than
     # the resolution can never close, and one wider than it throws away
     # accuracy the stage actually has.
     resolution_mm: float | None = None
+
+    def reachable_range_mm(self) -> tuple[float, float | None]:
+        """Position range (lo, hi) a move may target, in mm; hi None = unknown.
+
+        Normally [travel_min_mm, travel_mm]. On an axis that needs_homing the
+        readback is a counter zeroed wherever the carriage sat at power-up, so
+        the carriage can be anywhere in [0, travel] and every reachable
+        counter value lies within ±travel. That wider range is only offered
+        when hw_limits_stop says the switches will halt the carriage at the
+        real ends — which is how Thorlabs' own Kinesis software drives an
+        unhomed stage.
+        """
+        t = self.travel_mm
+        if self.needs_homing and self.hw_limits_stop and t:
+            return -float(t), float(t)
+        return self.travel_min_mm, t
 
     def move_to(self, position_mm: float) -> None:
         """Absolute move to position_mm; blocks until settled.
@@ -158,7 +188,7 @@ class StageBase(abc.ABC):
             return
         cur = self.get_position()
         if b > 0.0:
-            pre = max(target - b, self.travel_min_mm)
+            pre = max(target - b, self.reachable_range_mm()[0])
             # pre == target means the target sits inside the backlash margin at
             # the bottom of travel and there is no room to undershoot. Move
             # directly rather than refuse — the range checks in scan.py and the
@@ -184,8 +214,7 @@ class StageBase(abc.ABC):
                    f"{target_mm:.3f} mm) split into {n} steps of at most "
                    f"{step:g} mm")
         sign = 1.0 if target_mm > cur_mm else -1.0
-        lo = self.travel_min_mm
-        hi = self.travel_mm
+        lo, hi = self.reachable_range_mm()
         for k in range(1, n):
             # Stepped off cur_mm rather than off a fresh readback: no extra I/O,
             # and no room for readback error to accumulate along the way. The
@@ -239,7 +268,18 @@ class StageBase(abc.ABC):
         that happened during that scan."""
 
     def home(self) -> None:
-        pass
+        """Drive to the reference position and re-establish the frame.
+
+        Raises unless an adapter overrides it: a silent no-op here once let the
+        GUI announce "Stage homed" on a stage that had not moved.
+        """
+        raise NotImplementedError(f"{self.name} has no homing routine")
+
+    @property
+    def can_home(self) -> bool:
+        """Whether home() does anything — i.e. the adapter overrides it. The
+        GUI greys the Home button out when this is False."""
+        return type(self).home is not StageBase.home
 
     def stop(self) -> None:
         pass

@@ -19,7 +19,8 @@ implementation detail of the module it lives in.
 
 from lillypad.hardware.base import (C_NM_PER_FS, OVERLAP_BAND_FRAC,
                                     SPEC_VENDORS, SpectrometerBase, StageBase,
-                                    load_calibration_file, spec_ident,
+                                    StageLimitError, load_calibration_file,
+                                    spec_ident,
                                     split_spec_ident)
 from lillypad.hardware.registry import list_spectrometers, open_spectrometer
 from lillypad.hardware.spectrometers.avantes import (AvantesSpectrometer,
@@ -35,7 +36,7 @@ from lillypad.hardware.stitched import StitchedSpectrometer
 
 __all__ = [
     "C_NM_PER_FS", "OVERLAP_BAND_FRAC", "SPEC_VENDORS",
-    "StageBase", "SpectrometerBase", "load_calibration_file",
+    "StageBase", "StageLimitError", "SpectrometerBase", "load_calibration_file",
     "spec_ident", "split_spec_ident",
     "KinesisStage", "ZaberStage", "PiezoJenaStage", "list_kinesis_stages",
     "SeabreezeSpectrometer", "list_seabreeze_spectrometers",

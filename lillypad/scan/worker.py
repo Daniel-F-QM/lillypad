@@ -17,7 +17,8 @@ import time
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
-from lillypad.hardware.base import SpectrometerBase, StageBase
+from lillypad.hardware.base import (SpectrometerBase, StageBase,
+                                    StageLimitError)
 from lillypad.scan.core import delay_to_position_um, stage_to_um, um_to_stage
 from lillypad.scan.model import FrogResult, FrogScanConfig
 
@@ -168,13 +169,17 @@ class FrogScanWorker(QThread):
             # Travel-limit guard — catches a bad zero or range BEFORE moving.
             # The low end is limit.min (not necessarily 0) plus the backlash
             # margin, since the stage undershoots by that much to approach a
-            # target from below and must still have room to do it.
+            # target from below and must still have room to do it. On an
+            # unhomed axis the range is ±travel (StageBase.reachable_range_mm):
+            # nothing here can know where the real ends are, so reaching one
+            # is caught during the sweep instead — see move_or_stop.
             lo, hi = cfg.pos_min_um, cfg.pos_max_um
             backlash_um = stage_to_um(
                 float(getattr(self.stage, "backlash_mm", 0.0) or 0.0))
-            if lo is None and getattr(self.stage, "travel_mm", None):
-                lo = stage_to_um(float(getattr(self.stage, "travel_min_mm", 0.0)))
-                hi = stage_to_um(float(self.stage.travel_mm))
+            if lo is None:
+                r_lo, r_hi = self.stage.reachable_range_mm()
+                if r_hi:
+                    lo, hi = stage_to_um(float(r_lo)), stage_to_um(float(r_hi))
             if lo is not None:
                 lo += backlash_um
             if lo is not None and hi is not None:
@@ -256,9 +261,35 @@ class FrogScanWorker(QThread):
                     return True
                 return False
 
+            def move_or_stop(idx, delay_fs, target_um):
+                """Move to target_um. Returns True when the scan must stop
+                because the stage hit an end of travel getting there.
+
+                Always stops, whatever abort_on_stage_fault says: the stage is
+                not at the commanded delay and cannot get there, so carrying
+                on would only record more columns at the same wrong position.
+                Not parked either — same caution as the other stage faults.
+                """
+                nonlocal park
+                try:
+                    self.stage.move_to(um_to_stage(target_um))
+                except StageLimitError as e:
+                    reason = str(e)
+                    if 0 <= idx < total:
+                        faults[idx] = reason
+                    self.stage_fault.emit(idx, float(delay_fs), reason)
+                    park = False
+                    self.error.emit(
+                        f"Stage reached the end of its travel at "
+                        f"{delay_fs:+.1f} fs — {reason} Scan stopped. Move the "
+                        f"scan range or the zero away from that end.")
+                    return True
+                return False
+
             # Delay-extreme reference BEFORE — captured at the start position.
             # Archived, never subtracted (see FrogScanConfig.capture_delay_reference).
-            self.stage.move_to(um_to_stage(targets[0]))
+            if move_or_stop(-1, delays[0], targets[0]):
+                return
             if check_fault(-1, delays[0]):
                 return
             if cfg.capture_delay_reference:
@@ -271,7 +302,8 @@ class FrogScanWorker(QThread):
                 if self._abort:
                     self.error.emit("Scan aborted by user.")
                     return
-                self.stage.move_to(um_to_stage(targets[i]))   # absolute, blocking
+                if move_or_stop(i, delays[i], targets[i]):    # absolute, blocking
+                    return
                 col, peak, n_sat, members_raw = self._measure()
                 pos_um = stage_to_um(self.stage.get_position())   # read-back tag
                 trace[:, i] = col

@@ -56,14 +56,12 @@ class ScanController:
         if self.win.alignment._align_running():
             self.win.status.showMessage(
                 "An alignment sweep is running — the stage is busy.", 3000); return
-        # An unreferenced axis has no usable coordinate frame: every delay the
-        # scan would record is measured from a zero that means nothing, and
-        # homing afterwards moves the frame again. Refuse rather than save it.
-        if getattr(self.win.stage, "needs_homing", False):
-            self.win.status.showMessage(
-                "Stage is not homed — press Home, then set zero, then scan.",
-                6000)
-            return
+        # An unhomed axis may still scan: every delay is measured from the zero
+        # the operator marked, which is just as valid in the power-up frame.
+        # Only homing moves that frame, and _home_stage drops the zero when it
+        # does. What is lost is the pre-flight check against the real ends —
+        # the worker stops the scan instead if it runs into one.
+        unhomed = bool(getattr(self.win.stage, "needs_homing", False))
 
         c = self.win.scan_cfg
         c.delay_start_fs = self.win.spin_start.value()
@@ -163,6 +161,7 @@ class ScanController:
         self.win.btn_scan.style().unpolish(self.win.btn_scan); self.win.btn_scan.style().polish(self.win.btn_scan)
         self.win.export.set_save_enabled(False)
 
+        self.win._scan_stage_faulted = False      # see _on_error
         self.win._worker = FrogScanWorker(self.win.stage, self.win.spec, c,
                                       dark=self.win._scan_dark)
         self.win._worker.progress.connect(self._on_progress)
@@ -186,7 +185,10 @@ class ScanController:
         # _scan_running() would answer True — but that is an ordering accident,
         # and the same call one line earlier would have greyed nothing.
         self.win.appearance._refresh_autostitch_button(running=True)
-        self.win.status.showMessage(f"FROG scan: {delays.size} points…", 0)
+        self.win.status.showMessage(
+            f"FROG scan: {delays.size} points…" + (
+                " Stage not homed — scanning in its power-up frame; the scan "
+                "stops if it reaches either end." if unhomed else ""), 0)
 
     def _on_progress(self, done, total):
         self.win.progress.setValue(int(100 * done / total))
@@ -329,6 +331,7 @@ class ScanController:
         scan carries on and this is the only live sign that it has stopped
         tracking. Timeout 0 — it must not quietly disappear.
         """
+        self.win._scan_stage_faulted = True
         where = "the reference frame" if i < 0 else f"{delay_fs:+.0f} fs"
         self.win.status.showMessage(f"⚠ STAGE FAULT @ {where} — {reason}", 0)
 
@@ -416,7 +419,12 @@ class ScanController:
         self._reset_scan_ui()
 
     def _on_error(self, msg):
-        self.win.status.showMessage(f"Scan: {msg}", 6000)
+        # A scan stopped by the stage (a fault, or an end of travel on an
+        # unhomed axis) keeps its message up: the operator has to act on it
+        # before rescanning, and six seconds is easy to miss on a long scan.
+        faulted = self.win._scan_stage_faulted
+        self.win.status.showMessage(f"{'⚠ ' if faulted else ''}Scan: {msg}",
+                                    0 if faulted else 6000)
         self._reset_scan_ui()
 
     def _reset_scan_ui(self):

@@ -57,6 +57,8 @@ class ZaberStage(StageBase):
         "FE": "limit error",
         "FR": "overdrive limit exceeded",
     }
+    # The flags that only say "not homed" — see position_fault.
+    _UNHOMED_FLAGS = ("WH", "WR")
     # pos vs encoder.pos divergence beyond this means lost steps, not rounding.
     _ENCODER_TOL_MM = 0.010
 
@@ -204,8 +206,13 @@ class ZaberStage(StageBase):
             flags = set(self._axis.warnings.get_flags())
         except Exception:
             return None
+        # An axis that connected unhomed carries WH/WR from the start, and
+        # working in that power-up frame is allowed — so they are no news
+        # until home() clears needs_homing. After that they mean the reference
+        # was lost mid-session (a power glitch) and count again.
+        unreferenced = self._UNHOMED_FLAGS if self.needs_homing else ()
         reasons = [text for flag, text in self._FAULT_FLAGS.items()
-                   if flag in flags]
+                   if flag in flags and flag not in unreferenced]
 
         enc = self.encoder_position()
         if enc is not None:

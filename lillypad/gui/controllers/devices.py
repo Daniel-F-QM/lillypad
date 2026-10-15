@@ -240,14 +240,15 @@ class DeviceController:
             elif new_stage is not None:
                 # Real stage: adopt its ACTUAL position as zero-delay so
                 # "Move to 0 fs" can never slam it into a travel limit.
-                # Except when the axis has no reference — that readback is an
-                # arbitrary number, and homing later would move the frame under
-                # it. Adopt it anyway so the travel maths has something sane to
-                # work with, but _start_scan refuses to run until it is homed.
+                # An axis with no reference reads an arbitrary number here, but
+                # the zero only has to be consistent with the scan, which runs
+                # in the same power-up frame. Homing later moves that frame, and
+                # _home_stage drops the zero when it does.
                 self.win.scan_cfg.zero_pos_um = stage_to_um(new_stage.get_position())
             self.win.stage_ctl._update_stage_unit_ranges()  # new travel + possibly new zero
             self.win.stage_ctl._refresh_positions()   # inside the lock — we still own the stage
         self.win.stage_ctl._sync_backlash_ui()        # the new stage brings its own default
+        self.win.stage_ctl._refresh_home_button()     # …and may not be able to home
         self.win.stage_ctl._refresh_scan_um()         # zero may have moved: fs→um previews
         self.win.appearance._sync_connection_ui()      # panel swaps between controls/Connect
         return True, ""
@@ -371,13 +372,24 @@ class DeviceController:
             return False, err
         if stage.needs_homing:
             self.win.status.showMessage(
-                f"Stage: {stage.name} — NOT HOMED, home it before scanning.", 0)
+                f"Stage: {stage.name} — NOT HOMED, working in its power-up "
+                f"frame.", 0)
+            t = stage.travel_mm
+            if not t:
+                reach = ""
+            elif stage.hw_limits_stop:
+                reach = (f" Manual moves are allowed ±{t:.0f} mm from here; "
+                         f"the limit switches stop the carriage at either end.")
+            else:
+                reach = (f" Its limit switches are not set to stop moves, so "
+                         f"manual moves stay within 0…{t:.0f} mm of where it "
+                         f"powered up.")
             return True, (
                 f"Stage connected: {stage.name}, but the controller reports the "
-                f"axis NOT HOMED (it has been power-cycled). Its position "
-                f"readback has no physical meaning until you press Home, and "
-                f"homing will move the coordinate frame — so home first, then "
-                f"set zero. Scans are blocked until then.")
+                f"axis NOT HOMED (it has been power-cycled). Positions count from "
+                f"wherever it powered up. You can set zero and scan in that "
+                f"frame — a scan that runs into an end stops there — but "
+                f"homing later moves the frame and drops the zero.{reach}")
         self.win.status.showMessage(f"Stage: {stage.name} — zero at current position.", 5000)
         travel = (f"Travel {stage.travel_mm:.0f} mm." if stage.travel_mm else
                   "Travel unknown — no soft range limit, set one in the scan "
@@ -396,12 +408,13 @@ class DeviceController:
             return False, err
         if stage.needs_homing:
             self.win.status.showMessage(
-                f"Stage: {stage.name} — NOT HOMED, home it before scanning.", 0)
+                f"Stage: {stage.name} — NOT HOMED, working in its power-up "
+                f"frame.", 0)
             return True, (
-                f"Stage connected: {stage.name}, but the axis is NOT HOMED. Its "
-                f"position readback has no physical meaning until you press "
-                f"Home, and homing will move the coordinate frame — so home "
-                f"first, then set zero. Scans are blocked until then.")
+                f"Stage connected: {stage.name}, but the axis is NOT HOMED. "
+                f"Positions count from wherever it powered up. You can set zero "
+                f"and scan in that frame, but homing later moves the frame and "
+                f"drops the zero.")
         self.win.status.showMessage(f"Stage: {stage.name} — zero at current position.", 5000)
         backlash_um = stage_to_um(stage.backlash_mm)
         return True, (f"Stage connected: {stage.name}. Zero-delay set to current "

@@ -110,7 +110,8 @@ are the view controls — log scale, axis lock, and the alignment views.
 1. **Connect.** Press **Connect Spectrometer** and **Connect Stage** on the side
    panels, or use the toolbar buttons — same windows either way. Each scans for
    what is attached and lists it.
-2. **Home the stage** if it asks you to.
+2. **Home the stage** if it says it is not homed — or skip it and work in the
+   stage's power-up frame (see *An unhomed axis* below).
 3. **Find zero delay.** Jog until the signal peaks, then press
    **Set Position as 0 fs**.
 4. **Set the range** — start, stop and step in femtoseconds — and press
@@ -260,7 +261,7 @@ The four positions are measured from **wherever the stage is standing**, not
 from your marked zero — park where you want to test (usually *Move to 0 fs*) and
 press. A sweep that would run off the end of the travel is **refused, not
 clamped**, since a clamped target would destroy the symmetry you are measuring.
-It is also refused during a scan, or before the stage has been homed.
+It is also refused during a scan.
 
 ### Symmetry — is the *trace* symmetric?
 
@@ -439,17 +440,24 @@ got there. Reading it back cannot reveal a stall, a knob nudge or a lost
 reference.
 
 So Lillypad reads the controller's warning flags after every scan point (`FS`
-stalled, `WM` displaced while stationary, `NC` moved by hand, `WH`/`WR` unhomed,
-and others) and, where there is an encoder, cross-checks `pos` against it.
+stalled, `WM` displaced while stationary, `NC` moved by hand, `WH`/`WR` unhomed
+— ignored while the axis has not been homed since it connected — and others) and, where there is an encoder, cross-checks `pos` against it.
 Anything it finds stops the scan — *Abort scan on stage fault* in **Acquisition
 Settings**, on by default. Switch it off and the scan finishes with the affected
 columns marked in the `.npz`.
 
-**An unhomed axis connects, but will not scan.** Its position has no physical
-meaning yet, and homing afterwards moves the coordinate frame underneath any
-zero marked before it. Lillypad connects, says clearly that the axis is not
-homed, and blocks scans and alignment sweeps until you press Home. Homing an
-unreferenced axis also resets the stored zero — home first, then set zero.
+**An unhomed axis connects and scans, in its power-up frame.** After a power
+cycle the counter reads 0 wherever the carriage happens to be. Delays are
+measured from the zero you mark, so jogging to the overlap, setting zero and
+scanning all work without homing. What is lost is the check against the real
+ends of travel. A Thorlabs stage whose limit switches are set to stop moves
+(checked on connect) may then be driven ±travel from where it powered up, as in
+Thorlabs' own Kinesis software. A scan or move that runs into a switch stops
+there with a ⚠ message naming the end, and the stage is not parked. Homing
+afterwards moves the frame, so homing an unreferenced axis also resets the
+stored zero — set zero again after it.
+
+**Home** is greyed out on a stage with no homing routine (the piezo).
 
 **To measure the backlash on your own stage:**
 

@@ -294,3 +294,32 @@ class TestTheSimulatedPairFollowsTheStage:
         finally:
             win.devices.disconnect_spectrometer()
             win.devices.disconnect_stage()
+
+
+class TestTheHomeButtonNeverLies:
+    """Home either homes or is greyed out. The piezo has no homing routine, and
+    a clickable button that only ever failed was the old behaviour."""
+
+    def test_greyed_out_for_a_stage_that_cannot_home(self, window):
+        from lillypad.hardware import StageBase
+        from lillypad.sim import SimulatedStage
+
+        class _NoHome(SimulatedStage):
+            home = StageBase.home          # what an adapter without one inherits
+
+        win = window
+        try:
+            assert win.devices._apply_stage(_NoHome())[0]
+            assert not win.btn_home.isEnabled()
+            assert "no homing routine" in win.btn_home.toolTip()
+            # A stage action re-enables the controls; Home must stay grey.
+            win.stage_ctl._set_stage_controls_enabled(True)
+            assert not win.btn_home.isEnabled()
+            assert win.btn_minus.isEnabled()
+
+            assert win.devices.use_sim_stage()[0]          # can home
+            assert win.btn_home.isEnabled()
+            assert win.btn_home.toolTip() == ""
+        finally:
+            win.devices.disconnect_stage()
+        assert win.btn_home.isEnabled(), "no stage: live, says 'Connect a stage'"

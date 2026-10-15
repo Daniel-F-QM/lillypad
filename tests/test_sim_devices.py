@@ -40,6 +40,70 @@ class TestLongMoveSplit:
         assert n[0] == 1, f"expected 1 move for 2 mm, got {n[0]}"
 
 
+class TestUnhomedReach:
+    """After a power cycle a Kinesis counter reads 0 wherever the carriage is,
+    so a stage that powered up mid-travel must still be able to move down.
+    Like Thorlabs' own software, that is allowed only when the limit switches
+    will stop it at the real ends."""
+
+    @staticmethod
+    def _unhomed(hw_limits_stop):
+        stage = SimulatedStage(travel_mm=150.0)
+        stage.needs_homing = True
+        stage.hw_limits_stop = hw_limits_stop
+        return stage
+
+    def test_unhomed_with_stopping_switches_reaches_minus_travel(self):
+        assert self._unhomed(True).reachable_range_mm() == (-150.0, 150.0)
+
+    def test_without_stopping_switches_keeps_the_travel_range(self):
+        assert self._unhomed(False).reachable_range_mm() == (0.0, 150.0)
+
+    def test_homed_keeps_the_travel_range(self):
+        stage = SimulatedStage(travel_mm=150.0)
+        stage.hw_limits_stop = True
+        assert stage.reachable_range_mm() == (0.0, 150.0)
+
+    def test_negative_long_move_is_still_split(self):
+        """The sub-move clamp used travel_min_mm, so every intermediate step of
+        a move below 0 was pinned at 0 and the last one jumped the whole way."""
+        stage = self._unhomed(True)
+        targets = []
+        raw = stage._move_to_raw
+        stage._move_to_raw = lambda p: (targets.append(p), raw(p))
+        stage.move_to(-20.0)
+        assert targets == [-5.0, -10.0, -15.0, -20.0]
+        assert stage.get_position() == -20.0
+
+
+class TestHomeIsAdvertisedHonestly:
+    """can_home is what greys the Home button out, so it has to be True exactly
+    for the adapters whose home() does something."""
+
+    @pytest.mark.parametrize("cls_name,expected", [
+        ("KinesisStage", True), ("ZaberStage", True), ("PiezoJenaStage", False)])
+    def test_hardware_adapters(self, cls_name, expected):
+        import lillypad.hardware as hw
+        cls = getattr(hw, cls_name)
+        assert object.__new__(cls).can_home is expected   # no hardware: skip __init__
+
+    def test_the_simulator_can_home(self):
+        assert SimulatedStage().can_home
+
+    def test_an_adapter_without_home_raises_instead_of_pretending(self):
+        from lillypad.hardware import StageBase
+
+        class _Bare(StageBase):
+            name = "bare stage"
+            def _move_to_raw(self, position_mm): pass
+            def get_position(self): return 0.0
+
+        stage = _Bare()
+        assert not stage.can_home
+        with pytest.raises(NotImplementedError, match="no homing routine"):
+            stage.home()
+
+
 class TestBacklashZeroShift:
     """Marking zero after arriving from ABOVE, then sweeping upward, puts the
     marked zero and the scan in frames that differ by the screw slack. On a

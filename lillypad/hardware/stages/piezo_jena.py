@@ -276,11 +276,6 @@ class PiezoJenaStage(StageBase):
     def clear_position_faults(self) -> None:
         self._fault = None
 
-    def home(self) -> None:
-        # No homing routine exists for this closed-loop piezo; raising keeps
-        # the GUI's "homed to 0 mm" message from ever lying about it.
-        raise RuntimeError("home not defined for this stage")
-
     def disconnect(self) -> None:
         ser = getattr(self, "_ser", None)
         if ser is not None:

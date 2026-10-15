@@ -239,6 +239,7 @@ class FrogWindow(QMainWindow):
         self._scan_col    = None
         self._scan_pos_um = 0.0
         self._scan_members_raw = None  # newest column's raw member frames
+        self._scan_stage_faulted = False  # the stage stopped this scan — see _on_error
         self._display_timer = QTimer(self)
         self._display_timer.setInterval(60)      # ~16 fps display cadence
         self._display_timer.timeout.connect(self.feed._display_tick)
