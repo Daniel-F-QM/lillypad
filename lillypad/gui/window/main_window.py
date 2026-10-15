@@ -137,10 +137,10 @@ class FrogWindow(QMainWindow):
         self._align_view     = None   # scratch buffer for the normalized view
         self._align_trace_on = False
         # Symmetry mode: a display-only view of the finished trace folded about
-        # its autocorrelation peak. Mutually exclusive with the raw view above —
+        # its most symmetric axis. Mutually exclusive with the raw view above —
         # both rewrite the same image.
         self._symmetry_on    = False
-        self._fold_fs        = None   # hand-placed fold; None = the AC peak
+        self._fold_fs        = None   # hand-placed fold; None = optimised
         self._feed_was_on  = True
         self._pending_fit  = True
         # Weaker cousin of _pending_fit: refit the spectrum to the next frame

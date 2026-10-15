@@ -78,7 +78,7 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
 
     fold_dragged = Signal(float)     # symmetry fold line moved to this delay
 
-    fold_reset_requested = Signal()  # double-click on it → back to the AC peak
+    fold_reset_requested = Signal()  # double-click on it → back to the optimum
 
     axis_edit_failed = Signal(str)   # typed axis bound rejected → status bar
 

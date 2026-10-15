@@ -581,12 +581,13 @@ class AppearanceController:
             "from being each other's mirror image.\nBoth halves share one "
             "colour scale, so a dark right half genuinely means a symmetric "
             "trace. The corner readout is the asymmetry as a fraction of the "
-            "whole trace.\nThe line starts on the autocorrelation peak — drag "
-            "it to fold somewhere else, double-click it to put it back.\n"
+            "whole trace.\nThe line starts on the most symmetric axis near "
+            "the autocorrelation peak (to half a scan step) — drag it to fold "
+            "somewhere else, double-click it to put it back.\n"
             "Display only: the recorded trace and every export are unaffected."
             if ready else
             "Run a scan first — symmetry mode folds a finished trace about its "
-            "autocorrelation peak.")
+            "most symmetric axis.")
 
     def _set_hardware_buttons_enabled(self, on):
         """Every route to a device swap, locked together.

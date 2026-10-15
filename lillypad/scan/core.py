@@ -112,26 +112,101 @@ def fwhm(x, y):
 # Display maths, but maths: these take arrays and return arrays, so they belong
 # with the rest of the numpy in this module rather than on a Qt window where
 # they cannot be tested without one. `fold_fs` is the hand-placed fold line, or
-# None for the autocorrelation peak.
+# None for the optimised fold.
+#
+# A fold is a HALF-INDEX k: it sits at index k/2, so k = 2c is on column c and
+# k = 2c+1 is halfway between columns c and c+1. Half columns, not anything
+# finer, because then every comparison is still between two columns that were
+# actually measured — no resampling. Interpolating a mirrored column would
+# average its noise down, and an optimiser would then prefer positions
+# between columns for that reason alone.
 
 
-def symmetry_center(ac, delays, fold_fs=None):
-    """Column index the trace is folded about.
+def _fold_delay(k, delays):
+    """Delay of fold k: the mean of the column(s) it sits on or between."""
+    d = np.asarray(delays, float)
+    return 0.5 * (d[k // 2] + d[(k + 1) // 2])
 
-    The autocorrelation maximum by default: the AC is the trace summed over
-    wavelength, so its peak is where the two pulses overlap best — the delay
-    the trace SHOULD be symmetric about. Not the middle column, which would
-    make a scan range that was not centred on the overlap report its own
-    offset as asymmetry.
+
+def _fold_pairs(k, n):
+    """Column pairs (i, j), i = k - j, mirrored across fold k: j runs from
+    the fold outward for as long as its partner i is still measured. On an
+    even k the first pair is the fold column with itself."""
+    j = np.arange((k + 1) // 2, min(n - 1, k) + 1)
+    return k - j, j
+
+
+def _asymmetry(ac, k):
+    """The asymmetry score of fold k — see the comment in symmetry_view."""
+    a = np.asarray(ac, float)
+    total = float(np.nansum(a))
+    i, j = _fold_pairs(k, a.size)
+    if total <= 0 or not np.any(j > i):
+        return 0.0
+    return float(np.nansum(np.abs(a[j] - a[i]))) / total
+
+
+def optimal_fold(ac, delays):
+    """The fold (a half-index) that minimises the asymmetry score, searched
+    outward from the autocorrelation peak.
+
+    The AC peak is where the pulses overlap best, so it is where the search
+    STARTS — but as an estimate of the symmetry axis it is quantised to whole
+    columns and pushed about by noise, and a trace whose real centre falls
+    between two columns would score asymmetric for no physical reason.
+
+    Every half-column within ±max(AC FWHM/2, two scan steps) of the peak is
+    scored, rather than descending from it, so a noise wiggle cannot trap the
+    search; ties go to the fold nearest the peak. The window is kept local on
+    purpose: towards the trace edges fewer pairs are compared and the score
+    shrinks for that reason alone, and within it the compared span barely
+    changes, so the scores are comparable. The score minimised is the one the
+    readout shows, so dragging the line cannot beat it inside the window.
+    """
+    a = np.asarray(ac, float)
+    d = np.asarray(delays, float)
+    if a.size == 0 or not np.any(np.isfinite(a)):
+        return 0
+    k0 = 2 * int(np.nanargmax(a))
+    if a.size < 2:
+        return k0
+    step = float(np.median(np.abs(np.diff(d))))
+    width = fwhm(d, np.nan_to_num(a))
+    reach = max(0.5 * width if np.isfinite(width) else 0.0, 2.0 * step)
+    peak_fs = _fold_delay(k0, d)
+    best_k, best_s = k0, _asymmetry(a, k0)
+    # Nearest first, and only a STRICTLY lower score replaces the best, so a
+    # tie stays with the fold closest to the peak.
+    for k in sorted(range(2 * a.size - 1), key=lambda k: abs(k - k0)):
+        if abs(_fold_delay(k, d) - peak_fs) > reach + 1e-9 * step:
+            continue
+        i, j = _fold_pairs(k, a.size)
+        if not np.any(j > i):
+            continue                  # on an edge: nothing to compare
+        s = _asymmetry(a, k)
+        if s < best_s - 1e-12:
+            best_k, best_s = k, s
+    return best_k
+
+
+def symmetry_fold(ac, delays, fold_fs=None):
+    """Half-index the trace is folded about.
+
+    By default the optimised fold (optimal_fold): it starts at the
+    autocorrelation maximum, where the two pulses overlap best, and moves to
+    the most symmetric axis near it. Not the middle column, which would make a
+    scan range that was not centred on the overlap report its own offset as
+    asymmetry.
 
     A hand-placed line (dragged on the plot) overrides it, snapped to the
-    nearest measured column: the fold is an index into the trace, so there
-    is no sub-column position it could honour without resampling.
+    nearest half column — on a measured column or halfway between two.
     """
     if fold_fs is None:
-        return int(np.nanargmax(np.asarray(ac, float)))
+        return optimal_fold(ac, delays)
     d = np.asarray(delays, float)
-    return int(np.argmin(np.abs(d - float(fold_fs))))
+    ks = np.arange(2 * d.size - 1)
+    fds = 0.5 * (d[ks // 2] + d[(ks + 1) // 2])
+    return int(ks[np.argmin(np.abs(fds - float(fold_fs)))])
 
 def symmetry_view(trace, ac, delays, fold_fs=None):
     """Measured trace on the left of the fold, |T(+d) - T(-d)| on the right.
@@ -158,19 +233,16 @@ def symmetry_view(trace, ac, delays, fold_fs=None):
     """
     t = np.asarray(trace, float)
     n = t.shape[1]
-    c = symmetry_center(ac, delays, fold_fs)
-    fold = float(np.asarray(delays, float)[c])
+    k = symmetry_fold(ac, delays, fold_fs)
+    fold = float(_fold_delay(k, delays))
     out = t.copy()                   # left of the fold: measured, untouched
-    h = min(c, n - 1 - c)            # columns both sides can cover
     peak = float(np.nanmax(t)) if t.size else 0.0
-    if h < 1:
-        out[:, c + 1:] = np.nan      # fold on an edge: nothing to compare
+    i, j = _fold_pairs(k, n)
+    if not np.any(j > i):
+        out[:, k // 2 + 1:] = np.nan     # fold on an edge: nothing to compare
         return out, peak, 0.0, fold
-    left  = t[:, c - h:c + 1]        # columns c-h … c
-    right = t[:, c:c + h + 1]        # columns c   … c+h
-    d = np.abs(right - left[:, ::-1])
-    out[:, c:c + h + 1] = d
-    out[:, c + h + 1:]  = np.nan     # beyond the overlap: no counterpart
+    out[:, j] = np.abs(t[:, j] - t[:, i])
+    out[:, j[-1] + 1:] = np.nan      # beyond the overlap: no counterpart
     # Score: sum of the absolute difference over the sum of the whole
     # trace — but with the sum over WAVELENGTH taken first, i.e. on the
     # autocorrelation rather than pixel by pixel.
@@ -188,8 +260,4 @@ def symmetry_view(trace, ac, delays, fold_fs=None):
     # The blind spot is an asymmetry that cancels in the wavelength sum. The
     # IMAGE is per-pixel and still shows it — the picture says where, the
     # number says how much.
-    a = np.asarray(ac, float)
-    total = float(np.nansum(a))
-    score = (float(np.nansum(np.abs(a[c:c + h + 1] - a[c - h:c + 1][::-1])))
-             / total) if total > 0 else 0.0
-    return out, peak, score, fold
+    return out, peak, _asymmetry(ac, k), fold

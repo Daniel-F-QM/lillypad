@@ -14,8 +14,9 @@ ways of looking at what is on the bench right now.
     hard-cut, each half normalized to its own running maximum. Dark-corrected at
     MEMBER level, because that is the only place the pedestal can come off
     without bringing the calibration or the crossfade with it.
-  * **Symmetry mode.** The finished trace folded about its autocorrelation peak,
-    or about a fold line the operator drags.
+  * **Symmetry mode.** The finished trace folded about the most symmetric axis
+    near its autocorrelation peak (in half-column steps), or about a fold line
+    the operator drags.
 
 The last two are mutually exclusive, and the reason is mechanical rather than a
 policy: both rewrite the same image.
@@ -26,7 +27,7 @@ import numpy as np
 from lillypad.gui.text import FEED_BUSY_MSG
 from lillypad.gui.workers import AlignmentWorker
 from lillypad.hardware import StitchedSpectrometer
-from lillypad.scan import (delay_to_position_um, stage_to_um, symmetry_center,
+from lillypad.scan import (delay_to_position_um, stage_to_um, symmetry_fold,
                            symmetry_view)
 
 
@@ -242,42 +243,55 @@ class AlignmentController:
         if view is None:
             return
         data, peak, score, fold = view
+        if self.win._fold_fs is not None:
+            where = "   (manual)"
+        else:
+            # How far the optimiser moved the fold off the autocorrelation
+            # peak it started from — itself a reading of where zero delay is.
+            ac_peak = float(self.win.result.delays_fs[
+                int(np.nanargmax(self.win._result_ac))])
+            where = ("" if abs(fold - ac_peak) < 1e-9
+                     else f"   (AC peak {ac_peak:+.1f} fs)")
         with self.win.canvas.batch():
             self.win.canvas.update_trace(data, peak)
             self.win.canvas.set_fold_line(fold)
             self.win.canvas.set_symmetry_score(
-                f"Asymmetry  {100 * score:.2f} %   @ {fold:+.0f} fs")
+                f"Asymmetry  {100 * score:.2f} %   @ {fold:+.1f} fs{where}")
 
     def _on_fold_dragged(self, x_fs):
         """The fold line was dragged. Re-render only when it has actually
-        changed COLUMN: a drag reports every pixel it crosses, and recomputing
-        a trace-sized difference for a move that lands on the same column would
-        be work with nothing to show for it."""
+        changed HALF COLUMN: a drag reports every pixel it crosses, and
+        recomputing a trace-sized difference for a move that lands on the same
+        fold would be work with nothing to show for it. Leaving the optimised
+        fold for a hand-placed one always re-renders, to relabel the readout."""
         if self.win.result is None or not self.win._symmetry_on:
             return
-        before = symmetry_center(self.win._result_ac, self.win.result.delays_fs,
-                                 self.win._fold_fs)
+        was_manual = self.win._fold_fs is not None
+        before = symmetry_fold(self.win._result_ac, self.win.result.delays_fs,
+                               self.win._fold_fs)
         self.win._fold_fs = float(x_fs)
-        after = symmetry_center(self.win._result_ac, self.win.result.delays_fs,
-                                self.win._fold_fs)
-        if after != before:
+        after = symmetry_fold(self.win._result_ac, self.win.result.delays_fs,
+                              self.win._fold_fs)
+        if after != before or not was_manual:
             self._show_symmetry()
 
     def _on_fold_reset(self):
-        """Double-click on the line: back to the autocorrelation peak."""
+        """Double-click on the line: back to the optimised fold."""
         if self.win._fold_fs is None or not self.win._symmetry_on:
             return
         self.win._fold_fs = None
+        view = self._current_symmetry_view()
         self._show_symmetry()
-        self.win.status.showMessage("Fold line back on the autocorrelation peak.", 3000)
+        self.win.status.showMessage(
+            f"Fold back on the most symmetric axis ({view[3]:+.1f} fs).", 3000)
 
     def _on_symmetry_toggled(self, on):
         # Switching the mode re-centres the fold, in BOTH directions. A
         # hand-dragged position belongs to the look the operator was taking at
         # the time; turning the mode off ends that look, so coming back to it
-        # should start from the autocorrelation peak rather than resurrect a
-        # fold placed for a question already answered. Before the view is
-        # computed on the next line, so the `on` path folds about the peak.
+        # should start from the optimised fold rather than resurrect a fold
+        # placed for a question already answered. Before the view is computed
+        # on the next line, so the `on` path folds about the optimum.
         self.win._fold_fs = None
         view = self._current_symmetry_view() if on else None
         if on and view is None:
@@ -303,8 +317,10 @@ class AlignmentController:
             self.win.canvas.set_symmetry_score("")
             self._restore_trace_view()
         self.win.status.showMessage(
-            "Symmetry — measured trace left of the fold, |T(+d) − T(−d)| "
-            "right of it. Drag the line to move it, double-click to re-centre."
+            "Symmetry — folded at the most symmetric axis near the "
+            "autocorrelation peak: measured trace left of the fold, "
+            "|T(+d) − T(−d)| right of it. Drag the line to move it, "
+            "double-click to return to the optimum."
             if on else "FROG trace: measured counts.", 6000)
 
     def _restore_trace_view(self):
@@ -324,7 +340,7 @@ class AlignmentController:
             self.win.btn_symmetry.blockSignals(False)
         self.win._symmetry_on = False
         # A hand-placed fold belongs to the trace it was placed on, so a new
-        # scan starts back on the autocorrelation peak.
+        # scan starts back on the optimised fold.
         self.win._fold_fs = None
         self.win.canvas.set_fold_line(None)
         self.win.canvas.set_symmetry_score("")

@@ -270,9 +270,14 @@ data on one side, the difference `|T(+d) − T(−d)|` on the other, sharing one
 colour scale. Nearly black on the right means nearly symmetric, and a score in
 the corner puts a number on it.
 
-It folds about the autocorrelation peak — the delay the trace *should* be
-symmetric about — rather than the middle column, so an off-centre scan range
-does not report its own offset as asymmetry. Drag the fold line to move it.
+The fold starts at the autocorrelation peak — where the pulses overlap best,
+and the delay the trace *should* be symmetric about — rather than the middle
+column, so an off-centre scan range does not report its own offset as
+asymmetry. It then moves to the most symmetric axis nearby (within half the
+autocorrelation width), in half-column steps: on a measured column or exactly
+halfway between two, so both sides compared are always measured data. The
+readout shows that position and, when it differs, the AC peak it started from.
+Drag the fold line to move it; double-click it to return to the optimum.
 
 ### RAW — what the detectors actually saw
 
