@@ -44,8 +44,8 @@ class CanvasInteractionMixin:
     # The spectrum's Y is deliberately absent: its tick-label strip is the log
     # toggle (see _hit_spec_yaxis), and one strip cannot mean two things.
     # The AC's delay ends ARE editable and land on the TRACE, which owns that
-    # axis — in horizontal mode the trace's own delay ticks are hidden, so the
-    # AC's are the only ones there are to click.
+    # axis — the trace's own delay ticks are hidden under the stacked AC, so
+    # the AC's are the only ones there are to click.
     _AXIS_EDIT_PAD = 3      # px of slack around a tick label's ink
 
     def _editable_axes(self):

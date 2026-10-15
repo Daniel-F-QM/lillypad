@@ -190,14 +190,6 @@ class TestTraceDecimation:
 
 
 class TestThePublicAxisSurface:
-    def test_layout_mode_is_read_only_and_set_through_the_method(self, canvas):
-        canvas.set_layout_mode("vertical")
-        assert canvas.layout_mode == "vertical"
-        canvas.set_layout_mode("horizontal")
-        assert canvas.layout_mode == "horizontal"
-        with pytest.raises(AttributeError):
-            canvas.layout_mode = "vertical"
-
     def test_the_autoscale_switches_round_trip(self, canvas):
         for on in (False, True):
             canvas.set_autoscale_x(on)
@@ -230,13 +222,11 @@ class TestThePublicAxisSurface:
 
 
 class TestThePanelsStillDraw:
-    """One pass through each panel's update path in both layouts — the cheapest
-    check that the split did not leave a method reaching for state that ended up
-    on a class it no longer shares."""
+    """One pass through each panel's update path — the cheapest check that the
+    split did not leave a method reaching for state that ended up on a class it
+    no longer shares."""
 
-    @pytest.mark.parametrize("mode", ["horizontal", "vertical"])
-    def test_a_full_cycle_draws(self, canvas, mode):
-        canvas.set_layout_mode(mode)
+    def test_a_full_cycle_draws(self, canvas):
         wl = np.linspace(400.0, 700.0, 512)
         canvas.update_spectrum(wl, np.exp(-((wl - 550.0) / 20.0) ** 2) * 1e4)
         canvas.update_member_spectra(wl[:300], np.ones(300),
@@ -301,20 +291,16 @@ class TestTheColourBar:
         canvas.set_autoscale_clim(True)
         canvas.set_trace_normalised(False)
 
-    @pytest.mark.parametrize("mode", ["horizontal", "vertical"])
-    def test_it_stands_beside_the_trace_over_its_height(self, canvas, mode):
-        canvas.set_layout_mode(mode)
+    def test_it_stands_beside_the_trace_over_its_height(self, canvas):
         tr, cb = canvas.ax_trace.get_position(), canvas.ax_cbar.get_position()
         assert cb.x0 > tr.x1                      # clear of the trace
         assert cb.x1 < 1.0                        # and inside the figure
         assert cb.y0 == pytest.approx(tr.y0)
         assert cb.y1 == pytest.approx(tr.y1)
-        canvas.set_layout_mode("horizontal")
 
     def test_the_stacked_panels_keep_one_delay_axis(self, canvas):
-        """Horizontal mode: the AC gives up the same strip as the trace, or a
-        delay would sit at two different x positions in the two panels."""
-        canvas.set_layout_mode("horizontal")
+        """The AC gives up the same strip as the trace, or a delay would sit
+        at two different x positions in the two panels."""
         tr, ac = canvas.ax_trace.get_position(), canvas.ax_ac.get_position()
         assert (ac.x0, ac.x1) == pytest.approx((tr.x0, tr.x1))
 

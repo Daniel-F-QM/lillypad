@@ -53,15 +53,8 @@ SPLIT_ICON = {"dark":  resource_path("icons", "broken_spectrum_dark.png"),
               "light": resource_path("icons", "broken_spectrum_light.png")}
 MERGE_ICON = {"dark":  resource_path("icons", "continuous_spectrum_dark.png"),
               "light": resource_path("icons", "continuous_spectrum_light.png")}
-# Plot-layout toggle, same convention as above: each icon DEPICTS the layout you
-# get by clicking it. horizontal_* shows the tall spectrum beside the stacked
-# trace/AC pair, vertical_* the two top panels over a full-width bottom one.
-HORIZ_ICON = {"dark":  resource_path("icons", "horizontal_dark.png"),
-              "light": resource_path("icons", "horizontal_light.png")}
-VERT_ICON  = {"dark":  resource_path("icons", "vertical_dark.png"),
-              "light": resource_path("icons", "vertical_light.png")}
 # Alignment-mode sweep, on the spectrum panel's header. A crosshair: unlike the
-# two pairs above this one depicts a MODE rather than an action, so both files
+# pair above this one depicts a MODE rather than an action, so both files
 # show the same mark and differ only in the accent each theme draws it in.
 ALIGN_ICON = {"dark":  resource_path("icons", "alignment_dark.png"),
               "light": resource_path("icons", "alignment_light.png")}

@@ -99,8 +99,7 @@ windows — so nothing that looks like a hardware control can hand you fake data
 
 **Toolbar:** Acquisition Settings · Spectrometer · Stage · Simulation ·
 Graphics Settings · Alignment · Export · Calibration · *Avantes* (only when one
-is connected) · light/dark toggle · camera (save the plots as a picture) ·
-layout toggle.
+is connected) · light/dark toggle · camera (save the plots as a picture).
 
 **Panels:** the live **Spectrum** on one side; the **FROG Trace** and its
 **autocorrelation** on the other. Small buttons in the top corners of each plot
@@ -152,9 +151,8 @@ skips the window and writes with whatever it is set to.
 
 The **camera** in the toolbar writes the plots themselves to a PNG at 300 dpi —
 the FROG trace with the autocorrelation under it and the spectrum full height
-beside them, in whichever theme and colour map you are looking at. It is always
-that arrangement, whichever layout the window is in, and it leaves the alignment
-panel out; it is a figure for a slide or a page, not a record of the
+beside them, in whichever theme and colour map you are looking at. It leaves the
+alignment panel out; it is a figure for a slide or a page, not a record of the
 measurement. Export is what writes the numbers.
 
 The page takes the window's own proportions, so a wider window gives a wider

@@ -104,10 +104,8 @@ class TestThemeSwitchOnALiveWindow:
             window.canvas.draw()
 
 
-class TestLayoutModes:
-    @pytest.mark.parametrize("mode", ["vertical", "horizontal"])
-    def test_both_layouts_draw(self, window, mode):
-        window.canvas.set_layout_mode(mode)
+class TestLayout:
+    def test_the_layout_draws(self, window):
         window.canvas.draw()
 
     def test_the_figure_geometry_constants_are_reachable(self):

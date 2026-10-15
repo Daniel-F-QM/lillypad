@@ -88,12 +88,10 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
         self.fig = Figure(facecolor=PALETTE["plot_bg"])
         super().__init__(self.fig)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        # Layout state, read by _style()/_apply_mode_decorations() below.
-        self._layout_mode = "horizontal"
+        # Layout state, read by _layout_axes().
         self._spec_frac   = 0.50
-        # The gridspec only creates the axes and seeds the vertical arrangement;
-        # _layout_axes() positions all three explicitly at the end of __init__
-        # and on every mode/proportion change.
+        # The gridspec only creates the axes; _layout_axes() positions all of
+        # them explicitly at the end of __init__ and on every proportion change.
         gs = self.fig.add_gridspec(2, 2,
                                    height_ratios=[1.8, 1.0],
                                    width_ratios=[1.0, 1.0],
@@ -116,8 +114,8 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
         (self.line_spec,) = self.ax_spec.plot([], [], color=PALETTE["accent"], lw=1)
         (self.line_ac,)   = self.ax_ac.plot([], [], color=PALETTE["accent2"], lw=1)
         # AC width readout, boxed inside the panel it describes rather than in
-        # the side panel. Top-RIGHT: horizontal mode puts the AC's own title
-        # inside the panel's top-left, and the curve's peak sits at the middle.
+        # the side panel. Top-RIGHT: the AC's own title is inside the panel's
+        # top-left, and the curve's peak sits at the middle.
         self.txt_fwhm = self.ax_ac.text(
             0.985, 0.94, "", transform=self.ax_ac.transAxes,
             ha="right", va="top", fontsize=9, color=PALETTE["accent2"],
@@ -387,7 +385,7 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
         self._split_band = None      # (x, y_bottom, y_top) in figure fractions
         self._renderer = None        # last draw's renderer, for label metrics
         self._split = PlotSplitHandle(self)
-        # Place the axes for the startup layout mode (must come after the blit
+        # Place the axes (must come after the blit
         # state above: it invalidates both caches and requests a draw).
         self._layout_axes()
 
@@ -407,15 +405,17 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
         self.ax_spec.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
         self.ax_ac.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
         self.ax_dev.grid(True, color=PALETTE["grid"], lw=0.6, ls="--", alpha=0.7)
-        # The colour bar: same tick and label treatment as the panels, so it
-        # reads as part of the trace rather than as a legend pasted beside it.
-        self.ax_cbar.tick_params(colors=PALETTE["text_dim"], labelsize=8.5)
+        # The colour bar: the panels' colours, but a size smaller and packed
+        # tight — it is a scale for the trace, and every pixel its labels take
+        # is one the trace beside it does not get.
+        self.ax_cbar.tick_params(colors=PALETTE["text_dim"], labelsize=7.5,
+                                 length=2.5, pad=1.5)
         self.cbar.outline.set_edgecolor(PALETTE["border"])
         self.cbar.set_label(
             "Intensity (norm.)" if self._trace_normalised else "Intensity (counts)",
-            color=PALETTE["text_dim"], fontsize=9.5)
-        # Last: this re-does the two decorations the loop just reset to their
-        # vertical-mode defaults, so a theme switch cannot undo the layout mode.
+            color=PALETTE["text_dim"], fontsize=8.5, labelpad=2)
+        # Last: this re-does the decorations the loop just reset to their
+        # unstacked defaults, so a theme switch cannot undo the stacking.
         self._apply_mode_decorations()
 
     def _apply_cmap(self):
@@ -623,11 +623,9 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
             stands the page would come out with no spectrum, no trace and no
             autocorrelation, which is to say without the three things it is a
             picture of.
-          * the layout mode, and the alignment panel if it is open. The page is
-            always the horizontal arrangement (full-height spectrum on the
-            left, trace over the autocorrelation on the right) whichever mode
-            the window happens to be in, and never the alignment sweep — that
-            panel is an aid for adjusting the beam, not part of a result.
+          * the alignment panel, if it is open. The page never shows the
+            alignment sweep — that panel is an aid for adjusting the beam, not
+            part of a result.
           * the trace image's row pooling — see _display_decimation.
 
         The figure keeps its on-screen SIZE in inches and only gains dpi, so the
@@ -643,7 +641,6 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
         # A big window is already a big page — see PICTURE_MAX_PX.
         w_in, h_in = self.fig.get_size_inches()
         dpi = min(dpi, PICTURE_MAX_PX / max(w_in, h_in))
-        prev_mode = self._layout_mode
         prev_dev  = self._dev_on
         prev_anim = [art.get_animated() for _ax, art in self._animated]
         self._exporting = True
@@ -656,7 +653,6 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
             self.ax_cbar.set_animated(False)
             if prev_dev:
                 self.set_dev_visible(False)
-            self.set_layout_mode("horizontal")
             self._render_trace()         # unpooled, at the page's resolution
             # facecolor explicitly rather than by rcParam: the plot background
             # is a theme colour held in PALETTE, and a page saved in dark mode
@@ -667,7 +663,6 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
             for (_ax, art), was in zip(self._animated, prev_anim):
                 art.set_animated(was)
             self.ax_cbar.set_animated(True)
-            self.set_layout_mode(prev_mode)
             if prev_dev:
                 self.set_dev_visible(True)
             self._render_trace()         # …and back to the panel's resolution

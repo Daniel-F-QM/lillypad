@@ -54,28 +54,23 @@ _GEO_L_PX   = 68     # y label + 5-digit tick labels at 8.5 pt measure ~58 px
 _GEO_L_MAX  = 0.14   # …but never eat this much of a narrow window
 _GEO_GAP_PX = 70     # column-gap floor: the right column's y label and tick
                      # labels, plus clearance for the split handle beside them
-_GEO_ROW_RATIO = 1.8        # tall row : short row, both modes
+_GEO_ROW_RATIO = 1.8        # FROG trace : autocorrelation
 # Spectrum : deviation panel, when alignment mode splits the spectrum's cell.
 # Taller than _GEO_ROW_RATIO: the deviations are a strip either side of zero,
 # not a curve that has to fill a panel, and the spectrum it takes room from is
 # the one being aligned.
 _GEO_DEV_RATIO = 2.4
-_GEO_V_BOT     = 0.095
-_GEO_V_COLGAP  = 0.055
-_GEO_V_HSPACE  = 0.31       # the gridspec hspace the vertical layout was tuned with
-_GEO_H_BOT     = 0.095
-_GEO_H_COLGAP  = 0.065      # wider: two stacked y-axes share this gap, and the
+_GEO_BOT       = 0.095
+_GEO_COLGAP    = 0.065      # two stacked y-axes share this gap, and the
                             # autocorrelation's tick labels run longer than the
                             # trace's, so 0.055 leaves its y label touching.
-_GEO_H_ROWGAP  = 0.0        # flush: the stacked pair shares one delay axis, so
-                            # the trace's bottom spine IS the AC's top spine
 # The FROG trace's colour bar, a strip at the right of the trace. Pixels again,
 # for the same reason as LEFT: it holds fixed-size text, and a fraction that
 # leaves room for the labels at 900 px wastes a strip of plot at 1920.
-_GEO_CBAR_GAP_PX = 10   # trace's right spine → the bar
-_GEO_CBAR_W_PX   = 14   # the bar itself
-_GEO_CBAR_LBL_PX = 62   # its tick labels and label, right of it — the same
-                        # 5-digit-count budget as _GEO_L_PX, mirrored
+_GEO_CBAR_GAP_PX = 3    # trace's right spine → the bar: just clear of it
+_GEO_CBAR_W_PX   = 12   # the bar itself
+_GEO_CBAR_LBL_PX = 46   # its tick labels and label, right of it — a 5-digit
+                        # count at the bar's smaller tick font (see _style)
 
 # The autocorrelation panel is drawn normalized to its own peak, so its view is
 # fixed: 0…1 plus a little headroom to keep the peak off the top spine.

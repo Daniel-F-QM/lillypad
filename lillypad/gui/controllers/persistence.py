@@ -6,11 +6,9 @@ autosave diff and the restore all walk that list. Polled off the table rather
 than wired to thirty valueChanged signals, because a slider drag emits fifty
 changes a second and not one of them is worth a disk write.
 
-**ORDER IS LOAD-BEARING on restore, twice over.** The auto-scale checkboxes come
-before the limit spinboxes, because turning trace auto-scale off pins those four
-boxes to whatever is on screen and would overwrite the values being restored;
-and the layout mode comes before the split fraction, so the axes are laid out
-once, in the mode they are going to stay in.
+**ORDER IS LOAD-BEARING on restore.** The auto-scale checkboxes come before the
+limit spinboxes, because turning trace auto-scale off pins those four boxes to
+whatever is on screen and would overwrite the values being restored.
 
 What is deliberately NOT saved is as much of the design as what is: **no axis
 state**. Not the auto-scale flags, not the manual limits. Where the axes are
@@ -40,12 +38,10 @@ class SettingsController:
     # maximized. Both are still SAVED from here, so this stays the one place
     # that knows the full set.
     #
-    # ORDER IS LOAD-BEARING on restore, twice over:
-    #   • the auto-scale checkboxes come before the limit spinboxes, because
-    #     _on_autoscale_trace(False) pins those four boxes to whatever is on
-    #     screen and would overwrite the values being restored;
-    #   • the layout mode comes before the split fraction, so the axes are laid
-    #     out once, in the mode they are going to stay in.
+    # ORDER IS LOAD-BEARING on restore: the auto-scale checkboxes come before
+    # the limit spinboxes, because _on_autoscale_trace(False) pins those four
+    # boxes to whatever is on screen and would overwrite the values being
+    # restored.
     #
     # Getters read the CANVAS for the auto-scale flags and the WIDGETS for the
     # manual limits. That split is not arbitrary: _apply_zoom and reset_axes
@@ -61,9 +57,8 @@ class SettingsController:
             ("theme",   lambda: self.win._theme,    None),
             ("window",  self._window_geometry,  None),
 
-            ("layout_mode", lambda: c.layout_mode, self.win.appearance._set_layout),
-            ("spec_frac",   lambda: float(c.spec_fraction()),
-                            lambda v: g.sld_prop.setValue(int(round(float(v) * 100)))),
+            ("spec_frac", lambda: float(c.spec_fraction()),
+                          lambda v: g.sld_prop.setValue(int(round(float(v) * 100)))),
 
             # NO axis state here — not the auto-scale flags, not the manual
             # limits, not the autocorrelation's view. Where the axes are

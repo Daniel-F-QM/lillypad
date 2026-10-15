@@ -1,8 +1,8 @@
-"""How the window looks: theme, layout, and the state of every button.
+"""How the window looks: theme, and the state of every button.
 
 Two kinds of work, and they belong together because the second is entirely a
-consequence of the first. The theme and the plot layout are the two global
-appearance choices; everything else here is a `_refresh_*` that reads the
+consequence of the first. The theme is the one global appearance choice;
+everything else here is a `_refresh_*` that reads the
 current state and puts the right icon, tooltip, enabled-ness and object name on
 one button. There are two dozen of them and they were scattered through the
 window between the logic they decorate.
@@ -31,18 +31,18 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QFileDialog
 from lillypad.design.geometry import (HDR_BTN, HDR_GAP, HDR_GROUP_GAP,
                                       HDR_PAD, HDR_TITLE_GAP)
-from lillypad.design.icons import (ALIGN_ICON, HIDE_ICON, HORIZ_ICON,
-                                   LOCKED_ICON, MERGE_ICON, MOON_ICON,
-                                   PICTURE_ICON, REFRESH_ICON, RESCALE_ICON,
-                                   SHOW_ICON, SPLIT_ICON, STITCH_ICON,
-                                   SUN_ICON, UNLOCKED_ICON, VERT_ICON)
+from lillypad.design.icons import (ALIGN_ICON, HIDE_ICON, LOCKED_ICON,
+                                   MERGE_ICON, MOON_ICON, PICTURE_ICON,
+                                   REFRESH_ICON, RESCALE_ICON, SHOW_ICON,
+                                   SPLIT_ICON, STITCH_ICON, SUN_ICON,
+                                   UNLOCKED_ICON)
 from lillypad.design.theme import install_theme
 from lillypad.design.tokens import MEMBER_COLORS, PALETTE
 from lillypad.gui.text import RIGHT_CLICK_HINT
 
 
 class AppearanceController:
-    """Theme, plot layout, and the state of every button in the window."""
+    """Theme, and the state of every button in the window."""
 
     def __init__(self, win):
         self.win = win
@@ -60,7 +60,6 @@ class AppearanceController:
         self.win.btn_theme.setToolTip(
             "Switch to dark mode" if name == "light" else "Switch to light mode")
         self._refresh_overlay_button()   # its icons are per-theme too
-        self._refresh_layout_button()    # …and so are this one's
         self._refresh_feed_button()      # …and its glyph is drawn from PALETTE
         self._refresh_align_button()     # …and it has one file per theme
         self._refresh_align_refresh_icon()  # …as does its re-run button
@@ -74,52 +73,12 @@ class AppearanceController:
         self.win.pnl_no_spec.refresh_theme()  # …and its watermark is tinted live
         self.win.status.showMessage(f"{name.capitalize()} mode.", 2000)
 
-    # ── Plot layout ──────────────────────────────────────────────────────────
-    def _toggle_layout(self):
-        mode = ("vertical" if self.win.canvas.layout_mode == "horizontal"
-                else "horizontal")
-        self._set_layout(mode)
-        self.win.status.showMessage(
-            "Horizontal layout — trace and autocorrelation share the delay axis."
-            if mode == "horizontal" else
-            "Vertical layout — autocorrelation full width below.", 4000)
-
-    def _set_layout(self, mode):
-        """Apply a layout mode and keep its button honest.
-
-        Split out of _toggle_layout so a restored mode takes exactly the same
-        path as a click — minus the status message, which at startup would push
-        the 'no hardware connected' banner off the bar before it was read.
-        """
-        if mode not in ("horizontal", "vertical"):
-            raise ValueError(mode)          # a bad settings key, caught upstream
-        self.win.canvas.set_layout_mode(mode)
-        self._refresh_layout_button()
-
-    def _refresh_layout_button(self):
-        """Icon and tooltip of the plot-layout toggle. Like the theme and
-        overlay buttons, it advertises the layout a CLICK produces, so the
-        vertical icon is shown while the horizontal layout is active."""
-        horiz = self.win.canvas.layout_mode == "horizontal"
-        icon = (VERT_ICON if horiz else HORIZ_ICON)[self.win._theme]
-        if icon.exists():
-            self.win.btn_layout.setIcon(QIcon(str(icon)))
-            self.win.btn_layout.setText("")
-        else:
-            self.win.btn_layout.setIcon(QIcon())
-            self.win.btn_layout.setText("▤" if horiz else "▥")
-        self.win.btn_layout.setToolTip(
-            "Vertical layout: autocorrelation full width below the spectrum "
-            "and FROG trace" if horiz else
-            "Horizontal layout: FROG trace above the autocorrelation, sharing "
-            "one delay axis, beside a full-height spectrum")
-
     # ── Picture of the figure ────────────────────────────────────────────────
     def _refresh_picture_icon(self):
         """Per-theme camera on the picture button, with the same text fallback
         every other icon button carries. Only the icon is re-read here — unlike
-        its two neighbours this button has one state, so its tooltip is fixed
-        and set once."""
+        the theme toggle beside it this button has one state, so its tooltip
+        is fixed and set once."""
         icon = PICTURE_ICON[self.win._theme]
         if icon.exists():
             self.win.btn_picture.setIcon(QIcon(str(icon)))
@@ -204,7 +163,8 @@ class AppearanceController:
         # The header buttons act on a spectrum that may not exist; and the
         # message just claimed the panel, so the row has to be re-packed
         # around whatever is left showing.
-        for b in (self.win.btn_autofit, self.win.btn_feed, self.win.btn_align_spec):
+        for b in (self.win.btn_autofit, self.win.btn_feed, self.win.btn_freeze,
+                  self.win.btn_align_spec):
             b.setEnabled(have_spec)
         self._position_panel_buttons()
         if self.win.dlg_spec.isVisible():
@@ -366,8 +326,8 @@ class AppearanceController:
         what separates "what this panel's y axis is doing" from "things you can
         do to this panel".
 
-        Every edge here moves with the split fraction, the window size and the
-        layout mode, so this runs off canvas.axes_relaid — and off the refresh
+        Every edge here moves with the split fraction and the window size, so
+        this runs off canvas.axes_relaid — and off the refresh
         methods that show or hide a button, because each row is packed from its
         own edge and its width depends on which buttons are visible.
         """
@@ -540,7 +500,7 @@ class AppearanceController:
     def _refresh_align_button(self):
         """Per-theme crosshair on the alignment-sweep toggle.
 
-        Unlike the overlay and layout buttons this one depicts a MODE, so the
+        Unlike the overlay button this one depicts a MODE, so the
         mark does not change with the button's state — only with the theme,
         each file carrying that theme's accent. Falls back to the Δ it used to
         show if the icons are missing from the bundle.
@@ -556,7 +516,7 @@ class AppearanceController:
     def _refresh_feed_button(self):
         """Icon, colour and tooltip of the live-feed toggle.
 
-        Like the theme and layout buttons it advertises the CURRENT state, not
+        Like the theme button it advertises the CURRENT state, not
         the state a click produces: a running feed is the red stop square, a
         stopped one the accent play triangle. Both glyphs are drawn from the
         live PALETTE, so a theme switch re-generates them.

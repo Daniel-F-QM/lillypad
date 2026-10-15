@@ -119,23 +119,17 @@ def build_ui(win):
                               else "Switch to light mode")
     win.btn_theme.clicked.connect(win.appearance._toggle_theme)
     tb.addWidget(win.btn_theme)
-    # Save the plots as a picture, between the two controls that decide what
-    # those plots LOOK like — the theme and the layout. It belongs with them
-    # rather than beside Export: Export writes the measurement, in formats
-    # another program reads, while this writes the figure, for a slide or a
-    # page. Icon from _refresh_picture_icon (one file per theme).
+    # Save the plots as a picture, beside the theme — the control that
+    # decides what those plots LOOK like. It belongs with it rather than
+    # beside Export: Export writes the measurement, in formats another
+    # program reads, while this writes the figure, for a slide or a page.
+    # Icon from _refresh_picture_icon (one file per theme).
     win.btn_picture = QPushButton()
     win.btn_picture.setIconSize(QSize(18, 18))
     win.btn_picture.setFixedWidth(42)
     win.appearance._refresh_picture_icon()
     win.btn_picture.clicked.connect(win.appearance._save_picture)
     tb.addWidget(win.btn_picture)
-    # Plot layout toggle; icon and tooltip come from _refresh_layout_button.
-    win.btn_layout = QPushButton()
-    win.btn_layout.setIconSize(QSize(18, 18))
-    win.btn_layout.setFixedWidth(42)
-    win.btn_layout.clicked.connect(win.appearance._toggle_layout)
-    tb.addWidget(win.btn_layout)
 
     central = QWidget()
     win.setCentralWidget(central)
@@ -162,8 +156,8 @@ def build_ui(win):
     # ── Panel header buttons ─────────────────────────────────────────────
     # All children of the canvas so they float over the figure margin, and
     # all positioned by _position_panel_buttons: each one belongs to the
-    # panel it acts on, and every panel edge moves with the split fraction,
-    # the window size and the layout mode.
+    # panel it acts on, and every panel edge moves with the split fraction
+    # and the window size.
     win.btn_autofit = QPushButton(win.canvas)
     win.btn_autofit.setObjectName("overlay")
     win.btn_autofit.setIconSize(QSize(HDR_ICON, HDR_ICON))
@@ -374,8 +368,6 @@ def build_ui(win):
     # end up describing a reference that is not there.
     win.canvas.reference_changed.connect(win.appearance._refresh_reference_button)
     win.appearance._refresh_reference_button()
-
-    win.appearance._refresh_layout_button()    # needs the canvas for the current mode
 
     win.dlg_graphics = GraphicsSettingsDialog(win.canvas, win)
     # Mouse zoom/reset keeps the dialog's spinboxes and auto-scale

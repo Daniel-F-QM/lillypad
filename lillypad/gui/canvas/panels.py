@@ -430,7 +430,7 @@ class TracePanelMixin:
             self.ax_trace.set_ylim(wl[0], wl[-1])
             self._trace_xlim_cache = self.ax_trace.get_xlim()
             self._trace_ylim_cache = self.ax_trace.get_ylim()
-        self._sync_ac_x()      # horizontal: the AC follows the new delay range
+        self._sync_ac_x()      # the AC follows the new delay range
         self.draw_idle()
 
     def update_trace(self, trace, peak=None):
@@ -522,8 +522,8 @@ class AcPanelMixin:
     def update_ac(self, delays, ac):
         # Normalized to its own peak for DISPLAY only: the panel always reads
         # 0…1, so its tick labels stay short whatever the count level (they used
-        # to grow a digit per decade and steal width from the plot beside them in
-        # horizontal mode) and a scan's partial curve fills the panel from the
+        # to grow a digit per decade and steal width from the plot beside them)
+        # and a scan's partial curve fills the panel from the
         # first column. Nothing reads this line back — the stored trace, the
         # exports and the autocorrelation the scan computed keep raw counts.
         peak = float(ac.max()) if ac.size else 0.0
@@ -531,7 +531,7 @@ class AcPanelMixin:
         self.line_ac.set_data(delays, shown)
         self._set_half_line(shown)
         self._bg_static = None        # AC line changed
-        # The trace dictates the delay axis in either layout mode, so the AC's
+        # The trace dictates the delay axis, so the AC's
         # own x autoscale never runs: _sync_ac_x is the single writer, and
         # init_trace has already pointed the trace at this scan's range.
         changed = self._sync_ac_x()
