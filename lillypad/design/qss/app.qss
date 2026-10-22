@@ -148,6 +148,11 @@ QStatusBar { background-color:$surface; color:$text_dim;
 QToolBar { background:$surface; border-bottom:1px solid $border;
     spacing:6px; padding:4px 8px; }
 QDialog { background:$bg; }
+/* Homing-required warning: a red frame and a filled red banner, so it cannot
+   be mistaken for an ordinary notice. */
+QDialog#homewarn { border:2px solid $danger; }
+QLabel#homewarnbanner { background:$danger; color:$bg; padding:10px 14px;
+    font-size:$fs_value; font-weight:$fw_bold; }
 QScrollArea { border:none; background:transparent; }
 QScrollBar:vertical { background:transparent; width:18px; margin:2px;
     border:none; border-radius:$radius_pill; }

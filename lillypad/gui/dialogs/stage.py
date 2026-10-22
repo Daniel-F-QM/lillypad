@@ -1,8 +1,9 @@
 """Connecting a delay stage: Kinesis, Zaber or piezosystems Jena."""
 
 from PySide6.QtCore import QSignalBlocker
-from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-                               QPushButton, QVBoxLayout)
+from PySide6.QtWidgets import (QDialog, QGridLayout, QHBoxLayout, QLabel,
+                               QLineEdit, QPushButton, QSizePolicy,
+                               QVBoxLayout)
 
 from lillypad.hardware import list_kinesis_stages
 from lillypad.gui.dialogs.base import ConnectDialog
@@ -166,3 +167,62 @@ class StageDialog(ConnectDialog):
                                else "Not connected.")
         self.btn_disconnect.setEnabled(stage is not None)
         self.spin_backlash.setEnabled(stage is not None)
+
+
+class HomingRequiredDialog(QDialog):
+    """Red, modal warning for an axis that is locked (StageBase.moves_locked):
+    unhomed, with limit switches that could not be confirmed to stop a move.
+
+    ask() returns "home", "proceed", or None if the window was closed — and a
+    closed window leaves the stage locked, so every later move attempt asks
+    again.
+    """
+    def __init__(self, stage, parent=None):
+        super().__init__(parent)
+        self.setObjectName("homewarn")
+        self.setWindowTitle("Stage not homed")
+        self.setFixedWidth(440)
+        self.choice = None
+        lay = QVBoxLayout(self); lay.setSpacing(12)
+        lay.setContentsMargins(0, 0, 0, 14)
+
+        banner = QLabel("⚠  Stage should be homed")
+        banner.setObjectName("homewarnbanner")
+        banner.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        lay.addWidget(banner)
+
+        t = stage.travel_mm
+        reach = (f"±{t:.0f} mm from where it is now" if t
+                 else "any distance (travel unknown)")
+        body = QLabel(
+            f"<b>{stage.name}</b> has no reference position (it has been "
+            f"power-cycled), so its position counts from wherever it powered "
+            f"up.<br><br>Its limit switches could not be confirmed to stop a "
+            f"move, so a move could drive the carriage into the end of its "
+            f"travel. The stage is locked until you choose:<br><br>"
+            f"<b>Home stage</b> — find the reference, then move freely.<br>"
+            f"<b>Proceed without homing</b> — allow moves of {reach}, "
+            f"trusting the switches to stop it at the ends.")
+        body.setWordWrap(True)
+        body.setContentsMargins(14, 0, 14, 0)
+        lay.addWidget(body)
+
+        row = QHBoxLayout(); row.setContentsMargins(14, 0, 14, 0)
+        b_proceed = QPushButton("Proceed without homing")
+        b_proceed.setObjectName("danger")
+        b_proceed.clicked.connect(lambda: self._choose("proceed"))
+        b_home = QPushButton("Home stage"); b_home.setObjectName("accent")
+        b_home.setDefault(True)
+        b_home.clicked.connect(lambda: self._choose("home"))
+        row.addWidget(b_proceed); row.addStretch(1); row.addWidget(b_home)
+        lay.addLayout(row)
+
+    def _choose(self, choice):
+        self.choice = choice
+        self.accept()
+
+    @staticmethod
+    def ask(parent, stage):
+        dlg = HomingRequiredDialog(stage, parent)
+        dlg.exec()
+        return dlg.choice

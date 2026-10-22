@@ -88,6 +88,12 @@ class StageLimitError(RuntimeError):
     """
 
 
+class StageLockedError(RuntimeError):
+    """A move was refused because the axis is locked (StageBase.moves_locked):
+    it is unhomed, its limit switches are not confirmed to stop it, and the
+    operator has neither homed it nor chosen to proceed without homing."""
+
+
 class StageBase(abc.ABC):
     """A 1-D motorised delay stage. All positions are in MILLIMETRES.
 
@@ -145,6 +151,10 @@ class StageBase(abc.ABC):
     # then may an axis that needs_homing be driven below its travel_min_mm —
     # see reachable_range_mm. Adapters that cannot confirm it leave it False.
     hw_limits_stop: bool = False
+    # Set by the operator choosing "Proceed without homing" on an axis that
+    # needs_homing without hw_limits_stop. Unlocks moves over ±travel, as if
+    # the switches had been confirmed — the operator takes that on trust.
+    homing_waived: bool = False
     # Smallest move the axis can resolve, in mm, or None when the adapter does
     # not know. This is what defines "arrived": a settle window narrower than
     # the resolution can never close, and one wider than it throws away
@@ -157,15 +167,27 @@ class StageBase(abc.ABC):
         Normally [travel_min_mm, travel_mm]. On an axis that needs_homing the
         readback is a counter zeroed wherever the carriage sat at power-up, so
         the carriage can be anywhere in [0, travel] and every reachable
-        counter value lies within ±travel. That wider range is only offered
-        when hw_limits_stop says the switches will halt the carriage at the
-        real ends — which is how Thorlabs' own Kinesis software drives an
-        unhomed stage.
+        counter value lies within ±travel. That wider range is offered when
+        hw_limits_stop says the switches will halt the carriage at the real
+        ends — which is how Thorlabs' own Kinesis software drives an unhomed
+        stage — or when the operator has waived homing. Otherwise the axis is
+        locked (moves_locked) and no range is safe.
         """
         t = self.travel_mm
-        if self.needs_homing and self.hw_limits_stop and t:
+        if (self.needs_homing and t
+                and (self.hw_limits_stop or self.homing_waived)):
             return -float(t), float(t)
         return self.travel_min_mm, t
+
+    @property
+    def moves_locked(self) -> bool:
+        """True while no move is allowed: the axis is unhomed, its switches
+        are not confirmed to stop it, and the operator has not waived homing.
+        The counter is zeroed wherever the carriage powered up, so no target
+        can be checked against the real ends. home() or homing_waived unlocks.
+        """
+        return (self.needs_homing and not self.hw_limits_stop
+                and not self.homing_waived)
 
     def move_to(self, position_mm: float) -> None:
         """Absolute move to position_mm; blocks until settled.
@@ -181,6 +203,10 @@ class StageBase(abc.ABC):
         neither backlash nor a step limit (PiezoJenaStage) sets both to 0 and
         takes the no-readback fast path below.
         """
+        if self.moves_locked:
+            raise StageLockedError(
+                f"{self.name} is not homed and its limit switches could not be "
+                f"confirmed — home it, or choose to proceed without homing.")
         target = float(position_mm)
         b = self.backlash_mm
         if b <= 0.0 and (self.max_step_mm or 0.0) <= 0.0:

@@ -12,7 +12,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from lillypad.hardware import StitchedSpectrometer
+from lillypad.hardware import StageLockedError, StitchedSpectrometer
 from lillypad.sim import SimulatedSpectrometer, SimulatedStage
 from lillypad.scan import (FrogScanConfig, delay_to_position_um,
                            position_to_delay_fs, stage_to_um, um_to_stage)
@@ -74,6 +74,50 @@ class TestUnhomedReach:
         stage.move_to(-20.0)
         assert targets == [-5.0, -10.0, -15.0, -20.0]
         assert stage.get_position() == -20.0
+
+
+class TestUnconfirmedSwitchesLock:
+    """An unhomed axis whose switches are not confirmed to stop it may not move
+    at all — no counter range is safe when the counter started mid-travel —
+    until the operator homes it or waives homing (the red warning dialog)."""
+
+    @staticmethod
+    def _locked():
+        stage = SimulatedStage(travel_mm=150.0)
+        stage.needs_homing = True
+        stage.hw_limits_stop = False
+        return stage
+
+    def test_locked_until_a_choice_is_made(self):
+        stage = self._locked()
+        assert stage.moves_locked
+        with pytest.raises(StageLockedError):
+            stage.move_to(10.0)
+        assert stage.get_position() == 0.0
+
+    def test_relative_moves_are_refused_too(self):
+        with pytest.raises(StageLockedError):
+            self._locked().move_by(1.0)
+
+    def test_proceeding_without_homing_unlocks_plus_minus_travel(self):
+        stage = self._locked()
+        stage.homing_waived = True
+        assert not stage.moves_locked
+        assert stage.reachable_range_mm() == (-150.0, 150.0)
+        stage.move_to(-10.0)
+        assert stage.get_position() == -10.0
+
+    def test_homing_unlocks_and_restores_the_travel_range(self):
+        stage = self._locked()
+        stage.home()
+        assert not stage.moves_locked
+        assert stage.reachable_range_mm() == (0.0, 150.0)
+        stage.move_to(10.0)
+
+    def test_confirmed_switches_never_lock(self):
+        stage = self._locked()
+        stage.hw_limits_stop = True
+        assert not stage.moves_locked
 
 
 class TestHomeIsAdvertisedHonestly:

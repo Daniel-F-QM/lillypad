@@ -58,6 +58,9 @@ class SimulatedStage(StageBase):
         return self._true_pos
 
     def home(self) -> None:
+        # Homing is what establishes the reference, so it clears the flag
+        # first — move_to refuses to drive a locked axis.
+        self.needs_homing = False
         self.move_to(0.0)
 
 

@@ -20,6 +20,7 @@ controller (its firmware already does this) or a piezo, and wrong for a Zaber.
 
 import math
 
+from lillypad.gui.dialogs.stage import HomingRequiredDialog
 from lillypad.gui.text import FEED_BUSY_MSG
 from lillypad.scan import (delay_to_position_um, position_to_delay_fs,
                            stage_to_um, um_to_stage)
@@ -49,6 +50,33 @@ class StageController:
         self.win.btn_home.setEnabled(can and self.win.btn_minus.isEnabled())
         self.win.btn_home.setToolTip(
             "" if can else f"{stage.name} has no homing routine.")
+
+    def check_unlocked(self) -> bool:
+        """True if the stage may move. On a locked axis (unhomed, switches not
+        confirmed — StageBase.moves_locked) show the red homing warning first
+        and act on it: "Home stage" homes, "Proceed without homing" unlocks
+        ±travel. Either way the move that asked is not carried out — the
+        ranges have just changed under it, so the operator re-issues it.
+        Closing the window leaves the stage locked."""
+        stage = self.win.stage
+        if stage is None or not stage.moves_locked:
+            return True
+        choice = HomingRequiredDialog.ask(self.win, stage)
+        if choice == "home":
+            self._home_stage()
+        elif choice == "proceed":
+            stage.homing_waived = True
+            self._update_stage_unit_ranges()
+            t = stage.travel_mm
+            self.win.status.showMessage(
+                f"Stage: {stage.name} — NOT HOMED, moves unlocked"
+                + (f" over ±{t:.0f} mm" if t else "")
+                + " without confirmed limit switches.", 0)
+        else:
+            self.win.status.showMessage(
+                f"Stage: {stage.name} is locked until it is homed or you "
+                f"choose to proceed without homing.", 0)
+        return False
 
     def _moving(self, on):
         self.win.lbl_moving.setText("MOVING" if on else "IDLE")
@@ -190,6 +218,8 @@ class StageController:
         self.win.btn_units.setText("fs" if self.win._stage_units_fs else "um")
 
     def _jog(self, sign):
+        if not self.check_unlocked():
+            return
         v = self.win.spin_step.value()
         step_um = (float(delay_to_position_um(v, 0.0, self.win.scan_cfg.pass_factor))
                    if self.win._stage_units_fs else v)
@@ -203,6 +233,8 @@ class StageController:
         self._stage_action(do)
 
     def _move_absolute(self):
+        if not self.check_unlocked():
+            return
         v = self.win.spin_moveto.value()
         pf, z = self.win.scan_cfg.pass_factor, self.win.scan_cfg.zero_pos_um
         target_um = float(delay_to_position_um(v, z, pf)) if self.win._stage_units_fs else v
@@ -211,6 +243,8 @@ class StageController:
         self._stage_action(lambda: self.win.stage.move_to(um_to_stage(target_um)))
 
     def _move_to_zero(self):
+        if not self.check_unlocked():
+            return
         self._stage_action(
             lambda: self.win.stage.move_to(um_to_stage(self.win.scan_cfg.zero_pos_um)))
 

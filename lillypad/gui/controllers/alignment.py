@@ -97,9 +97,12 @@ class AlignmentController:
         if self.win.spec is None or self.win.stage is None:
             self.win.status.showMessage("Connect a stage and a spectrometer first.", 4000)
             return False
-        # No needs_homing refusal: the sweep is relative to wherever the stage
-        # is, so an unhomed axis sweeps just as well. Running into an end stops
-        # the move (StageLimitError) and AlignmentWorker reports it.
+        # An unhomed axis sweeps just as well — the sweep is relative to
+        # wherever the stage is, and running into an end stops the move
+        # (StageLimitError). Only a locked axis (switches not confirmed) is
+        # held back until the operator homes it or waives homing.
+        if not self.win.stage_ctl.check_unlocked():
+            return False
 
         # Same handover contract as _start_scan: the worker drives the stage
         # and the spectrometer for the whole sweep, so the feed has to let go

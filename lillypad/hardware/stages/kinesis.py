@@ -252,8 +252,11 @@ class KinesisStage(StageBase):
 
         "make"/"break" are switches the controller halts on. "ignore" means
         no switch, and "make_home"/"break_home" are used for homing only — a
-        move runs straight through them. Anything unreadable counts as False,
-        which keeps an unhomed axis inside [0, travel] of its power-up spot.
+        move runs straight through them. Anything unreadable counts as False.
+        An unhomed axis is then limited to counter values [0, travel], but the
+        counter starts at 0 wherever the carriage sat at power-up, so this is
+        only the real travel if it powered up at the low end. From mid-travel
+        a move to `travel` still runs past the physical end.
         """
         try:
             p = motor.get_limit_switch_parameters()
@@ -339,6 +342,13 @@ class KinesisStage(StageBase):
         switch at the 2 mm/s factory homing velocity takes 150 s end to end.
         """
         motor = self._motor
+        # The counter only advances when a read drains the message, so a
+        # MOVE_HOMED from the last home can still be sitting unread. Drain it
+        # first, or the first poll below counts it as this home finishing.
+        try:
+            motor.flush_comm()
+        except Exception:
+            pass
         sent_before, _ = motor.check_background_comm(_MOT_MOVE_HOMED)
         motor.home(sync=False, force=True)
         deadline = time.monotonic() + timeout_s
@@ -352,6 +362,11 @@ class KinesisStage(StageBase):
                                or (seen_homing and "homed" in status)):
                 break
             if time.monotonic() > deadline:
+                # Don't leave the carriage travelling after giving up on it.
+                try:
+                    motor.stop(immediate=True)
+                except Exception:
+                    pass
                 raise RuntimeError(
                     f"{self.name}: homing did not finish within {timeout_s:.0f} s.")
             time.sleep(0.05)

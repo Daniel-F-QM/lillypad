@@ -61,6 +61,8 @@ class ScanController:
         # Only homing moves that frame, and _home_stage drops the zero when it
         # does. What is lost is the pre-flight check against the real ends —
         # the worker stops the scan instead if it runs into one.
+        if not self.win.stage_ctl.check_unlocked():
+            return
         unhomed = bool(getattr(self.win.stage, "needs_homing", False))
 
         c = self.win.scan_cfg

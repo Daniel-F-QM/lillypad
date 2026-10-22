@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import shutil
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup
 from PySide6.QtWidgets import (QFileDialog, QInputDialog, QMenu, QMessageBox,
                                QPushButton)
@@ -375,15 +375,17 @@ class DeviceController:
                 f"Stage: {stage.name} — NOT HOMED, working in its power-up "
                 f"frame.", 0)
             t = stage.travel_mm
-            if not t:
+            if stage.moves_locked:
+                self._prompt_homing()
+            if not t and not stage.moves_locked:
                 reach = ""
             elif stage.hw_limits_stop:
                 reach = (f" Manual moves are allowed ±{t:.0f} mm from here; "
                          f"the limit switches stop the carriage at either end.")
             else:
-                reach = (f" Its limit switches are not set to stop moves, so "
-                         f"manual moves stay within 0…{t:.0f} mm of where it "
-                         f"powered up.")
+                reach = (" Its limit switches could not be confirmed to stop "
+                         "a move, so the stage is LOCKED until you home it or "
+                         "choose to proceed without homing.")
             return True, (
                 f"Stage connected: {stage.name}, but the controller reports the "
                 f"axis NOT HOMED (it has been power-cycled). Positions count from "
@@ -396,6 +398,12 @@ class DeviceController:
                   "config if you need it.")
         return True, (f"Stage connected: {stage.name}. Zero-delay set to current "
                       f"position ({self.win.scan_cfg.zero_pos_um:.1f} um). {travel}")
+
+    def _prompt_homing(self):
+        """Show the red homing warning for a stage that just connected locked.
+        Deferred to the event loop so the connect message lands first and the
+        modal is not opened from inside the connect call."""
+        QTimer.singleShot(0, self.win.stage_ctl.check_unlocked)
 
     def connect_zaber_stage(self, port=None):
         try:
@@ -410,11 +418,17 @@ class DeviceController:
             self.win.status.showMessage(
                 f"Stage: {stage.name} — NOT HOMED, working in its power-up "
                 f"frame.", 0)
+            locked = ""
+            if stage.moves_locked:
+                self._prompt_homing()
+                locked = (" Its limit switches could not be confirmed to stop "
+                          "a move, so the stage is LOCKED until you home it or "
+                          "choose to proceed without homing.")
             return True, (
                 f"Stage connected: {stage.name}, but the axis is NOT HOMED. "
                 f"Positions count from wherever it powered up. You can set zero "
                 f"and scan in that frame, but homing later moves the frame and "
-                f"drops the zero.")
+                f"drops the zero.{locked}")
         self.win.status.showMessage(f"Stage: {stage.name} — zero at current position.", 5000)
         backlash_um = stage_to_um(stage.backlash_mm)
         return True, (f"Stage connected: {stage.name}. Zero-delay set to current "
