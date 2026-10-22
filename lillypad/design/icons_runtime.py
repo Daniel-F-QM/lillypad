@@ -15,6 +15,7 @@ All three need a running QApplication.
 
 from __future__ import annotations
 
+import math
 import tempfile
 from pathlib import Path
 
@@ -73,8 +74,43 @@ def make_check_icon(color, tag) -> str:
     return fp.as_posix()
 
 
-def glyph_icon(kind, color, px=HDR_ICON) -> QIcon:
-    """A play / stop / plus glyph as a QIcon, drawn in `color`.
+def _tinted_pixmap(pm: QPixmap, color) -> QPixmap:
+    """`pm` repainted in one colour, keeping its alpha (and its device pixel
+    ratio). SourceIn keeps the destination's alpha and replaces its colour."""
+    out = QPixmap(pm.size())
+    out.setDevicePixelRatio(pm.devicePixelRatio())
+    out.fill(Qt.transparent)
+    p = QPainter(out)
+    p.drawPixmap(0, 0, pm)
+    p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+    p.fillRect(out.rect(), QColor(color))
+    p.end()
+    return out
+
+
+def toggle_icon(off, on_color) -> QIcon:
+    """An icon for a checkable button that INVERTS when checked: `off` (a
+    QPixmap or an image path) as drawn while unchecked, and the same mark
+    repainted in `on_color` — the button's own background colour, under the
+    stylesheet's accent fill — while checked. Checkable buttons pick the
+    QIcon.On pixmap by themselves, so no code has to swap anything on toggle.
+    """
+    pm = off if isinstance(off, QPixmap) else QPixmap(str(off))
+    icon = QIcon()
+    if pm.isNull():
+        return icon
+    on = _tinted_pixmap(pm, on_color)
+    for mode in (QIcon.Normal, QIcon.Active):
+        icon.addPixmap(pm, mode, QIcon.Off)
+        icon.addPixmap(on, mode, QIcon.On)
+    return icon
+
+
+def glyph_icon(kind, color, px=HDR_ICON, on_color=None) -> QIcon:
+    """A play / stop / plus / wave glyph as a QIcon, drawn in `color`.
+
+    With `on_color`, the icon also carries the checked-state copy for an
+    inverting toggle (see toggle_icon).
 
     Rendered at the screen's device pixel ratio: at 150% Windows scaling a
     logical-size pixmap is upscaled by the compositor, which both softens the
@@ -110,9 +146,24 @@ def glyph_icon(kind, color, px=HDR_ICON) -> QIcon:
         r = th / 2.0
         p.drawRoundedRect(QRectF(c - arm / 2, c - th / 2, arm, th), r, r)
         p.drawRoundedRect(QRectF(c - th / 2, c - arm / 2, th, arm), r, r)
+    elif kind == "wave":
+        # One period of a sine, stroked rather than filled: the smoothing
+        # toggle's mark — a smooth curve where the trace would be blocky.
+        p.setBrush(Qt.NoBrush)
+        pen = QPen(QColor(color), 0.13 * n)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        w, a = 0.74 * n, 0.24 * n
+        pts = [QPointF(c - w / 2 + w * k / 48,
+                       c - a * math.sin(2 * math.pi * k / 48))
+               for k in range(49)]
+        p.drawPolyline(QPolygonF(pts))
     else:
         s = 0.56 * n
         p.drawRoundedRect(QRectF(c - s / 2, c - s / 2, s, s), 0.10 * n, 0.10 * n)
     p.end()
     pm.setDevicePixelRatio(dpr)
+    if on_color is not None:
+        return toggle_icon(pm, on_color)
     return QIcon(pm)

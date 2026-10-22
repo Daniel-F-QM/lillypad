@@ -74,6 +74,9 @@ class SettingsController:
             # that is not in the list, so a colormap dropped from
             # TRACE_COLORMAPS needs no guard of its own.
             ("cmap",          lambda: c.cmap_name, g.cmb_cmap.setCurrentText),
+            # Display-only delay smoothing — a preference, like the scale.
+            ("trace_smooth",  self.win.btn_smooth.isChecked,
+                              lambda v: self.win.btn_smooth.setChecked(as_bool(v))),
             ("cmap_reversed", lambda: c.cmap_reversed,
                               lambda v: g.chk_cmap_rev.setChecked(as_bool(v))),
             # Percent, as typed — the canvas keeps the fraction.

@@ -29,7 +29,9 @@ from lillypad.design import stylesheet, theme, tokens
 # the code sets has to have a rule here or the widget silently goes unstyled.
 QSS_OBJECT_NAMES = (
     "accent", "accentcompact", "compact", "danger", "dim", "err", "hdr", "idle",
-    "moving", "nodev", "ok", "overlay", "overlaydanger", "readout", "readout_sm",
+    "moving", "nodev", "ok", "overlay", "overlaydanger", "overlaygood",
+    "overlaytoggle",
+    "readout", "readout_sm",
     "sat", "satok", "satwarn", "sep", "unit", "value",
 )
 

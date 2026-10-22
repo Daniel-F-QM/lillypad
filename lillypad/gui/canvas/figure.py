@@ -279,6 +279,8 @@ class FrogCanvas(AxesApiMixin, SpectrumPanelMixin, TracePanelMixin,
         # worker recorded (and what gets exported / autocorrelated) is never
         # touched.
         self._trace_raw    = None    # last full trace, unmasked
+        # Display-only linear interpolation along DELAY (see _smooth_columns).
+        self.trace_smooth  = True
         self._trace_peak   = None    # its max when the caller supplied one
         self._trace_thresh = 0.0     # display floor, fraction of peak (0 = off)
         self._cmap_name    = "jet"

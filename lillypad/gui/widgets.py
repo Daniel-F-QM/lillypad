@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFrame,
                                QLabel, QLineEdit, QPushButton, QSlider,
                                QSpinBox, QVBoxLayout, QWidget)
 
-from lillypad.design.icons import DISCONNECTED_ICON
+from lillypad.design.icons import DISCONNECTED_ICON, TRACE_BACKGROUND_ICON
 from lillypad.design.tokens import PALETTE
 
 
@@ -96,6 +96,64 @@ class StatusLamp(QWidget):
         p.drawEllipse(QPointF(cx, cy), r, r)
         p.end()
 
+def _tinted(src, side, tint):
+    """`src` scaled to fit `side` px and repainted in `tint`, keeping its alpha
+    — how a one-colour mark serves both themes from one file."""
+    scaled = src.scaled(side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    out = QPixmap(scaled.size())
+    out.fill(Qt.transparent)
+    p = QPainter(out)
+    p.drawPixmap(0, 0, scaled)
+    # SourceIn keeps the destination's alpha and replaces its colour, so this
+    # repaints the glyph in the palette colour and leaves the transparent
+    # surround alone.
+    p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+    p.fillRect(out.rect(), QColor(tint))
+    p.end()
+    return out
+
+
+class TraceWatermark(QWidget):
+    """The Lilypad mark, faint and centred, on the EMPTY FROG trace panel —
+    the trace panel's counterpart of NoDeviceOverlay's plug.
+
+    See-through and click-through: it paints only the mark, so the axes, grid
+    and ticks underneath still show, and the canvas still gets every mouse
+    event. A Qt child rather than a matplotlib artist for the same reason as
+    the overlay — the canvas blits, and an artist would need full redraws.
+    Shown only while there is no trace; a scan's first column covers the
+    panel, so the mark would only peek through threshold-masked pixels.
+    """
+    ICON_FRAC  = 0.62     # of the panel's shorter side
+    ICON_ALPHA = 0.14
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._src = (QPixmap(str(TRACE_BACKGROUND_ICON))
+                     if TRACE_BACKGROUND_ICON.exists() else QPixmap())
+        self._cache = None          # ((side, tint), pixmap)
+
+    def paintEvent(self, _event):
+        if self._src.isNull():
+            return
+        side = int(min(self.width(), self.height()) * self.ICON_FRAC)
+        if side < 16:
+            return
+        tint = PALETTE["text_dim"]
+        if self._cache is None or self._cache[0] != (side, tint):
+            self._cache = ((side, tint), _tinted(self._src, side, tint))
+        pm = self._cache[1]
+        p = QPainter(self)
+        p.setOpacity(self.ICON_ALPHA)
+        p.drawPixmap((self.width() - pm.width()) // 2,
+                     (self.height() - pm.height()) // 2, pm)
+
+    def refresh_theme(self):
+        """The tint is baked into the cache; repaint against the new PALETTE."""
+        self.update()
+
+
 class NoDeviceOverlay(QWidget):
     """Covers an empty plot panel with a message and a Connect button.
 
@@ -138,18 +196,7 @@ class NoDeviceOverlay(QWidget):
         tint = PALETTE["text_dim"]
         if self._cache is not None and self._cache[0] == (side, tint):
             return self._cache[1]
-        scaled = self._src.scaled(side, side, Qt.KeepAspectRatio,
-                                  Qt.SmoothTransformation)
-        out = QPixmap(scaled.size())
-        out.fill(Qt.transparent)
-        p = QPainter(out)
-        p.drawPixmap(0, 0, scaled)
-        # SourceIn keeps the destination's alpha and replaces its colour, so
-        # this repaints the glyph in the palette colour and leaves the
-        # transparent surround alone.
-        p.setCompositionMode(QPainter.CompositionMode_SourceIn)
-        p.fillRect(out.rect(), QColor(tint))
-        p.end()
+        out = _tinted(self._src, side, tint)
         self._cache = ((side, tint), out)
         return out
 

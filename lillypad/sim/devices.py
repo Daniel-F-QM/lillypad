@@ -108,7 +108,7 @@ class SimulatedSpectrometer(SpectrometerBase):
                  wl_start: float | None = None, wl_end: float | None = None,
                  n_pixels: int = 1024, n_time: int | None = None,
                  t_max_fs: float | None = None,
-                 peak_counts: float = 4000.0, read_noise: float = 15.0,
+                 peak_counts: float = 8000.0, read_noise: float = 15.0,
                  background_counts: float = 0.0,
                  max_counts: float | None = 65535.0,
                  response=None):

@@ -409,6 +409,62 @@ class TracePanelMixin:
         self._trace_thresh = max(0.0, min(100.0, float(percent))) / 100.0
         self._render_trace()          # takes effect without waiting for a column
 
+    def set_trace_smooth(self, on):
+        """Turn the display-only delay-axis interpolation on or off."""
+        self.trace_smooth = bool(on)
+        self._render_trace()
+
+    def refresh_trace_resolution(self):
+        """Re-render after a relayout if the panel's width changed, so the
+        delay interpolation keeps matching the pixels it is drawn on."""
+        if not (self.trace_smooth and self._trace_raw is not None):
+            return
+        try:
+            width = int(min(self.ax_trace.get_window_extent().width, 4096))
+        except Exception:
+            return
+        if width != getattr(self, "_smooth_width", None):
+            self._render_trace()
+
+    @property
+    def has_trace(self):
+        """True once a scan has given the trace panel something to show."""
+        return self._trace_raw is not None
+
+    def _smooth_columns(self, shown):
+        """Linearly interpolate `shown` along the delay axis to about one
+        column per screen pixel. Display only — the stored trace is untouched.
+
+        A scan has far fewer delay columns than the panel has pixels, so each
+        column is stretched into a wide flat block. Interpolating between
+        neighbouring columns removes the blocks without inventing anything a
+        column did not measure. Each original column stays centred where it is
+        drawn without smoothing: imshow lays n columns out as n equal cells
+        across the extent, and the new grid samples those cell centres.
+        The wavelength axis is left alone; its max-reduction above is what
+        keeps narrow lines visible.
+        """
+        n = shown.shape[1]
+        if n < 2:
+            return shown
+        try:
+            width = self.ax_trace.get_window_extent().width
+        except Exception:
+            return shown
+        if self._exporting:
+            width *= 3          # the saved picture has ~3x the screen's pixels
+        m = int(min(width, 4096))
+        if not self._exporting:
+            self._smooth_width = m      # what refresh_trace_resolution checks
+        if m <= n:
+            return shown        # already a column per pixel or finer
+        x = (np.arange(m) + 0.5) * (n / m) - 0.5
+        np.clip(x, 0.0, n - 1.0, out=x)
+        i0 = np.floor(x).astype(np.intp)
+        i1 = np.minimum(i0 + 1, n - 1)
+        t = x - i0
+        return shown[:, i0] * (1.0 - t) + shown[:, i1] * t
+
     def init_trace(self, delays, wl):
         # A new scan can span a different delay range; resume following it,
         # mirroring the trace-view reset below.
@@ -497,6 +553,8 @@ class TracePanelMixin:
         f = self._display_decimation(raw.shape[0])
         shown = (raw.reshape(raw.shape[0] // f, f, raw.shape[1]).max(axis=1)
                  if f > 1 else raw)
+        if self.trace_smooth:
+            shown = self._smooth_columns(shown)
         data = (np.ma.masked_less(shown, self._trace_thresh * peak)
                 if self._trace_thresh > 0 else shown)
         self.im.set_data(data)

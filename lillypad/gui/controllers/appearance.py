@@ -25,17 +25,18 @@ Two subtleties worth knowing before editing:
 """
 
 from lillypad.design.icons_runtime import glyph_icon as _glyph_icon
+from lillypad.design.icons_runtime import toggle_icon
 
-from PySide6.QtCore import QSignalBlocker, Qt
+from PySide6.QtCore import QSignalBlocker, QSize, Qt
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication, QFileDialog
 from lillypad.design.geometry import (HDR_BTN, HDR_GAP, HDR_GROUP_GAP,
-                                      HDR_PAD, HDR_TITLE_GAP)
+                                      HDR_ICON, HDR_PAD, HDR_TITLE_GAP)
 from lillypad.design.icons import (ALIGN_ICON, HIDE_ICON, LOCKED_ICON,
                                    MERGE_ICON, MOON_ICON, PICTURE_ICON,
                                    REFRESH_ICON, RESCALE_ICON, SHOW_ICON,
                                    SPLIT_ICON, STITCH_ICON, SUN_ICON,
-                                   UNLOCKED_ICON)
+                                   SYMMETRY_ICON, UNLOCKED_ICON)
 from lillypad.design.theme import install_theme
 from lillypad.design.tokens import MEMBER_COLORS, PALETTE
 from lillypad.gui.text import RIGHT_CLICK_HINT
@@ -71,6 +72,9 @@ class AppearanceController:
         self._refresh_picture_icon()     # …as does the camera
         self._size_moving_label()        # its font came from the stylesheet
         self.win.pnl_no_spec.refresh_theme()  # …and its watermark is tinted live
+        self.win.trace_mark.refresh_theme()   # …as is the trace panel's
+        self._refresh_smooth_icon()           # …and the wave is drawn from PALETTE
+        self._refresh_symmetry_icon()         # …as is the mirror's checked copy
         self.win.status.showMessage(f"{name.capitalize()} mode.", 2000)
 
     # ── Picture of the figure ────────────────────────────────────────────────
@@ -386,11 +390,12 @@ class AppearanceController:
                 x += b.width() + HDR_GAP
 
         spec_right = pack(
-            c.ax_spec, [self.win.btn_autofit, self.win.btn_feed, self.win.btn_freeze,
+            c.ax_spec, [self.win.btn_feed, self.win.btn_autofit, self.win.btn_freeze,
                         self.win.btn_refshow, self.win.btn_autostitch,
                         self.win.btn_overlay, self.win.btn_align_spec,
                         self.win.btn_align_refresh])
-        pack(c.ax_trace, [self.win.btn_align_trace, self.win.btn_symmetry])
+        pack(c.ax_trace, [self.win.btn_smooth, self.win.btn_align_trace,
+                          self.win.btn_symmetry])
         # The y-axis pair, tucked against the title it qualifies. Padlock first:
         # it is the one that changes what the axis DOES, the scale toggle only
         # how it is drawn.
@@ -402,6 +407,14 @@ class AppearanceController:
         # floating in it. It is laid out only here — it has no parent layout to
         # do that for it.
         self.win.pnl_no_spec.setGeometry(c.panel_rect_px(c.ax_spec))
+        self.win.trace_mark.setGeometry(c.panel_rect_px(c.ax_trace))
+        self.refresh_trace_mark()
+
+    def refresh_trace_mark(self):
+        """The Lilypad mark shows only on an empty trace panel."""
+        mark = getattr(self.win, "trace_mark", None)
+        if mark is not None:
+            mark.setVisible(not self.win.canvas.has_trace)
 
     def _refresh_autofit_icon(self):
         """Per-theme mark on the one-shot auto-fit button, with the text
@@ -427,6 +440,25 @@ class AppearanceController:
         else:
             self.win.btn_autoscale.setIcon(QIcon())
             self.win.btn_autoscale.setText("🔓" if on else "🔒")
+
+    def _refresh_smooth_icon(self):
+        """The smoothing toggle's wave, drawn from the live PALETTE, with the
+        inverted copy it shows while checked."""
+        self.win.btn_smooth.setIcon(_glyph_icon(
+            "wave", PALETTE["accent"], on_color=PALETTE["surface"]))
+
+    def _refresh_symmetry_icon(self):
+        """The mirror mark, with the inverted copy it shows while checked —
+        re-made on a theme switch because that copy is in the surface colour.
+        Falls back to a bar if the icon is missing from the bundle."""
+        if SYMMETRY_ICON.exists():
+            self.win.btn_symmetry.setIcon(
+                toggle_icon(SYMMETRY_ICON, PALETTE["surface"]))
+            self.win.btn_symmetry.setIconSize(QSize(HDR_ICON, HDR_ICON))
+            self.win.btn_symmetry.setText("")
+        else:
+            self.win.btn_symmetry.setIcon(QIcon())
+            self.win.btn_symmetry.setText("|")
 
     def _refresh_freeze_icon(self):
         """The + mark, drawn from the live PALETTE so a theme switch reruns it
@@ -507,7 +539,10 @@ class AppearanceController:
         """
         icon = ALIGN_ICON[self.win._theme]
         if icon.exists():
-            self.win.btn_align_spec.setIcon(QIcon(str(icon)))
+            # Inverts when checked (toggle_icon): the mark in the surface
+            # colour on the stylesheet's accent fill.
+            self.win.btn_align_spec.setIcon(
+                toggle_icon(icon, PALETTE["surface"]))
             self.win.btn_align_spec.setText("")
         else:
             self.win.btn_align_spec.setIcon(QIcon())
@@ -518,18 +553,18 @@ class AppearanceController:
 
         Like the theme button it advertises the CURRENT state, not
         the state a click produces: a running feed is the red stop square, a
-        stopped one the accent play triangle. Both glyphs are drawn from the
+        stopped one the green play triangle. Both glyphs are drawn from the
         live PALETTE, so a theme switch re-generates them.
         """
         running = self.win.btn_feed.isChecked()
         self.win.btn_feed.setIcon(_glyph_icon(
             "stop" if running else "play",
-            PALETTE["danger"] if running else PALETTE["accent"]))
+            PALETTE["danger"] if running else PALETTE["good"]))
         self.win.btn_feed.setToolTip("Stop the live spectrum feed" if running
                                  else "Start the live spectrum feed")
         # Colour via objectName + repolish, not setStyleSheet, so a later theme
         # switch restyles it along with everything else.
-        name = "overlaydanger" if running else "overlay"
+        name = "overlaydanger" if running else "overlaygood"
         if self.win.btn_feed.objectName() != name:
             self.win.btn_feed.setObjectName(name)
             self.win.btn_feed.style().unpolish(self.win.btn_feed)

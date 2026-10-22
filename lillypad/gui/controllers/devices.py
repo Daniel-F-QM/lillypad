@@ -91,9 +91,15 @@ class DeviceController:
     # ── Hardware ─────────────────────────────────────────────────────────────
     def _make_sim_spectrometer(self):
         """A sim spectrometer that derives its delay from the LIVE stage (so it
-        works with a real stage too — the Stage.py test setup)."""
+        works with a real stage too — the Stage.py test setup).
+
+        It carries a dark pedestal, as every real detector does. Without one
+        the read noise straddles zero and acquire() clips it there, so a dark
+        is all zeros and positive spikes and a dark-subtracted trace gets rows
+        pulled far below zero."""
         return SimulatedSpectrometer(
             self.win.stage, gate=self.win.sim_gate, pulse=self.win.sim_pulse,
+            background_counts=300.0,
             position_to_delay=lambda pos_mm: position_to_delay_fs(
                 stage_to_um(pos_mm), self.win.scan_cfg.zero_pos_um, self.win.scan_cfg.pass_factor))
 

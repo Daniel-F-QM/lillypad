@@ -55,17 +55,26 @@ QPushButton#accentcompact:hover { background-color:$accent;
     color:$bg; }
 QPushButton#overlay { border-color:$accent; color:$accent;
     padding:0px; font-size:$fs_small; border-radius:$radius_sm; }
-QPushButton#overlay:hover { background-color:$accent; color:$bg; }
-QPushButton#overlay:pressed { background-color:$accent; color:$bg; }
-/* Checked state for the header toggles. NOT the accent fill the hover and
-   pressed rules use: every one of these buttons carries an icon drawn in that
-   same accent, which would disappear into it — an "on" state you can only see
-   by taking the mouse away is no state at all. A raised surface behind a
-   thicker accent border reads as pressed-in while leaving the mark on top. */
-QPushButton#overlay:checked { background-color:$border_hover;
-    border:2px solid $accent; }
-QPushButton#overlay:checked:hover { background-color:$accent;
-    color:$bg; }
+/* Hover and pressed RAISE the button instead of filling it: every header
+   button's mark is drawn in its border colour, so an accent (or danger/good)
+   fill swallowed the icon whole while the mouse was over it. */
+QPushButton#overlay:hover { background-color:$border_hover; }
+QPushButton#overlay:pressed { background-color:$border; }
+/* Header toggles whose picture stays the same in both states (symmetry,
+   smoothing, alignment, RAW). Checked, they INVERT: accent fill, with the
+   mark in the button's own surface colour — the icons carry that second,
+   surface-coloured copy as their QIcon.On pixmap (icons_runtime.toggle_icon),
+   and text follows `color`. Toggles whose picture changes with the state
+   (padlock, lin/log, eye, stitched view) stay #overlay and look the same on
+   and off: the picture already says which state they are in. */
+QPushButton#overlaytoggle { border-color:$accent; color:$accent;
+    padding:0px; font-size:$fs_small; border-radius:$radius_sm; }
+QPushButton#overlaytoggle:hover { background-color:$border_hover; }
+QPushButton#overlaytoggle:pressed { background-color:$border; }
+QPushButton#overlaytoggle:checked { background-color:$accent;
+    border-color:$accent; color:$surface; }
+QPushButton#overlaytoggle:checked:hover { background-color:$accent2;
+    border-color:$accent2; color:$surface; }
 /* The "no spectrometer connected" message centred on an empty spectrum panel.
    Accent, not danger: nothing is wrong, there is simply nothing connected yet
    — and the accent is what carries against the plot background it sits on,
@@ -76,10 +85,13 @@ QLabel#nodev { color:$accent; background:transparent; font-size:$fs_display;
 /* Same header button, in the stop colour — the live feed's running state. */
 QPushButton#overlaydanger { border-color:$danger; color:$danger;
     padding:0px; font-size:$fs_small; border-radius:$radius_sm; }
-QPushButton#overlaydanger:hover { background-color:$danger;
-    color:$bg; }
-QPushButton#overlaydanger:pressed { background-color:$danger;
-    color:$bg; }
+QPushButton#overlaydanger:hover { background-color:$border_hover; }
+QPushButton#overlaydanger:pressed { background-color:$border; }
+/* …and in the go colour — the live feed's stopped state (press to start). */
+QPushButton#overlaygood { border-color:$good; color:$good;
+    padding:0px; font-size:$fs_small; border-radius:$radius_sm; }
+QPushButton#overlaygood:hover { background-color:$border_hover; }
+QPushButton#overlaygood:pressed { background-color:$border; }
 QPushButton::menu-indicator { image: url("$arrow_dn"); width:8px; height:7px;
     subcontrol-origin:padding; subcontrol-position:center right; right:6px; }
 QMenu { background-color:$surface; border:1px solid $border;

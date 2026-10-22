@@ -30,7 +30,7 @@ class AlignmentDialog(QDialog):
         self.spin_align_step = DoubleSpinBox()
         self.spin_align_step.setDecimals(0)
         self.spin_align_step.setRange(1.0, 100000.0)
-        self.spin_align_step.setValue(100.0)
+        self.spin_align_step.setValue(10.0)
         self.spin_align_step.setSuffix(" fs")
         self.spin_align_step.setToolTip(
             "Half-width x of the alignment sweep: spectra are taken at "

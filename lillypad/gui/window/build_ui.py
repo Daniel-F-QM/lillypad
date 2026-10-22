@@ -33,12 +33,13 @@ from PySide6.QtWidgets import (QCheckBox, QGridLayout, QGroupBox, QHBoxLayout,
                                QWidget)
 
 from lillypad.design.geometry import HDR_BTN, HDR_ICON
-from lillypad.design.icons import MOON_ICON, SUN_ICON, SYMMETRY_ICON
+from lillypad.design.icons import MOON_ICON, SUN_ICON
 from lillypad.gui.canvas import FrogCanvas
 from lillypad.gui.dialogs.export import EXPORT_FORMATS
 from lillypad.gui.dialogs.graphics import GraphicsSettingsDialog
 from lillypad.gui.text import RIGHT_CLICK_HINT
 from lillypad.gui.widgets import (DoubleSpinBox, NoDeviceOverlay, StatusLamp,
+                                  TraceWatermark,
                                   _hline)
 from lillypad.gui.workers import MAX_UI_EXPOSURE_MS
 
@@ -292,7 +293,7 @@ def build_ui(win):
     # Alignment mode, spectrum side: opens the deviation panel under the
     # spectrum, steps to +/-x and +/-2x, and plots the two differences there.
     win.btn_align_spec = QPushButton(win.canvas)
-    win.btn_align_spec.setObjectName("overlay")
+    win.btn_align_spec.setObjectName("overlaytoggle")
     win.btn_align_spec.setCheckable(True)
     win.btn_align_spec.setFixedSize(HDR_BTN, HDR_BTN)
     win.btn_align_spec.setIconSize(QSize(HDR_ICON, HDR_ICON))
@@ -326,7 +327,7 @@ def build_ui(win):
     # Alignment mode, trace side — the trace panel's own header.
     # Wider than the rest: it is the one button still carrying a word.
     win.btn_align_trace = QPushButton("RAW", win.canvas)
-    win.btn_align_trace.setObjectName("overlay")
+    win.btn_align_trace.setObjectName("overlaytoggle")
     win.btn_align_trace.setCheckable(True)
     win.btn_align_trace.setFixedSize(40, HDR_BTN)
     win.btn_align_trace.hide()
@@ -336,17 +337,33 @@ def build_ui(win):
     # depend on the pair — but only enabled once a finished scan gives it an
     # autocorrelation to find the fold line in.
     win.btn_symmetry = QPushButton(win.canvas)
-    win.btn_symmetry.setObjectName("overlay")
+    win.btn_symmetry.setObjectName("overlaytoggle")
     win.btn_symmetry.setCheckable(True)
-    if SYMMETRY_ICON.exists():
-        win.btn_symmetry.setIcon(QIcon(str(SYMMETRY_ICON)))
-        win.btn_symmetry.setIconSize(QSize(HDR_ICON, HDR_ICON))
-    else:
-        win.btn_symmetry.setText("|")
+    win.appearance._refresh_symmetry_icon()
     win.btn_symmetry.setFixedSize(HDR_BTN, HDR_BTN)
     win.btn_symmetry.show()
     win.btn_symmetry.toggled.connect(win.alignment._on_symmetry_toggled)
     win.appearance._refresh_symmetry_button()
+
+    # Smoothing toggle: linear interpolation along the delay axis, display
+    # only (FrogCanvas._smooth_columns). On by default.
+    win.btn_smooth = QPushButton(win.canvas)
+    win.btn_smooth.setObjectName("overlaytoggle")
+    win.btn_smooth.setCheckable(True)
+    win.btn_smooth.setChecked(win.canvas.trace_smooth)
+    win.btn_smooth.setFixedSize(HDR_BTN, HDR_BTN)
+    win.btn_smooth.setIconSize(QSize(HDR_ICON, HDR_ICON))
+    win.btn_smooth.setToolTip(
+        "Smooth the trace along the delay axis (display only — saved data "
+        "is never smoothed)")
+    win.btn_smooth.show()
+    win.btn_smooth.toggled.connect(win.canvas.set_trace_smooth)
+    win.appearance._refresh_smooth_icon()
+
+    # The Lilypad mark on the empty trace panel. Lowered beneath the header
+    # buttons; placed and shown/hidden by _position_panel_buttons.
+    win.trace_mark = TraceWatermark(win.canvas)
+    win.trace_mark.lower()
 
     # ── "No spectrometer connected" ──────────────────────────────────────
     # A Qt child of the canvas, not a matplotlib artist: the canvas blits,
@@ -360,6 +377,7 @@ def build_ui(win):
     win.pnl_no_spec.hide()
 
     win.canvas.axes_relaid.connect(win.appearance._position_panel_buttons)
+    win.canvas.axes_relaid.connect(win.canvas.refresh_trace_resolution)
     win.appearance._position_panel_buttons()
 
     # The reference's toggle is an INDICATOR as much as a control, and the

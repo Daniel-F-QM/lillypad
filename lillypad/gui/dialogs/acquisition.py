@@ -32,7 +32,7 @@ class AcquisitionSettingsDialog(QDialog):
         grid.addWidget(self.spin_idle, 1, 1)
         grid.addWidget(QLabel("Wait after move"), 2, 0)
         self.spin_wait = SpinBox(); self.spin_wait.setRange(0, 10000)
-        self.spin_wait.setValue(0); self.spin_wait.setSuffix(" ms")
+        self.spin_wait.setValue(100); self.spin_wait.setSuffix(" ms")
         grid.addWidget(self.spin_wait, 2, 1)
         lay.addLayout(grid)
 

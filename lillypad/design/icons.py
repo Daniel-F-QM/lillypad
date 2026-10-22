@@ -94,6 +94,8 @@ SYMMETRY_ICON = resource_path("icons", "symmetry.png")
 # unlike the pairs above: it is drawn as an alpha mask and tinted from the live
 # PALETTE (see NoDeviceOverlay), so it follows a theme switch by itself.
 DISCONNECTED_ICON = resource_path("icons", "disconnected.png")
+# Watermark on the empty FROG trace panel — same alpha-mask treatment.
+TRACE_BACKGROUND_ICON = resource_path("icons", "Lilypad_background.png")
 
 _APP_ICON = None
 

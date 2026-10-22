@@ -23,8 +23,8 @@ one — the highest-peak frame since the last tick is the one that gets judged.
 
 import numpy as np
 
-from PySide6.QtCore import QSignalBlocker
-from PySide6.QtWidgets import QAbstractSpinBox
+from PySide6.QtCore import QSignalBlocker, Qt
+from PySide6.QtWidgets import QAbstractSpinBox, QApplication
 from lillypad.gui.perf import perf_tick
 from lillypad.gui.text import FEED_BUSY_MSG
 from lillypad.gui.widgets import SAT_WARN_FRACTION
@@ -560,14 +560,39 @@ class LiveFeedController:
             self.invalidate_dark(f"integration time changed to "
                                   f"{', '.join(changed)}")
 
+    # Dark averaging: at least this many frames, and DARK_FRAMES_PER_AVG times
+    # the scan's points-per-average, so the dark is always much quieter than
+    # one scan point — but never more than DARK_BUDGET_MS of exposure, because
+    # the capture blocks the GUI thread for its whole length.
+    DARK_MIN_FRAMES = 16
+    DARK_FRAMES_PER_AVG = 4
+    DARK_MAX_FRAMES = 64
+    DARK_BUDGET_MS = 5000.0
+
+    def _dark_frame_count(self):
+        """How many frames to average into a dark (see DARK_* above)."""
+        n = max(self.DARK_MIN_FRAMES,
+                self.DARK_FRAMES_PER_AVG * int(self.win.dlg_settings.n_average))
+        members = getattr(self.win.spec, "members", None)
+        frame_ms = (sum(_exposure_ms(m) for m in members) if members
+                    else _exposure_ms(self.win.spec))
+        if frame_ms > 0:
+            n = min(n, int(self.DARK_BUDGET_MS // frame_ms))
+        return max(1, min(n, self.DARK_MAX_FRAMES))
+
     def _capture_dark(self):
-        """Record the dark from a FRESH frame.
+        """Record the dark as the AVERAGE of several fresh frames.
+
+        Averaged because the same dark is subtracted from every column of a
+        scan: its noise is not averaged away along the delay axis the way each
+        point's own noise is, so a single-frame dark prints its noise into the
+        trace as stripes along delay. N frames cut that by sqrt(N).
 
         Always acquires rather than reusing self.win.last_spectrum: that field only
         moves while the display ticks, so with the feed stopped it holds the
         last LIT frame and "Record Dark" recorded the light. Acquiring also
-        means the merged frame and the member frames come from one exposure
-        instead of two different ones.
+        means the merged frame and the member frames come from the same
+        exposures instead of two different ones.
         """
         if self.win.scanning.running():
             self.win.status.showMessage("A scan is running — spectrometer is busy.", 3000)
@@ -579,15 +604,32 @@ class LiveFeedController:
             if not ok:
                 self.win.status.showMessage(FEED_BUSY_MSG, 4000)
                 return
+            n = self._dark_frame_count()
+            self.win.status.showMessage(f"Recording dark — {n} frames…", 0)
+            self.win.status.repaint()
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            acc = m_acc = None
             try:
-                frame = np.asarray(self.win.spec.acquire(), float)
+                for _ in range(n):
+                    f = np.asarray(self.win.spec.acquire(), float)
+                    acc = f.copy() if acc is None else acc + f
+                    # Inside the lock: these frames belong to the acquire just
+                    # made, and the feed cannot overwrite last_member_raw.
+                    mf = getattr(self.win.spec, "last_member_raw", None)
+                    if mf is not None:
+                        if m_acc is None:
+                            m_acc = [np.asarray(x, float).copy() for x in mf]
+                        else:
+                            for a, x in zip(m_acc, mf):
+                                a += x
             except Exception as e:
                 self.win.status.showMessage(f"Dark capture failed: {e}", 5000)
                 return
-            # Inside the lock: the frames belong to the acquire above, and the
-            # feed must not overwrite last_member_raw before we have copied it.
+            finally:
+                QApplication.restoreOverrideCursor()
+            frame = acc / n
             members = self.win.devices._slot_members()
-            frames = getattr(self.win.spec, "last_member_raw", None)
+            frames = None if m_acc is None else tuple(a / n for a in m_acc)
             if len(members) == 2 and frames is not None:
                 # Stored positionally in self.win.spec.members order — NOT keyed by
                 # id(), which is recycled across reconnects; _apply_spectrometer
@@ -608,7 +650,8 @@ class LiveFeedController:
         self.win.last_spectrum = frame
         self.win._dark_member_warned = False
         self.win.chk_dark.setEnabled(True); self.win.chk_dark.setChecked(True)
-        self.win.status.showMessage(f"Dark recorded — {where}.", 4000)
+        self.win.status.showMessage(
+            f"Dark recorded — {where}, average of {n} frames.", 4000)
 
     def invalidate_dark(self, reason):
         """Throw the recorded dark away and say why.

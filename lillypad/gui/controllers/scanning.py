@@ -153,6 +153,7 @@ class ScanController:
         self.win._live_frame  = None     # park any leftover live-feed frame too
         self.win.alignment._init_align_trace(wl, delays.size)
         self.win.canvas.init_trace(delays, wl)
+        self.win.appearance.refresh_trace_mark()    # the trace now has data
         self.win.feed.reset_saturation(); self.win.progress.setValue(0)
         # A difference measured at the old position says nothing about the
         # scan that is starting, and the scan owns the stage the sweep needs.

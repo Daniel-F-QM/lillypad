@@ -30,18 +30,21 @@ PULSE_SHAPES: dict[str, dict] = {
     "tl_gauss": {
         "label": "Transform-limited Gaussian",
         "build": _build_tl_gauss,
+        "sim":   {"tau0_fs": 5.5},     # SHG over 550–900 nm
         "desc":  "Same FWHM as the sech, but with Gaussian wings — a slightly "
                  "tighter trace with no pedestal.",
     },
     "chirp": {
         "label": "Linearly chirped (GDD)",
         "build": _build_chirp,
+        "sim":   {"tau0_fs": 5.0},     # SHG over 550–900 nm
         "desc":  "+3·τ₀² of GDD (~6x stretch). Long in delay, unchanged in "
                  "bandwidth — the classic 'this pulse is not compressed' trace.",
     },
     "tod": {
         "label": "Third-order dispersion",
         "build": _build_tod,
+        "sim":   {"tau0_fs": 4.9},     # SHG over 550–900 nm
         "desc":  "Pure cubic phase: a steep front edge trailed by an Airy "
                  "satellite train. The satellites sit ~1% below the peak, so "
                  "they need a compressed colour scale to see.",
@@ -49,12 +52,14 @@ PULSE_SHAPES: dict[str, dict] = {
     "spm": {
         "label": "Self-phase modulation",
         "build": _build_spm,
+        "sim":   {"tau0_fs": 19.2},     # SHG over 550–900 nm
         "desc":  "B-integral of 4.5 rad, no dispersion. Envelope unchanged, "
                  "spectrum split into the multi-lobed SPM comb.",
     },
     "fiber": {
         "label": "Fibre output (SPM + normal GVD)",
         "build": _build_fiber,
+        "sim":   {"tau0_fs": 23.5},     # SHG over 550–900 nm
         "desc":  "Split-step propagation past optical wave breaking (N²≈25). "
                  "Hard-edged diamond with interference fringes inside — the "
                  "busiest trace in the set.",
@@ -62,12 +67,14 @@ PULSE_SHAPES: dict[str, dict] = {
     "double": {
         "label": "Double pulse",
         "build": _build_double,
+        "sim":   {"tau0_fs": 5.3},     # SHG over 550–900 nm
         "desc":  "Two replicas 6·τ₀ apart in quadrature: three lobes along "
                  "delay, all striped with spectral interference fringes.",
     },
     "two_color": {
         "label": "Two-colour pair",
         "build": _build_two_color,
+        "sim":   {"tau0_fs": 8.2},     # SHG over 550–900 nm
         "desc":  "Two sub-pulses at different colours and different times. SHG "
                  "mixes them into three off-diagonal bands.",
     },
@@ -118,10 +125,12 @@ PULSE_SHAPES: dict[str, dict] = {
 DEFAULT_PULSE = "tl_sech"
 
 # SimulatedSpectrometer arguments a BEAM may own, and what they are when
-# neither the caller nor the preset says. A 1030 nm, 30 fs pulse on a +/-1024
-# fs grid — the pulse the simulator has always defaulted to.
+# neither the caller nor the preset says. A 1400 nm, 5.2 fs pulse on a +/-1024
+# fs grid: its SHG fills 550–900 nm. The structured beams spread their spectrum
+# further than a transform-limited pulse does, so each carries its own tau0_fs
+# (see "sim" above), fitted so that its SHG window is that same 550–900 nm.
 SIM_BEAM_DEFAULTS: dict[str, float | int] = {
-    "lambda0_nm": 1030.0, "tau0_fs": 30.0, "n_time": 4096, "t_max_fs": 1024.0,
+    "lambda0_nm": 1400.0, "tau0_fs": 5.2, "n_time": 4096, "t_max_fs": 1024.0,
 }
 
 
