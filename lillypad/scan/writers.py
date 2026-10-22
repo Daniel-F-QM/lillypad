@@ -58,6 +58,36 @@ def _ascending(result):
     return delays, trace
 
 
+def _trim_empty_rows(wl, trace):
+    """Drop the wavelength rows at either END that are exactly zero at every
+    delay. Rows inside the range are kept, zero or not.
+
+    Those rows come from an intensity calibration whose factor is 0 at its
+    ends (a detector cut off where its response dies). Every pixel there is
+    multiplied by 0, the dark is too, so the row is exactly 0 everywhere and
+    carries no data. A trace with no non-zero row at all is returned whole,
+    rather than as a file with no rows.
+    """
+    live = np.flatnonzero(np.any(trace != 0, axis=1))
+    if live.size == 0:
+        return wl, trace
+    keep = slice(live[0], live[-1] + 1)
+    return wl[keep], trace[keep]
+
+
+def _export_rows(result, trim_empty_rows):
+    """(delays, wavelengths, trace) as the two text formats write them:
+    ascending delay, dark-corrected, optionally edge-trimmed."""
+    delays, trace = _ascending(result)
+    wl = np.asarray(result.wavelengths_nm, float)
+    if wl.size != trace.shape[0]:
+        raise ValueError(f"wavelength vector ({wl.size}) does not match the "
+                         f"trace ({trace.shape[0]} rows)")
+    if trim_empty_rows:
+        wl, trace = _trim_empty_rows(wl, trace)
+    return delays, wl, trace
+
+
 def _delay_increment(result, delays):
     """Uniform delay step (fs). Taken from the realised axis, falling back to
     the configured step for a single-column scan."""
@@ -66,14 +96,13 @@ def _delay_increment(result, delays):
     return float(result.config.delay_step_fs)
 
 
-def write_dwc(path, result):
-    """Write a FrogResult as a .dwc trace (background-subtracted)."""
-    delays, trace = _ascending(result)
-    wl = np.asarray(result.wavelengths_nm, float)
+def write_dwc(path, result, trim_empty_rows=False):
+    """Write a FrogResult as a .dwc trace (background-subtracted).
+
+    `trim_empty_rows` drops all-zero wavelength rows at either end (see
+    _trim_empty_rows); the header's point count follows the trimmed data."""
+    delays, wl, trace = _export_rows(result, trim_empty_rows)
     n_wl, n_delays = trace.shape
-    if wl.size != n_wl:
-        raise ValueError(f"wavelength vector ({wl.size}) does not match the "
-                         f"trace ({n_wl} rows)")
 
     with open(path, "w", encoding="ascii", newline="\r\n") as f:
         f.write(f"Number of delay points = {n_delays}\n"
@@ -128,11 +157,11 @@ def write_npz(path, result):
     np.savez(path, **data)
 
 
-def write_csv(path, result):
+def write_csv(path, result, trim_empty_rows=False):
     """Write a FrogResult as a spreadsheet-friendly CSV: a delay header row
-    (fs) over one row per wavelength (nm), background-subtracted."""
-    delays, trace = _ascending(result)
-    wl  = np.asarray(result.wavelengths_nm, float)
+    (fs) over one row per wavelength (nm), background-subtracted.
+    `trim_empty_rows` as for write_dwc."""
+    delays, wl, trace = _export_rows(result, trim_empty_rows)
     fmt = _row_fmt(trace.shape[1], "%.6g", ",")
     with open(path, "w", encoding="utf-8", newline="\r\n") as f:
         f.write("wavelength_nm\\delay_fs," + _row_fmt(delays.size, "%.6g", ",") % tuple(delays))

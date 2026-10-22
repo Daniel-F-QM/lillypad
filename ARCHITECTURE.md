@@ -156,7 +156,8 @@ The three export formats differ in more than syntax:
 
 - **`.dwc`** and **`.csv`** carry the dark-corrected trace, and both flip a
   high-to-low scan to ascending delay, because `.dwc` records only a positive
-  increment.
+  increment. With the Export window's trim option (on by default) they also
+  drop the wavelength rows at either end that are zero at every delay.
 - **`.npz`** carries the RAW counts, the dark that would be subtracted, and the
   delay-extreme reference frames if they were taken — **in acquisition order**.
   Line an archive up against a `.dwc` by delay *value*, not by column index.

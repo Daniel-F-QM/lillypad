@@ -134,6 +134,13 @@ stage reported a fault, since "zero" would no longer mean anything.
 If you want untouched numbers, use `.npz`. The two text formats have fixed
 layouts that cannot carry the extras, so they get the subtracted trace.
 
+**Trim empty wavelength rows** (Export window, on by default) leaves out of the
+`.dwc` and `.csv` the rows at either end of the trace that are zero at every
+delay. They come from a calibration file whose factor is 0 at its ends — the
+NIRQuest file stops at 1600 nm, so a stitched trace otherwise ends in ~300 rows
+of zeros up to 1703 nm. Zero rows *inside* the range are always kept, and the
+`.npz` always keeps every pixel.
+
 **Export** opens a window holding the format, the file name and the Save
 button. The name is a starting point — the Save dialog can still be typed over
 — and with **Date prefix?** ticked (it is by default) today's date goes in front
@@ -212,7 +219,8 @@ across the whole FROG trace.
 
 `result.trace` and the `.npz` are still archived raw: the archive keeps the raw
 counts **and** the dark, so `trace - dark` reproduces exactly what the `.dwc`
-and `.csv` contain. One thing has *not* followed: the `fwhm_ac_fs` field inside
+and `.csv` contain (with trimming on, the text files are that minus the
+all-zero rows at either end — match them by wavelength). One thing has *not* followed: the `fwhm_ac_fs` field inside
 the `.npz` metadata is computed from the raw trace. In practice it agrees with
 the panel, because the autocorrelation baseline-subtracts anyway.
 

@@ -93,6 +93,9 @@ class SettingsController:
             ("export_date_prefix", lambda: self.win.dlg_export.date_stamped,
                                    lambda v: self.win.dlg_export.chk_date.setChecked(
                                        as_bool(v))),
+            ("export_trim_empty_rows", lambda: self.win.dlg_export.trim_empty_rows,
+                                       lambda v: self.win.dlg_export.chk_trim.setChecked(
+                                           as_bool(v))),
 
             ("avg_per_point",      lambda: d.n_average,
                                    lambda v: d.spin_avg.setValue(int(v))),

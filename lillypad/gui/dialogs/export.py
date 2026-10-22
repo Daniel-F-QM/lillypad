@@ -24,6 +24,10 @@ EXPORT_FORMATS = {
     "csv": ("CSV table  (.csv)",     ".csv", "CSV table (*.csv)",     write_csv),
 }
 
+# The formats the "trim empty rows" option applies to. Not the .npz: the
+# archive keeps every pixel, so it always lines up with the raw device.
+TRIMMABLE_FORMATS = {"dwc", "csv"}
+
 # Stem the Save dialog opens on until someone types their own. Deliberately not
 # a date and not a counter: the date is the checkbox's job below, and a counter
 # would have to be kept per folder to mean anything.
@@ -78,6 +82,14 @@ class ExportDialog(QDialog):
             "carry the extras, so they get the background-subtracted trace.")
         hint.setObjectName("dim"); hint.setWordWrap(True)
         lay.addWidget(hint)
+        self.chk_trim = QCheckBox("Trim empty wavelength rows")
+        self.chk_trim.setChecked(True)
+        self.chk_trim.setToolTip(
+            "Leave out the wavelength rows at either end of the trace that are "
+            "zero at every delay. They come from a calibration file whose "
+            "factor is 0 there, and carry no data. Rows in between are always "
+            "kept. Applies to .dwc and .csv; the .npz always keeps every pixel.")
+        lay.addWidget(self.chk_trim)
 
         lay.addWidget(_hline())
 
@@ -132,6 +144,11 @@ class ExportDialog(QDialog):
         l = QLabel(text); l.setObjectName("hdr")
         return l
 
+    @property
+    def trim_empty_rows(self):
+        """Whether .dwc/.csv exports drop the all-zero rows at either end."""
+        return self.chk_trim.isChecked()
+
     # ── The name ──────────────────────────────────────────────────────────
     @property
     def date_stamped(self):
@@ -174,6 +191,9 @@ class ExportDialog(QDialog):
         this is the path FROM the window, so the window already knows."""
         with QSignalBlocker(self.radios[key]):
             self.radios[key].setChecked(True)
+        # Greyed out, not unticked, for the .npz: the choice is kept for when
+        # a text format is picked again.
+        self.chk_trim.setEnabled(key in TRIMMABLE_FORMATS)
 
     def toggle(self):
         if self.isVisible():

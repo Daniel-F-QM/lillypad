@@ -16,8 +16,10 @@ before touching this:
     Line an archive up against a .dwc by delay VALUE, not by column index.
 """
 
+from functools import partial
+
 from PySide6.QtWidgets import QFileDialog
-from lillypad.gui.dialogs.export import EXPORT_FORMATS
+from lillypad.gui.dialogs.export import EXPORT_FORMATS, TRIMMABLE_FORMATS
 from lillypad.gui.workers import ExportWorker
 
 
@@ -65,6 +67,9 @@ class ExportController:
             self.win.status.showMessage("An export is already in progress.", 3000)
             return
         _label, suffix, filt, writer = EXPORT_FORMATS[self.win._export_fmt]
+        if (self.win._export_fmt in TRIMMABLE_FORMATS
+                and self.win.dlg_export.trim_empty_rows):
+            writer = partial(writer, trim_empty_rows=True)
         path, _ = QFileDialog.getSaveFileName(
             self.win, "Save FROG scan", self.win.dlg_export.file_name(suffix), filt)
         if not path:

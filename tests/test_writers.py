@@ -175,6 +175,66 @@ class TestDwc:
             write_dwc(tmp_path / "t.dwc", r)
 
 
+def _zero_edged_result():
+    """Rows 0 and 4-5 are exactly zero at every delay (a calibration factor of
+    0 there, applied to signal and dark alike); row 2 is zero inside the
+    range, which trimming must keep."""
+    r = make_result(dark=False)
+    trace = np.array(r.trace, float)
+    trace[[0, 2, 4, 5], :] = 0.0
+    r.trace = trace
+    return r
+
+
+def _read_dwc(p):
+    lines = p.read_text(encoding="ascii").splitlines()
+    wl = [float(v) for v in lines[lines.index("[Wavelength vector]") + 1].split("\t")]
+    data_at = lines.index("[Data array]")
+    rows = np.array([[float(v) for v in ln.split("\t")]
+                     for ln in lines[data_at + 1:] if ln.strip()])
+    return lines, np.array(wl), rows
+
+
+class TestTrimEmptyRows:
+    def test_dwc_drops_only_the_zero_rows_at_either_end(self, tmp_path):
+        p = tmp_path / "t.dwc"
+        r = _zero_edged_result()
+        write_dwc(p, r, trim_empty_rows=True)
+        lines, wl, rows = _read_dwc(p)
+        assert lines[1] == "Number of wavelength points = 3"
+        assert np.allclose(wl, r.wavelengths_nm[1:4], rtol=1e-6)
+        assert np.allclose(rows, r.corrected_trace()[1:4], rtol=1e-6)
+        assert not rows[1].any(), "a zero row inside the range was dropped"
+
+    def test_off_by_default_at_the_writer(self, tmp_path):
+        p = tmp_path / "t.dwc"
+        write_dwc(p, _zero_edged_result())
+        lines, wl, rows = _read_dwc(p)
+        assert lines[1] == f"Number of wavelength points = {N_WL}"
+        assert rows.shape == (N_WL, N_DELAY)
+
+    def test_a_trace_with_no_zero_edges_is_untouched(self, tmp_path):
+        a, b = tmp_path / "a.dwc", tmp_path / "b.dwc"
+        write_dwc(a, make_result())
+        write_dwc(b, make_result(), trim_empty_rows=True)
+        assert a.read_bytes() == b.read_bytes()
+
+    def test_an_all_zero_trace_is_written_whole(self, tmp_path):
+        p = tmp_path / "t.dwc"
+        r = make_result(dark=False, trace=np.zeros((N_WL, N_DELAY)))
+        write_dwc(p, r, trim_empty_rows=True)
+        _lines, wl, rows = _read_dwc(p)
+        assert wl.size == N_WL and rows.shape == (N_WL, N_DELAY)
+
+    def test_csv_trims_the_same_rows(self, tmp_path):
+        p = tmp_path / "t.csv"
+        r = _zero_edged_result()
+        write_csv(p, r, trim_empty_rows=True)
+        body = p.read_text(encoding="utf-8").splitlines()[1:]
+        wl = [float(ln.split(",")[0]) for ln in body]
+        assert np.allclose(wl, r.wavelengths_nm[1:4], rtol=1e-6)
+
+
 class TestNpz:
     def test_round_trips_the_raw_trace_and_axes(self, tmp_path):
         p = tmp_path / "t.npz"

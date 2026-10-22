@@ -200,6 +200,20 @@ class TestDialogValueProperties:
             window.dlg_export.chk_date.setChecked(flag)
             assert window.dlg_export.date_stamped is flag
 
+    def test_trim_empty_rows_tracks_its_widget(self, window):
+        for flag in (True, False):
+            window.dlg_export.chk_trim.setChecked(flag)
+            assert window.dlg_export.trim_empty_rows is flag
+
+    def test_trim_is_greyed_out_for_the_npz_only(self, window):
+        was = window._export_fmt
+        try:
+            for key, enabled in (("npz", False), ("csv", True), ("dwc", True)):
+                window.export.set_format(key)
+                assert window.dlg_export.chk_trim.isEnabled() is enabled
+        finally:
+            window.export.set_format(was)
+
 
 class TestTheLiveFeedSwitchIsNamed:
     """The Avantes window has to stop the feed before arming a hardware
