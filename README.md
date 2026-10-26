@@ -24,9 +24,10 @@ everything with nothing plugged in.
 
 - **Live spectrum and live trace** — the trace builds up column by column while
   the scan runs.
-- **Eleven simulated pulse shapes**, from a clean transform-limited pulse to a
+- **Twelve simulated pulse shapes**, from a clean transform-limited pulse to a
   chirped one, a double pulse, fibre output, a deliberately over-exposed one, a
-  deliberately misaligned one, and *Bird* — a measured 1.0–3.2 µm continuum
+  deliberately weak (low-SNR) one, a deliberately misaligned one, and *Bird* — a
+  measured 1.0–3.2 µm continuum
   that comes with its own pair of simulated Ocean spectrometers.
 - **Saturation warnings** — clipped pixels counted per column, shown on a lamp,
   with an optional automatic stop.
@@ -134,7 +135,7 @@ stage reported a fault, since "zero" would no longer mean anything.
 If you want untouched numbers, use `.npz`. The two text formats have fixed
 layouts that cannot carry the extras, so they get the subtracted trace.
 
-**Trim empty wavelength rows** (Export window, on by default) leaves out of the
+**Trim empty wavelength rows** (Export window, off by default) leaves out of the
 `.dwc` and `.csv` the rows at either end of the trace that are zero at every
 delay. They come from a calibration file whose factor is 0 at its ends — the
 NIRQuest file stops at 1600 nm, so a stitched trace otherwise ends in ~300 rows
@@ -143,16 +144,17 @@ of zeros up to 1703 nm. Zero rows *inside* the range are always kept, and the
 
 **Export** opens a window holding the format, the file name and the Save
 button. The name is a starting point — the Save dialog can still be typed over
-— and with **Date prefix?** ticked (it is by default) today's date goes in front
-of it as `YYYY-MM-DD_`, so a folder of exports sorts chronologically by name.
-It is the name every save in the program starts from, the toolbar's camera
-included. The line under the field shows exactly what the Save dialog will open
-on:
+— and with **Date prefix?** ticked (it is off by default) today's date goes in
+front of it as `YYYY-MM-DD_`, so a folder of exports sorts chronologically by
+name. The **Delimiter** box beside it sets what goes between year, month and
+day: `-` by default, `.` for `2026.09.15`, empty for `20260915`. It is the name
+every save in the program starts from, the toolbar's camera included. The line
+under the field shows exactly what the Save dialog will open on:
 
-> Saves as   2026-09-15_frog_scan.dwc
+> Saves as   2026-09-15_FROG_trace.dwc
 
-The format and the name are both remembered between sessions; the date is not
-— it is made fresh from today's date on every save. **Save** on the side panel
+The format, the name and the delimiter are remembered between sessions; the
+date is not — it is made fresh from today's date on every save. **Save** on the side panel
 skips the window and writes with whatever it is set to.
 
 ## Saving the picture
@@ -455,9 +457,9 @@ reference.
 So Lillypad reads the controller's warning flags after every scan point (`FS`
 stalled, `WM` displaced while stationary, `NC` moved by hand, `WH`/`WR` unhomed
 — ignored while the axis has not been homed since it connected — and others) and, where there is an encoder, cross-checks `pos` against it.
-Anything it finds stops the scan — *Abort scan on stage fault* in **Acquisition
-Settings**, on by default. Switch it off and the scan finishes with the affected
-columns marked in the `.npz`.
+With *Abort scan on stage fault* ticked in **Acquisition Settings**, anything it
+finds stops the scan. It is off by default: the scan then finishes, with the
+affected columns marked in the `.npz`.
 
 **An unhomed axis connects and scans, in its power-up frame.** After a power
 cycle the counter reads 0 wherever the carriage happens to be. Delays are
@@ -661,13 +663,17 @@ the spectrometer is not carrying.
 
 Lillypad writes a `settings.json` next to the program and reads it back on the
 next launch. It holds the theme, window size and position, colour map, line
-width, the export format and file name (date prefix included), and your
-acquisition settings — scan range and step, averaging, saturation threshold and
-the two abort switches.
+width, the export format and file name (date prefix included), every
+acquisition setting — scan range and step, averages, idle shots, the wait after
+each move, the saturation threshold and the full-scale override it is a
+percentage of, the delay-extreme reference and the two abort switches — and the
+alignment step. Integration times and the stage's jog step are not kept.
 
 So the defaults described here are what you get on a *fresh* install, and
-**deleting `settings.json` is a clean factory reset**. It is plain text and safe
-to edit or delete while the app is closed. Device settings, including everything
+**deleting `settings.json` is a clean factory reset**. The defaults themselves
+are one table, `DEFAULT_SETTINGS` in [lillypad/settings.py](lillypad/settings.py),
+applied exactly as a saved file would be. `settings.json` is plain text and
+safe to edit or delete while the app is closed. Device settings, including everything
 in the Avantes window, are *not* stored there — those are read from the
 instrument each time.
 

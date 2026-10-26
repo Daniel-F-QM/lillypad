@@ -248,14 +248,24 @@ class SpectrometerDialog(ConnectDialog):
             if value <= 0:
                 # Refuse rather than silently reverting: a bad value here
                 # disables saturation checking, which must not happen quietly.
+                hint = (" Use '.' for decimals and no thousands separator."
+                        if "," in text else "")
                 self._do(lambda: (False, f"Full scale must be a positive "
-                                         f"number of counts (got {text!r})."))
+                                         f"number of counts (got {text!r})."
+                                         + hint))
                 return
             self.state.scan_cfg.saturation_counts = value
         self.main.feed.reset_saturation()
         self._do(lambda: (True, "Full scale: " + (
             f"{self.state.scan_cfg.saturation_counts:.0f} counts (override)."
             if self.state.scan_cfg.saturation_counts else "auto (from device).")))
+
+    def set_full_scale(self, counts):
+        """Put a full-scale override in place as if it had been typed — None
+        is "auto (from device)". The restore path for settings.json."""
+        self.edit_full_scale.setText("" if counts is None else f"{counts:g}")
+        self.state.scan_cfg.saturation_counts = counts
+        self.main.feed.reset_saturation()
 
     def _on_backend(self):
         backend = self.cmb_backend.currentData()

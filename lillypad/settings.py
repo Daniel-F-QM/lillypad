@@ -5,7 +5,8 @@ particular piece of hardware. A serial number, an integration time or a stage
 zero describes the rig that happened to be plugged in last time, and restoring
 one silently would put a number the operator never entered into the next
 measurement. What is kept here is only how the program LOOKS and how it has been
-told to behave.
+told to behave. (The full-scale override counts as policy: it is what the
+saturation threshold is a percentage of.)
 
 A plain JSON file rather than QSettings and the registry, for the same reason the
 calibration files are a folder: the operator can open it, read it, correct it by
@@ -18,6 +19,7 @@ monitor-layout check behind window-geometry restore, stays with the window.)
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 
@@ -25,29 +27,70 @@ from lillypad.paths import SETTINGS_PATH
 
 SETTINGS_VERSION = 1
 
+# The program's defaults: what a fresh install, or a deleted settings.json,
+# starts with. They go through exactly the same restore path as a saved value,
+# so they reach each widget — and everything that widget drives, such as the
+# live saturation threshold — the way a remembered setting does. That is why
+# they live here rather than in the widget constructors: a constructor value
+# never fires the change signal that keeps the rest of the program in step.
+# A key missing here falls back to the value its widget is built with.
+DEFAULT_SETTINGS = {
+    "theme": "dark",
+    "window": {"x": 0, "y": 0, "w": 1180, "h": 760, "maximized": False},
+    "spec_frac": 0.44,
+    "log_scale": False,
+    "cmap": "jet",
+    "trace_smooth": True,
+    "cmap_reversed": False,
+    "trace_threshold_pct": 0.0,
+    "line_width": 1.0,
+    "export_format": "dwc",
+    "export_name": "FROG_trace",
+    "export_date_prefix": False,
+    "export_date_delimiter": "-",
+    "export_trim_empty_rows": False,
+    "avg_per_point": 1,
+    "idle_shots": 0,
+    "wait_after_move_ms": 250,
+    "saturation_pct": 85.0,
+    "abort_on_saturation": False,
+    "abort_on_stage_fault": False,
+    "scan_start_fs": -100.0,
+    "scan_stop_fs": 100.0,
+    "scan_step_fs": 1.0,
+    "scan_delay_reference": False,
+    "align_step_fs": 10.0,
+    "processing": "lillypad",
+}
+
 _SETTINGS = None
 
 
 def load_settings() -> dict:
-    """Read settings.json once per process; {} for anything wrong with it.
+    """The settings in force: DEFAULT_SETTINGS, overlaid with whatever
+    settings.json holds. Read once per process.
 
     Cached because two moments need the same answer and must not disagree:
     main() needs the theme before the QApplication is styled, and the window
     needs everything else after its widgets exist.
 
     A missing file is the ordinary first-run case, and a corrupt one is treated
-    exactly the same way — defaults are always a working program, and a startup
-    that refused to start because a preferences file lost a brace would be a far
-    worse failure than a forgotten colormap.
+    exactly the same way — the defaults alone, because defaults are always a
+    working program, and a startup that refused to start because a preferences
+    file lost a brace would be a far worse failure than a forgotten colormap.
     """
     global _SETTINGS
     if _SETTINGS is None:
         try:
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            _SETTINGS = data if isinstance(data, dict) else {}
         except (OSError, ValueError, UnicodeDecodeError):
-            _SETTINGS = {}
+            data = {}
+        # A deep copy: "window" is a nested dict, and the defaults must come
+        # out of every load exactly as written above.
+        merged = copy.deepcopy(DEFAULT_SETTINGS)
+        merged.update(data if isinstance(data, dict) else {})
+        _SETTINGS = merged
     return _SETTINGS
 
 

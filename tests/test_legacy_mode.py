@@ -542,9 +542,9 @@ def window():
     win = FrogWindow()
     avg = win.dlg_settings.spin_avg.value()
     yield win
-    # Put back what these tests touch BEFORE closing: the window saves
-    # settings.json on the way out, and a test must not leave the next launch
-    # in legacy mode or on a different frames-per-point.
+    # Put back what these tests touch before closing. The window saves
+    # settings.json on the way out — into conftest's throwaway file, but a
+    # later window in the same run reads that file too.
     win.devices.set_processing("lillypad")
     win.devices.disconnect_spectrometer()
     win.dlg_settings.spin_avg.setValue(avg)

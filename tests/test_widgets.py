@@ -41,6 +41,47 @@ def _wheel(app, w, delta=120):
     app.sendEvent(w, ev)
 
 
+@pytest.fixture
+def german_default():
+    """A machine set to German: "," as the decimal separator, "." grouping.
+    The default locale is put back afterwards."""
+    from PySide6.QtCore import QLocale
+    before = QLocale()
+    QLocale.setDefault(QLocale(QLocale.Language.German,
+                               QLocale.Country.Germany))
+    yield
+    QLocale.setDefault(before)
+
+
+class TestDotDecimals:
+    """Every number field uses "." for decimals, whatever the Windows region
+    says — the plots, exports and settings.json all do."""
+
+    def test_a_double_box_shows_a_dot(self, app, german_default):
+        w = widgets.DoubleSpinBox()
+        w.setRange(0.0, 1e6); w.setDecimals(2); w.setValue(1234.5)
+        assert w.cleanText() == "1234.50"      # dot, and no thousands separator
+
+    def test_a_double_box_reads_a_dot(self, app, german_default):
+        w = widgets.DoubleSpinBox()
+        w.setRange(0.0, 100.0); w.setDecimals(2)
+        assert w.valueFromText("2.25") == 2.25
+
+    def test_an_int_box_has_no_thousands_separator(self, app, german_default):
+        w = widgets.SpinBox()
+        w.setRange(0, 100000); w.setValue(12000)
+        assert w.cleanText() == "12000"
+
+    def test_startup_makes_it_the_default_for_qts_own_boxes(self, app,
+                                                            german_default):
+        """QInputDialog.getDouble builds a plain QDoubleSpinBox, which only
+        the default locale reaches."""
+        widgets.use_dot_decimals()
+        plain = QDoubleSpinBox()
+        plain.setDecimals(1); plain.setValue(0.5)
+        assert plain.cleanText() == "0.5"
+
+
 class TestNoWheel:
     """Scrolling a panel must never edit a setting. ev.ignore() propagates the
     wheel to the enclosing QScrollArea, so the panel still scrolls."""

@@ -1,7 +1,8 @@
 """Small, reusable widgets.
 
 Nothing here knows what Lillypad measures. These are the pieces the panels and
-dialogs are built from: value widgets that refuse the mouse wheel, a separator,
+dialogs are built from: value widgets that refuse the mouse wheel (and number
+boxes that always write "." for the decimal separator), a separator,
 a status lamp, and the three custom-painted widgets that live on top of the
 figure.
 
@@ -14,7 +15,7 @@ painted ones sample the palette directly.
 from __future__ import annotations
 
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QLocale, QPointF, QRectF, Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFrame,
                                QLabel, QLineEdit, QPushButton, QSlider,
@@ -34,8 +35,37 @@ class _NoWheel:
         ev.ignore()
 
 
-class SpinBox(_NoWheel, QSpinBox):             pass
-class DoubleSpinBox(_NoWheel, QDoubleSpinBox): pass
+def number_locale() -> QLocale:
+    """The locale every number field reads and writes: "." as the decimal
+    separator and no thousands separator, whatever the Windows region says.
+
+    A spin box otherwise follows the system locale, so on a German machine it
+    shows and expects "1,5" — while every other number in the program (the
+    plots, the exports, settings.json, the typed-in axis bounds) uses "1.5".
+    """
+    loc = QLocale.c()
+    loc.setNumberOptions(QLocale.NumberOption.OmitGroupSeparator
+                         | QLocale.NumberOption.RejectGroupSeparator)
+    return loc
+
+
+def use_dot_decimals() -> None:
+    """Make number_locale() the application default. Called once at startup,
+    before any widget exists, so the number boxes Qt builds itself (the
+    QInputDialog.getDouble prompts) follow it too."""
+    QLocale.setDefault(number_locale())
+
+
+class _DotDecimal:
+    """Pins a spin box to number_locale(), whatever the default is when it is
+    built — the window does not depend on startup having set it first."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setLocale(number_locale())
+
+
+class SpinBox(_NoWheel, _DotDecimal, QSpinBox):             pass
+class DoubleSpinBox(_NoWheel, _DotDecimal, QDoubleSpinBox): pass
 class ComboBox(_NoWheel, QComboBox):           pass
 class Slider(_NoWheel, QSlider):               pass
 
@@ -291,8 +321,9 @@ class AxisBoundEditor(QLineEdit):
         try:
             value = float(text)
         except ValueError:
+            hint = " Use '.' for decimals." if "," in text else ""
             self._canvas.axis_edit_failed.emit(
-                f"{text!r} is not a number — axis unchanged.")
+                f"{text!r} is not a number — axis unchanged.{hint}")
             return
         self._canvas.apply_axis_bound(ax, which, end, value)
 

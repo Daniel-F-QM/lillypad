@@ -7,9 +7,11 @@ step 9.
 
 import time
 
-from PySide6.QtCore import Qt, QSignalBlocker
-from PySide6.QtWidgets import (QCheckBox, QDialog, QLabel, QLineEdit,
-                               QPushButton, QRadioButton, QVBoxLayout)
+from PySide6.QtCore import QRegularExpression, Qt, QSignalBlocker
+from PySide6.QtGui import QRegularExpressionValidator
+from PySide6.QtWidgets import (QCheckBox, QDialog, QHBoxLayout, QLabel,
+                               QLineEdit, QPushButton, QRadioButton,
+                               QVBoxLayout)
 
 from lillypad.gui.widgets import _hline
 from lillypad.scan import write_csv, write_dwc, write_npz
@@ -31,7 +33,12 @@ TRIMMABLE_FORMATS = {"dwc", "csv"}
 # Stem the Save dialog opens on until someone types their own. Deliberately not
 # a date and not a counter: the date is the checkbox's job below, and a counter
 # would have to be kept per folder to mean anything.
-DEFAULT_EXPORT_NAME = "frog_scan"
+DEFAULT_EXPORT_NAME = "FROG_trace"
+
+# What goes between year, month and day in the date prefix, until someone
+# types another. "-" gives ISO 8601 (2026-10-26); empty is allowed too.
+DEFAULT_DATE_DELIMITER = "-"
+DATE_DELIMITER_MAX = 3
 
 
 class ExportDialog(QDialog):
@@ -103,12 +110,33 @@ class ExportDialog(QDialog):
             "dialog can still be typed over: this is the starting point, not a "
             "lock.")
         lay.addWidget(self.edit_name)
+        # The date prefix and its delimiter on one line: the delimiter only
+        # means anything while the prefix is on, and is greyed out otherwise.
+        drow = QHBoxLayout(); drow.setSpacing(8)
         self.chk_date = QCheckBox("Date prefix?")
         self.chk_date.setChecked(True)
         self.chk_date.setToolTip(
-            "Put today's date in front of the name as YYYY-MM-DD_ . ISO order, "
-            "so a folder of exports sorts into chronological order by name.")
-        lay.addWidget(self.chk_date)
+            "Put today's date in front of the name, year first — so a folder "
+            "of exports sorts into chronological order by name.")
+        drow.addWidget(self.chk_date)
+        drow.addStretch(1)
+        drow.addWidget(QLabel("Delimiter"))
+        self.edit_date_delim = QLineEdit(DEFAULT_DATE_DELIMITER)
+        self.edit_date_delim.setMaxLength(DATE_DELIMITER_MAX)
+        self.edit_date_delim.setFixedWidth(44)
+        self.edit_date_delim.setAlignment(Qt.AlignCenter)
+        self.edit_date_delim.setPlaceholderText("none")
+        # Anything a file name may hold; the characters Windows refuses cannot
+        # be typed at all, rather than being quietly swapped on save.
+        self.edit_date_delim.setValidator(QRegularExpressionValidator(
+            QRegularExpression(
+                "[^" + QRegularExpression.escape(self._ILLEGAL) + "]*"),
+            self.edit_date_delim))
+        self.edit_date_delim.setToolTip(
+            "What goes between year, month and day: '-' gives 2026-10-26, "
+            "'.' gives 2026.10.26, and empty gives 20261026.")
+        drow.addWidget(self.edit_date_delim)
+        lay.addLayout(drow)
         # What the two controls above actually produce, spelled out: the date
         # is not in the field being typed into, and the suffix is not in it
         # either, so neither is guessable from the field alone.
@@ -118,6 +146,8 @@ class ExportDialog(QDialog):
         lay.addWidget(self.lbl_preview)
         self.edit_name.textChanged.connect(self.refresh_preview)
         self.chk_date.toggled.connect(self.refresh_preview)
+        self.chk_date.toggled.connect(self.edit_date_delim.setEnabled)
+        self.edit_date_delim.textChanged.connect(self.refresh_preview)
 
         lay.addWidget(_hline())
 
@@ -155,6 +185,21 @@ class ExportDialog(QDialog):
         """Whether the composed name carries today's date as a prefix."""
         return self.chk_date.isChecked()
 
+    @property
+    def date_delimiter(self):
+        """What goes between year, month and day in the date prefix."""
+        return self.edit_date_delim.text()
+
+    def set_date_delimiter(self, text):
+        """Set the delimiter as if it had been typed — the restore path for
+        settings.json. Refuses what typing could not produce: too long, or a
+        character Windows will not put in a file name."""
+        text = str(text)
+        if (len(text) > DATE_DELIMITER_MAX
+                or any(c in self._ILLEGAL for c in text)):
+            raise ValueError(f"not a usable date delimiter: {text!r}")
+        self.edit_date_delim.setText(text)
+
     def active_key(self):
         """The format key whose radio is ticked."""
         for key, rb in self.radios.items():
@@ -174,7 +219,12 @@ class ExportDialog(QDialog):
         if not text:
             text = DEFAULT_EXPORT_NAME
         if self.chk_date.isChecked():
-            text = f"{time.strftime('%Y-%m-%d')}_{text}"
+            # Built from the numbers rather than through strftime, so a "%"
+            # in the delimiter is just a character.
+            d = time.localtime()
+            sep = self.date_delimiter
+            text = (f"{d.tm_year:04d}{sep}{d.tm_mon:02d}{sep}{d.tm_mday:02d}"
+                    f"_{text}")
         return text
 
     def file_name(self, suffix=None):

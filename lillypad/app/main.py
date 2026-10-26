@@ -4,7 +4,8 @@ Six steps, and the ORDER is the whole content of this file:
 
   1. the AppUserModelID, before any window exists, or the taskbar groups us
      under the Python launcher and shows its icon;
-  2. the QApplication, its name, icon and base font;
+  2. the QApplication, its name, icon and base font, and "." as the decimal
+     separator in every number field;
   3. **the theme, before the first widget** — PALETTE is sampled at
      construction time by the figure and by the per-theme icon files build_ui
      picks, so a theme applied afterwards would mean restyling the whole
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import QApplication
 
 from lillypad.design.icons import app_icon
 from lillypad.design.theme import install_theme, startup_theme
+from lillypad.gui.widgets import use_dot_decimals
 from lillypad.gui.window.main_window import FrogWindow
 from lillypad.paths import seed_calibration_dir
 from lillypad.settings import load_settings
@@ -50,6 +52,9 @@ def main():
     app.setApplicationName("Lillypad")
     app.setWindowIcon(app_icon())
     app.setFont(QFont("Segoe UI", 10, QFont.Normal))
+    # "." as the decimal separator in every number field, whatever the Windows
+    # region says — before the first widget, so Qt's own prompts follow it too.
+    use_dot_decimals()
     # Theme before the first widget exists: PALETTE is sampled at construction
     # time by the figure and by the per-theme icon files build_ui picks, so a
     # theme restored after the window was built would mean restyling the whole

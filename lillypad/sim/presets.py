@@ -120,6 +120,21 @@ PULSE_SHAPES: dict[str, dict] = {
                  "clips flat against full scale and the saturation lamp goes "
                  "red — turn the integration time down to recover it.",
     },
+    "low_snr": {
+        "label": "Weak signal (low SNR)",
+        "build": _build_tl_sech,
+        # The other end of "saturated": the same clean sech pulse with 1/20 of
+        # the light. The read noise and the pedestal's shot noise do not scale
+        # with it, so the trace sinks into them. Measured on the app's single
+        # simulator: peak SNR ~2.5 per frame at 10 ms (the clean pulse: ~26),
+        # ~13 at 100 ms.
+        "exposure": 0.05,
+        "desc":  "A clean sech pulse with 1/20 of the light. At 10 ms the "
+                 "peak sits only 2–3x above the noise and the wings vanish "
+                 "into it. For testing averaging, the dark and the fits on "
+                 "noisy data — raise the integration time or Averages / point "
+                 "to dig it out.",
+    },
 }
 
 DEFAULT_PULSE = "tl_sech"

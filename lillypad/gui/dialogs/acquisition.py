@@ -76,9 +76,9 @@ class AcquisitionSettingsDialog(QDialog):
         stage_hint = QLabel(
             "A stall, a knob nudge or an unhomed axis means the stage is not "
             "where the program thinks it is, so every later column carries a "
-            "delay that never happened. Checked (the default), the scan stops "
-            "at the first one. Unchecked, it runs to the end and the affected "
-            "columns are marked in the .npz.")
+            "delay that never happened. Checked, the scan stops at the first "
+            "one. Unchecked, it runs to the end and the affected columns are "
+            "marked in the .npz.")
         stage_hint.setObjectName("dim"); stage_hint.setWordWrap(True)
         lay.addWidget(stage_hint)
 

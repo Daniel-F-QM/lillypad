@@ -33,6 +33,27 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _throwaway_settings_file(tmp_path_factory):
+    """settings.json, for the whole run, is a file in a temp folder.
+
+    Every FrogWindow saves its settings when it closes, so without this the
+    suite wrote whatever the tests had last dialled in (7 averages, 3 idle
+    shots, a 250 fs alignment step...) over the operator's real settings.json.
+    It also means every window under test starts from DEFAULT_SETTINGS rather
+    than from somebody's preferences, so a run is the same on every machine.
+    Tests that need their own file (test_settings.py) patch over this one.
+    """
+    from lillypad import settings
+    mp = pytest.MonkeyPatch()
+    mp.setattr(settings, "SETTINGS_PATH",
+               tmp_path_factory.mktemp("settings") / "settings.json")
+    settings._reset_cache()
+    yield
+    mp.undo()
+    settings._reset_cache()
+
+
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
     return REPO_ROOT

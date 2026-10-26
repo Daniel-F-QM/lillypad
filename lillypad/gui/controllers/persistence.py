@@ -93,6 +93,9 @@ class SettingsController:
             ("export_date_prefix", lambda: self.win.dlg_export.date_stamped,
                                    lambda v: self.win.dlg_export.chk_date.setChecked(
                                        as_bool(v))),
+            # Between year, month and day; "" is a real choice (20261026).
+            ("export_date_delimiter", lambda: self.win.dlg_export.date_delimiter,
+                                      self.win.dlg_export.set_date_delimiter),
             ("export_trim_empty_rows", lambda: self.win.dlg_export.trim_empty_rows,
                                        lambda v: self.win.dlg_export.chk_trim.setChecked(
                                            as_bool(v))),
@@ -109,6 +112,11 @@ class SettingsController:
                                      lambda v: d.chk_abort_sat.setChecked(as_bool(v))),
             ("abort_on_stage_fault", lambda: d.abort_on_stage_fault,
                                      lambda v: d.chk_abort_stage_fault.setChecked(as_bool(v))),
+            # The Spectrometer window's full-scale override, which sets what
+            # the saturation threshold above is a percentage OF. null = auto,
+            # trust what the device reports.
+            ("full_scale_counts", lambda: self.win.scan_cfg.saturation_counts,
+                                  self._restore_full_scale),
 
             ("scan_start_fs",   self.win.spin_start.value,
                                 lambda v: self.win.spin_start.setValue(float(v))),
@@ -127,6 +135,12 @@ class SettingsController:
             ("processing",      lambda: self.win.processing,
                                 self._restore_processing),
         ]
+
+    def _restore_full_scale(self, value):
+        counts = None if value is None else float(value)
+        if counts is not None and not counts > 0:
+            raise ValueError(value)    # same rule as typing it: positive only
+        self.win.dlg_spec.set_full_scale(counts)
 
     def _restore_processing(self, value):
         ok, msg = self.win.devices.set_processing(str(value))
