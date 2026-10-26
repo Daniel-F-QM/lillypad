@@ -97,7 +97,9 @@ class LiveFeedWorker(QThread):
             try:
                 t0 = time.monotonic()
                 raw = np.asarray(spec.acquire(), float)
-                wl  = np.asarray(spec.wavelengths, float)
+                # The axis the CORRECTED frame is drawn on, which legacy mode
+                # trims; `raw` itself stays whole for the saturation lamp.
+                wl  = np.asarray(spec.output_wavelengths, float)
                 elapsed_ms = (time.monotonic() - t0) * 1000.0
             except Exception as e:
                 now = time.monotonic()

@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from lillypad.hardware.base import OVERLAP_BAND_FRAC, SpectrometerBase
+from lillypad.hardware.base import (OVERLAP_BAND_FRAC, PROCESSING_MODES,
+                                    SpectrometerBase)
 
 class StitchedSpectrometer(SpectrometerBase):
     """Two spectrometers with overlapping wavelength ranges presented as ONE
@@ -23,6 +24,16 @@ class StitchedSpectrometer(SpectrometerBase):
     identity and consumers cannot double-apply anything. spec1 is additionally
     scaled by `stitch_factor` (fit or set by hand) to absorb any residual
     sensitivity mismatch.
+
+    Two methods
+    -----------
+    `processing` is "lillypad" (everything below) or "legacy", which
+    reproduces the legacy program's StitchedSpectrometer exactly: a grid at
+    the first-pixel spacing of the finer member, the WHOLE overlap snapped to
+    grid points, a flat 50/50 average across it, and a minimize_scalar fit
+    over it on averaged frames. The members follow the same switch for their calibration
+    (SpectrometerBase.set_processing), and set_processing() here moves all
+    three together, all or nothing.
 
     The overlap band
     ----------------
@@ -38,7 +49,8 @@ class StitchedSpectrometer(SpectrometerBase):
     spec2 alone above, raised-cosine in between). Default is the central
     OVERLAP_BAND_FRAC of the geometric overlap; set_band() moves it. A taper
     rather than the old flat 50/50 average, which stepped at both seams and
-    dragged the dead edges into the merged curve.
+    dragged the dead edges into the merged curve. (Legacy mode is that old
+    average, on purpose; there the band is the whole overlap and cannot move.)
 
     The two members hold INDEPENDENT integration times (see
     set_member_integration_time). Frames stay in raw counts, so the exposure
@@ -67,42 +79,26 @@ class StitchedSpectrometer(SpectrometerBase):
     own max_counts, live and during a scan, so either detector clipping trips
     its own alarm. See scan.py's FrogScanWorker.run.
     """
-    def __init__(self, spec_a: SpectrometerBase, spec_b: SpectrometerBase):
-        wl_a = np.asarray(spec_a.wavelengths, float)
-        wl_b = np.asarray(spec_b.wavelengths, float)
-        if wl_a.max() <= wl_b.max():
-            self.spec1, self.spec2 = spec_a, spec_b
-            wl1, wl2 = wl_a, wl_b
-        else:
-            self.spec1, self.spec2 = spec_b, spec_a
-            wl1, wl2 = wl_b, wl_a
-        if wl2.min() >= wl1.max():
-            raise RuntimeError(
-                f"No spectral overlap between {self.spec1.name} "
-                f"({wl1.min():.0f}–{wl1.max():.0f} nm) and {self.spec2.name} "
-                f"({wl2.min():.0f}–{wl2.max():.0f} nm) — stitching needs "
-                f"overlapping wavelength ranges.")
-        self._wl1, self._wl2 = wl1, wl2
-        # Common grid at the finer of the two pixel spacings (median: real
-        # spectrometer grids are not perfectly uniform).
-        dwl = min(float(np.median(np.diff(wl1))), float(np.median(np.diff(wl2))))
-        self._wl = np.arange(wl1.min(), wl2.max(), dwl)
-        #  |-- spec1 only --|== geometric overlap ==|-- spec2 only --|
-        self._m1  = self._wl <= wl2.min()
-        self._m2  = self._wl >= wl1.max()
-        self._ovl = ~(self._m1 | self._m2)
-        # Geometric overlap bounds, the hard limits set_band() validates
-        # against. Taken from the members' ranges, not from self._wl, so a grid
-        # that stops a fraction of a pixel short cannot narrow them.
-        self.overlap_lo_nm = float(wl2.min())
-        self.overlap_hi_nm = float(wl1.max())
+    def __init__(self, spec_a: SpectrometerBase, spec_b: SpectrometerBase,
+                 method: str = "lillypad"):
+        if method not in PROCESSING_MODES:
+            raise ValueError(f"method must be one of {PROCESSING_MODES}, "
+                             f"got {method!r}")
+        # Construction order, kept so the layout can be rebuilt (relayout)
+        # when a member's trimmed range or the method changes. spec1/spec2
+        # are derived from these by wavelength, every time.
+        self._spec_a, self._spec_b = spec_a, spec_b
+        # The members calibrate under the same method as the stitch. Brought
+        # into line here so a pair can never mix the two.
+        for m in (spec_a, spec_b):
+            m.set_processing(method)
         self.stitch_factor = 1.0
         # RMS relative mismatch left over after the last fit, or None if never
         # fitted. This is what says whether ONE scalar is enough for this pair:
         # small means the two calibrated curves really do agree across the
         # band, large means a calibration is wrong or the band is too wide.
         self.stitch_residual: float | None = None
-        self._set_default_band()
+        self._apply_layout(self._compute_layout(method))
         self.name = f"stitched: {self.spec1.name} + {self.spec2.name}"
         self.max_counts = None
         # The intersection of the members' ranges: set_integration_time() on
@@ -117,6 +113,156 @@ class StitchedSpectrometer(SpectrometerBase):
         # against its own member's max_counts. Tuple assignment is atomic, so
         # the GUI thread may read this while the feed thread acquires.
         self.last_member_raw: tuple[np.ndarray, np.ndarray] | None = None
+
+    # ── Layout: member order, common grid, overlap ───────────────────────────
+    def _compute_layout(self, method: str) -> dict:
+        """Everything the grid and the overlap depend on, for `method`, from
+        the members' CALIBRATED axes (output_wavelengths — legacy mode trims
+        them). Pure: raises without touching anything when it cannot be done.
+        """
+        a, b = self._spec_a, self._spec_b
+        wl_a = np.asarray(a.output_wavelengths, float)
+        wl_b = np.asarray(b.output_wavelengths, float)
+        if wl_a.max() <= wl_b.max():
+            spec1, spec2, wl1, wl2 = a, b, wl_a, wl_b
+        else:
+            spec1, spec2, wl1, wl2 = b, a, wl_b, wl_a
+        # The legacy program only refuses a gap (min > max); a pair that just
+        # touches goes on with an empty overlap, as it does there.
+        gap = (wl2.min() > wl1.max()) if method == "legacy" \
+            else (wl2.min() >= wl1.max())
+        if gap:
+            raise RuntimeError(
+                f"No spectral overlap between {spec1.name} "
+                f"({wl1.min():.0f}–{wl1.max():.0f} nm) and {spec2.name} "
+                f"({wl2.min():.0f}–{wl2.max():.0f} nm) — stitching needs "
+                f"overlapping wavelength ranges.")
+        layout = dict(method=method, spec1=spec1, spec2=spec2, wl1=wl1, wl2=wl2,
+                      # Geometric overlap bounds, the hard limits set_band()
+                      # validates against. Taken from the members' ranges,
+                      # not from the grid, so a grid that stops a fraction of
+                      # a pixel short cannot narrow them.
+                      overlap_lo_nm=float(wl2.min()),
+                      overlap_hi_nm=float(wl1.max()))
+        if method == "legacy":
+            layout.update(self._legacy_grid(spec1, spec2, wl1, wl2))
+            return layout
+        # Common grid at the finer of the two pixel spacings (median: real
+        # spectrometer grids are not perfectly uniform).
+        dwl = min(float(np.median(np.diff(wl1))), float(np.median(np.diff(wl2))))
+        wl = np.arange(wl1.min(), wl2.max(), dwl)
+        #  |-- spec1 only --|== geometric overlap ==|-- spec2 only --|
+        m1 = wl <= wl2.min()
+        m2 = wl >= wl1.max()
+        layout.update(wl=wl, m1=m1, m2=m2, ovl=~(m1 | m2))
+        return layout
+
+    @staticmethod
+    def _legacy_grid(spec1, spec2, wl1, wl2) -> dict:
+        """The legacy program's StitchedSpectrometer.__init__, line for line:
+        the grid step is the spacing of the FIRST TWO pixels of the finer
+        member, and the overlap is snapped to the grid points nearest spec2's
+        first and spec1's last pixel (wlo1, wlo2)."""
+        for spec, w in ((spec1, wl1), (spec2, wl2)):
+            if w.size < 2:
+                raise RuntimeError(f"{spec.name} has fewer than two pixels "
+                                   f"left — nothing to stitch.")
+        dwl1 = wl1[1] - wl1[0]
+        dwl2 = wl2[1] - wl2[0]
+        dwl = dwl1 if dwl1 < dwl2 else dwl2
+        if not dwl > 0:
+            raise RuntimeError("Legacy stitching needs ascending wavelength "
+                               "axes on both spectrometers.")
+        wl = np.arange(np.min(wl1), np.max(wl2), dwl)
+        # |--------|-----|--------|
+        # wlmin    wlo1   wlo2      wlmax
+        wlo1 = wl[np.argmin(abs(wl - np.min(wl2)))]
+        wlo2 = wl[np.argmin(abs(wl - np.max(wl1)))]
+        ovl = (wl > wlo1) & (wl < wlo2)      # filter for the spectral overlap
+        m1 = (wl <= wlo1)
+        m2 = (wl >= wlo2)
+        return dict(wl=wl, m1=m1, m2=m2, ovl=ovl,
+                    wlo1=float(wlo1), wlo2=float(wlo2))
+
+    def _apply_layout(self, layout: dict) -> None:
+        self.processing = layout["method"]
+        self.spec1, self.spec2 = layout["spec1"], layout["spec2"]
+        self._wl1, self._wl2 = layout["wl1"], layout["wl2"]
+        self._wl = layout["wl"]
+        self._m1, self._m2, self._ovl = layout["m1"], layout["m2"], layout["ovl"]
+        self.overlap_lo_nm = layout["overlap_lo_nm"]
+        self.overlap_hi_nm = layout["overlap_hi_nm"]
+        if self.processing == "legacy":
+            # No band to choose: the 50/50 region IS the band, so the overlap
+            # shading and the RAW view's cut both land on the legacy overlap.
+            self.band_lo_nm, self.band_hi_nm = layout["wlo1"], layout["wlo2"]
+            self._fit_mask = self._ovl
+            # Informational only (the legacy combine fills the grid region by
+            # region), in the same order, so a point in both m1 and m2 goes
+            # to spec2 as it does there.
+            w1 = np.zeros_like(self._wl)
+            w1[self._m1] = 1.0
+            w1[self._m2] = 0.0
+            w1[self._ovl] = 0.5
+            self._w1 = w1
+            self.stitch_residual = None
+        else:
+            self._set_default_band()
+
+    def relayout(self) -> bool:
+        """Rebuild the grid after a member's calibrated range changed (a new
+        calibration file in legacy mode trims a different set of pixels).
+
+        Returns True when anything changed. A no-op — band, residual and all
+        left alone — when the members' axes are what the grid was built from,
+        which in Lillypad mode is always. Raises, changing nothing, when the
+        new ranges cannot be stitched; the caller restores the member.
+
+        spec1 and spec2 can swap here. The stitch factor then belongs to the
+        other device, so it goes back to 1.
+        """
+        layout = self._compute_layout(self.processing)
+        if (layout["spec1"] is self.spec1
+                and np.array_equal(layout["wl1"], self._wl1)
+                and np.array_equal(layout["wl2"], self._wl2)):
+            return False
+        swapped = layout["spec1"] is not self.spec1
+        self._apply_layout(layout)
+        if swapped:
+            self.stitch_factor = 1.0
+        self.stitch_residual = None
+        return True
+
+    def set_processing(self, mode: str) -> int:
+        """Move both members' calibration AND the stitch to `mode`.
+
+        All or nothing: if either member's file will not load under `mode`, or
+        the trimmed ranges no longer overlap, this raises and the pair stays
+        exactly as it was. Returns the members' total of skipped lines. The
+        stitch factor is kept, unless spec1 and spec2 swap (see relayout).
+        """
+        if mode not in PROCESSING_MODES:
+            raise ValueError(f"processing must be one of {PROCESSING_MODES}, "
+                             f"got {mode!r}")
+        members = (self._spec_a, self._spec_b)
+        saved = [m.calibration_state() for m in members]
+        try:
+            skipped = sum(m.set_processing(mode) for m in members)
+            layout = self._compute_layout(mode)
+        except Exception:
+            for m, state in zip(members, saved):
+                m.restore_calibration_state(state)
+            raise
+        if mode == self.processing and layout["spec1"] is self.spec1 \
+                and np.array_equal(layout["wl1"], self._wl1) \
+                and np.array_equal(layout["wl2"], self._wl2):
+            return skipped
+        swapped = layout["spec1"] is not self.spec1
+        self._apply_layout(layout)
+        if swapped:
+            self.stitch_factor = 1.0
+        self.stitch_residual = None
+        return skipped
 
     @property
     def members(self) -> tuple[SpectrometerBase, SpectrometerBase]:
@@ -159,8 +305,10 @@ class StitchedSpectrometer(SpectrometerBase):
         self.set_band(lo + margin, hi - margin)
 
     def reset_band(self) -> tuple[float, float]:
-        """Back to the default band. Returns the new (lo, hi)."""
-        self._set_default_band()
+        """Back to the default band. Returns the new (lo, hi). In legacy mode
+        the band is the whole overlap already, so nothing moves."""
+        if self.processing != "legacy":
+            self._set_default_band()
         return self.overlap_band
 
     def set_band(self, lo_nm: float, hi_nm: float) -> tuple[float, float]:
@@ -174,6 +322,10 @@ class StitchedSpectrometer(SpectrometerBase):
         Recomputes only the masks and the blend weights — the common grid and
         the member masks are untouched, so a band change is free.
         """
+        if self.processing == "legacy":
+            raise RuntimeError(
+                "Legacy mode averages over the whole overlap — there is no band "
+                "to set. Switch the method to Lillypad to choose one.")
         lo, hi = float(lo_nm), float(hi_nm)
         if not (np.isfinite(lo) and np.isfinite(hi)):
             raise RuntimeError("Overlap band bounds must be finite numbers.")
@@ -246,7 +398,8 @@ class StitchedSpectrometer(SpectrometerBase):
         `darks` is an optional (dark1, dark2) pair of RAW member frames in
         self.members order, subtracted BEFORE calibrate() — the only order that
         is correct, since a calibration multiplies the dark pedestal along with
-        the signal.
+        the signal. Lillypad clips the difference at 0; legacy mode keeps
+        negatives.
 
         `member_scale` is deliberately NOT applied here: the per-spectrometer
         view needs it per curve, and combine() applies it for the merged frame.
@@ -260,8 +413,11 @@ class StitchedSpectrometer(SpectrometerBase):
                 raise RuntimeError(
                     "The recorded dark does not match this pair's frames — "
                     "re-record it before fitting.")
-            sig1 = np.clip(raw1 - d1, 0, None)
-            sig2 = np.clip(raw2 - d2, 0, None)
+            if self.processing == "legacy":
+                sig1, sig2 = raw1 - d1, raw2 - d2
+            else:
+                sig1 = np.clip(raw1 - d1, 0, None)
+                sig2 = np.clip(raw2 - d2, 0, None)
         return self.spec1.calibrate(sig1), self.spec2.calibrate(sig2)
 
     def combine(self, i1, i2) -> np.ndarray:
@@ -271,6 +427,8 @@ class StitchedSpectrometer(SpectrometerBase):
         stored dark and acquire() cannot drift apart: whatever goes through
         here lands on the current stitch factor and the current band.
         """
+        if self.processing == "legacy":
+            return self._combine_legacy(i1, i2)
         i1 = np.asarray(i1, float) * self.member_scale(0)
         # One crossfade over the whole grid. _w1 is already 1 where only spec1
         # has pixels and 0 where only spec2 does, so the edge-held values
@@ -279,6 +437,22 @@ class StitchedSpectrometer(SpectrometerBase):
         return (w1 * np.interp(self._wl, self._wl1, i1)
                 + (1.0 - w1) * np.interp(self._wl, self._wl2, np.asarray(i2,
                                                                         float)))
+
+    def _combine_legacy(self, i1, i2) -> np.ndarray:
+        """The legacy program's StitchedSpectrometer.intensities, line for
+        line:
+        spec1 alone (scaled) up to wlo1, spec2 alone from wlo2, and the plain
+        average of the two in between."""
+        wl = self._wl
+        I = np.zeros_like(wl)
+        I1 = np.asarray(i1, float) * self.member_scale(0)
+        I2 = np.asarray(i2, float)
+        I[self._m1] = np.interp(wl[self._m1], self._wl1, I1)
+        I[self._m2] = np.interp(wl[self._m2], self._wl2, I2)
+        o = self._ovl
+        I[o] = 0.5 * (np.interp(wl[o], self._wl1, I1)
+                      + np.interp(wl[o], self._wl2, I2))
+        return I
 
     def combined_dark(self, darks) -> np.ndarray:
         """The two RAW member darks pushed through the merge pipeline, i.e. the
@@ -302,7 +476,7 @@ class StitchedSpectrometer(SpectrometerBase):
     def acquire(self) -> np.ndarray:
         return self.combine(*self._acquire_pair())
 
-    def fit_stitch_factor(self, darks=None) -> float:
+    def fit_stitch_factor(self, darks=None, n_frames: int = 1) -> float:
         """Take one frame from each member and choose the factor that makes
         spec1 match spec2 over the OVERLAP BAND, least-squares. The residual is
         quadratic in the factor, so the minimum is the closed form
@@ -323,7 +497,11 @@ class StitchedSpectrometer(SpectrometerBase):
 
         Also records `stitch_residual`, the RMS of (s*a - b) over the band
         relative to that band's peak — how well one scalar actually did.
+
+        In legacy mode see _fit_legacy instead; `n_frames` is used only there.
         """
+        if self.processing == "legacy":
+            return self._fit_legacy(darks, n_frames)
         i1, i2 = self._acquire_pair(darks)
         o = self._fit_mask
         if not o.any():
@@ -339,11 +517,62 @@ class StitchedSpectrometer(SpectrometerBase):
                 f"{self.band_lo_nm:.1f}–{self.band_hi_nm:.1f} nm — cannot fit "
                 f"a stitch factor.")
         self.stitch_factor = float(np.dot(a, b)) / denom
+        self._record_residual(a, b)
+        return self.stitch_factor
+
+    def _fit_legacy(self, darks, n_frames) -> float:
+        """The legacy program's fit_stitch_factor, line for line.
+
+        Each member averages `n_frames` raw frames (the legacy navg, the frames
+        per scan point), has its dark subtracted when one is passed (there:
+        when Subtract Dark is ticked), is calibrated and trimmed, and is
+        interpolated onto the whole overlap; the factor is whatever
+        scipy.optimize.minimize_scalar makes of sum(|s*I1 - I2|^2) there.
+
+        Unlike the legacy program, an empty overlap, a spec1 with no signal
+        there or a minimisation that fails raises instead of leaving an
+        arbitrary or the old factor in place without a word.
+        """
+        n = max(1, int(n_frames))
+        acc1 = acc2 = None
+        for _ in range(n):
+            raw1 = np.asarray(self.spec1.acquire(), float)
+            raw2 = np.asarray(self.spec2.acquire(), float)
+            self.last_member_raw = (raw1, raw2)
+            acc1 = raw1.copy() if acc1 is None else acc1 + raw1
+            acc2 = raw2.copy() if acc2 is None else acc2 + raw2
+        i1, i2 = self.prepare_pair(acc1 / n, acc2 / n, darks)
+        o = self._ovl
+        if not o.any():
+            raise RuntimeError(
+                f"The overlap {self.band_lo_nm:.1f}–{self.band_hi_nm:.1f} nm "
+                f"contains no grid points — cannot fit a stitch factor.")
+        I1 = np.interp(self._wl[o], self._wl1, i1)
+        I2 = np.interp(self._wl[o], self._wl2, i2)
+        if not np.any(I1):
+            raise RuntimeError(
+                f"No signal from {self.spec1.name} in the overlap "
+                f"{self.band_lo_nm:.1f}–{self.band_hi_nm:.1f} nm — cannot fit "
+                f"a stitch factor.")
+        # Imported here, not at module scope: lillypad.hardware must import
+        # with numpy alone (test_layering.py). A literal import inside the
+        # function is still what PyInstaller's analysis finds.
+        from scipy.optimize import minimize_scalar
+        minfunc = lambda s: np.sum(np.abs(I1 * s - I2) ** 2)  # noqa: E731
+        res = minimize_scalar(minfunc)
+        if not res.success:
+            raise RuntimeError(f"Stitch-factor minimisation did not converge: "
+                               f"{res.message}")
+        self.stitch_factor = float(res.x)
+        self._record_residual(I1, I2)
+        return self.stitch_factor
+
+    def _record_residual(self, a, b) -> None:
+        """stitch_residual for the factor just fitted over samples a, b."""
         scale = float(np.max(np.abs(b)))
         self.stitch_residual = (
             float(np.sqrt(np.mean((self.stitch_factor * a - b) ** 2)) / scale)
             if scale > 0.0 else None)
-        return self.stitch_factor
 
     def calibration_targets(self) -> list[SpectrometerBase]:
         return [self.spec1, self.spec2]

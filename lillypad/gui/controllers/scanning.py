@@ -76,13 +76,16 @@ class ScanController:
         c.saturation_fraction  = self.win.dlg_settings.sat_percent / 100.0
         c.abort_on_saturation  = self.win.dlg_settings.abort_on_saturation
         c.abort_on_stage_fault = self.win.dlg_settings.abort_on_stage_fault
+        # Recorded, not acted on: the devices already carry the method.
+        c.processing = self.win.processing
         # c.saturation_counts is owned by the Hardware dialog's override field.
 
         try:
             delays = c.delays_fs()
         except ValueError as e:
             self.win.status.showMessage(f"Bad scan range: {e}", 4000); return
-        wl = np.asarray(self.win.spec.wavelengths, float)
+        # The axis of the calibrated columns, which legacy mode trims.
+        wl = np.asarray(self.win.spec.output_wavelengths, float)
 
         # No dark means the exported trace carries the full pedestal, which on
         # a typical bench is several times the signal — so say so ONCE, before

@@ -17,3 +17,8 @@ RIGHT_CLICK_HINT = ("Right-click the plot to toggle this: off fits the full "
 # not release the hardware in time.
 FEED_BUSY_MSG = ("Live feed is still mid-acquisition — try again in a moment "
                  "(or stop the feed first).")
+
+
+# What each processing method (hardware.PROCESSING_MODES) is called: in the
+# Spectrometer window's Method box and in every message about a switch.
+PROCESSING_LABELS = {"lillypad": "Lillypad", "legacy": "Legacy"}

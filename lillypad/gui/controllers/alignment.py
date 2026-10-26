@@ -169,7 +169,7 @@ class AlignmentController:
             # displayed baseline rather than a second derivation of it.
             s = [np.asarray(self.win.feed._corrected_frame(raw, frames), float)
                  for raw, frames in results]
-            wl = np.asarray(self.win.spec.wavelengths, float)
+            wl = np.asarray(self.win.spec.output_wavelengths, float)
             d1 = s[2] - s[1]        # S(+x)  - S(-x)
             d2 = s[3] - s[0]        # S(+2x) - S(-2x)
         except Exception as e:

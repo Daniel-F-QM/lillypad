@@ -35,15 +35,17 @@ from PySide6.QtWidgets import (QFileDialog, QInputDialog, QMenu, QMessageBox,
                                QPushButton)
 from lillypad.paths import CALIBRATION_DIR
 from lillypad.gui.dialogs.base import DevicePickerDialog
-from lillypad.gui.text import FEED_BUSY_MSG
+from lillypad.gui.text import FEED_BUSY_MSG, PROCESSING_LABELS
 from lillypad.gui.workers import _exposure_bounds
-from lillypad.hardware import (AvantesSpectrometer, KinesisStage,
-                               PiezoJenaStage, SeabreezeSpectrometer,
+from lillypad.hardware import (PROCESSING_MODES, AvantesSpectrometer,
+                               KinesisStage, PiezoJenaStage,
+                               SeabreezeSpectrometer,
                                StitchedSpectrometer, ZaberStage,
                                list_avantes_spectrometers,
                                list_kinesis_stages,
                                list_seabreeze_spectrometers,
                                list_spectrometers, load_calibration_file,
+                               load_calibration_file_legacy,
                                open_spectrometer)
 from lillypad.sim import (SIM_SPECTROMETERS, SimulatedSpectrometer,
                           SimulatedStage, sim_spectrometer_pair)
@@ -97,11 +99,13 @@ class DeviceController:
         the read noise straddles zero and acquire() clips it there, so a dark
         is all zeros and positive spikes and a dark-subtracted trace gets rows
         pulled far below zero."""
-        return SimulatedSpectrometer(
+        sim = SimulatedSpectrometer(
             self.win.stage, gate=self.win.sim_gate, pulse=self.win.sim_pulse,
             background_counts=300.0,
             position_to_delay=lambda pos_mm: position_to_delay_fs(
                 stage_to_um(pos_mm), self.win.scan_cfg.zero_pos_um, self.win.scan_cfg.pass_factor))
+        sim.set_processing(self.win.processing)    # no file yet — cannot fail
+        return sim
 
     def _make_sim_device(self, half):
         """One member of the simulated pair, modelled on a REAL spectrometer.
@@ -128,6 +132,8 @@ class DeviceController:
                 self.win.scan_cfg.pass_factor),
             **model["device"])
         sim.name = model["name"]
+        # Before the file, so it is read under the method in force.
+        sim.set_processing(self.win.processing)
         cal = CALIBRATION_DIR / f"{model['calibration']}.txt"
         if cal.is_file():
             try:
@@ -176,17 +182,23 @@ class DeviceController:
         # identically and give no way to tell which is which.
         sim.name = (f"simulated {'blue' if half == 0 else 'red'} half "
                     f"[{start:.0f}–{end:.0f} nm]")
+        sim.set_processing(self.win.processing)    # no file yet — cannot fail
         return sim
 
     def _open_slot_device(self, ident):
         """Open whatever a multi-spectrometer slot points at — a simulated
         half, or a real device by its tagged id. The sentinels are matched
         first: they carry no vendor tag, so open_spectrometer would reject
-        them."""
+        them.
+
+        The device comes back on the processing method in force, so the
+        calibration file the caller loads next is read under it."""
         for half, (sim_ident, _label) in enumerate(SIM_SLOT_DEVICES):
             if ident == sim_ident:
                 return self._make_sim_member(half)
-        return open_spectrometer(ident, self.win.seabreeze_backend)
+        dev = open_spectrometer(ident, self.win.seabreeze_backend)
+        dev.set_processing(self.win.processing)    # no file yet — cannot fail
+        return dev
 
     def _sim_devices(self):
         """Every SimulatedSpectrometer the connected device is made of — itself,
@@ -264,6 +276,18 @@ class DeviceController:
         see _apply_stage."""
         if self.win.scanning.running():
             return False, "A scan is running — stop it before changing hardware."
+        mode = self.win.processing
+        if (new_spec is not None
+                and getattr(new_spec, "processing", mode) != mode):
+            # Every route that opens a device puts it on the method in force
+            # first; this is the net under them. A device that cannot take the
+            # method (its file will not load strictly, say) is refused rather
+            # than adopted on the wrong one.
+            try:
+                new_spec.set_processing(mode)
+            except Exception as e:
+                return False, (f"{new_spec.name} cannot use the "
+                               f"{PROCESSING_LABELS[mode]} method: {e}")
         with self.device_lock() as ok:
             if not ok:
                 return False, FEED_BUSY_MSG
@@ -669,22 +693,38 @@ class DeviceController:
                 "That spectrometer is no longer connected.", 4000)
             return False
         skipped = 0
+        pair = self.win.spec if self.win._pair_live() else None
+        spec1_before = getattr(pair, "spec1", None)
+        axis_before = np.asarray(self.win.spec.output_wavelengths, float)
         with self.device_lock() as ok:
             if not ok:
                 self.win.status.showMessage(FEED_BUSY_MSG, 4000)
                 return False
+            saved = spec.calibration_state()
             try:
                 if path is None:
                     spec.clear_calibration()
                 else:
                     skipped = spec.set_calibration(path)
+                if pair is not None:
+                    # Legacy mode trims each member to its file, so the pair's
+                    # grid has to follow. A no-op in Lillypad mode.
+                    pair.relayout()
             except Exception as e:
+                # relayout() raises before changing anything, so putting the
+                # member back is the whole rollback.
+                spec.restore_calibration_state(saved)
                 QMessageBox.warning(
                     self.win, "Calibration not applied",
                     f"{spec.name} could not load '{getattr(path, 'stem', path)}':"
                     f"\n\n{e}\n\nThe spectrometer is still on "
                     f"{spec.calibration_name or 'raw counts'}.")
                 return False
+        if pair is not None and pair.spec1 is not spec1_before:
+            self.win.feed.invalidate_dark(
+                "the two spectrometers swapped places in the stitch")
+        if not np.array_equal(axis_before, self.win.spec.output_wavelengths):
+            self._output_axis_changed()
         msg = (f"{spec.name}: calibration "
                + (f"'{path.stem}' applied." if path is not None
                   else "removed (raw counts)."))
@@ -693,6 +733,79 @@ class DeviceController:
                     f"skipped.")
         self.win.status.showMessage(msg, 8000 if skipped else 4000)
         return True
+
+    def _output_axis_changed(self):
+        """The calibrated axis moved under the live device: legacy mode trims
+        each spectrometer to its calibration file, so a new file or a change
+        of method adds or removes pixels.
+
+        Whatever was drawn on the old axis goes. The frozen reference stays —
+        it carries its own axis, and a before/after comparison of the two
+        methods is exactly what it is for.
+        """
+        self.win._live_frame = None      # emitted against the old axis
+        self.win.canvas.clear_members()
+        self.win.alignment._close_align_mode()
+        self.win._pending_rescale = True
+
+    # ── Processing method ────────────────────────────────────────────────────
+    def set_processing(self, mode):
+        """Switch calibration, stitching and the dark to `mode`: "lillypad",
+        or "legacy" to reproduce the legacy acquisition program exactly.
+        (ok, msg).
+
+        The connected device moves over all or nothing (see
+        SpectrometerBase.set_processing and StitchedSpectrometer's): when its
+        calibration file will not load under the new method, or the trimmed
+        ranges stop overlapping, nothing changes and the reason comes back.
+        Every device connected later opens on the method in force.
+
+        The recorded dark is kept, since it is raw counts and neither method
+        touches those — with two exceptions. Back in Lillypad mode a dark that
+        legacy mode carried across an exposure change is dropped, because
+        Lillypad never subtracts a dark from another exposure. And if spec1 and
+        spec2 swap places, the member darks (stored in that order) go too.
+        """
+        if mode not in PROCESSING_MODES:
+            return False, f"Unknown processing method {mode!r}."
+        label = PROCESSING_LABELS[mode]
+        if mode == self.win.processing:
+            return True, f"Method: {label}."
+        if self.win.scanning.running():
+            return False, ("A scan is running — stop it before changing the "
+                           "method.")
+        spec = self.win.spec
+        if spec is None:
+            self.win.processing = mode
+            return True, (f"Method: {label} — used for the next spectrometer "
+                          f"you connect.")
+        spec1_before = getattr(spec, "spec1", None)
+        with self.device_lock() as ok:
+            if not ok:
+                return False, FEED_BUSY_MSG
+            try:
+                skipped = spec.set_processing(mode)
+            except Exception as e:
+                return False, (f"Could not switch to {label}: {e}\n\nStill on "
+                               f"{PROCESSING_LABELS[self.win.processing]}.")
+            self.win.processing = mode
+        self._output_axis_changed()
+        msg = f"Method: {label}."
+        if self.win._pair_live():
+            msg += (" The stitch factor was fitted under the other method — "
+                    "re-run Auto-stitch.")
+        if skipped:
+            msg += (f"  NOTE: {skipped} malformed calibration line(s) were "
+                    f"skipped.")
+        self.win.status.showMessage(msg, 6000)
+        if spec1_before is not None and spec.spec1 is not spec1_before:
+            self.win.feed.invalidate_dark(
+                "the two spectrometers swapped places in the stitch")
+        elif mode == "lillypad" and not self.win.feed.dark_matches_exposure():
+            self.win.feed.invalidate_dark(
+                "it was recorded at another integration time, which only "
+                "legacy mode allows")
+        return True, msg
 
     def _add_calibration_file(self):
         """Copy a calibration file into calibration_files/ so it shows up in
@@ -846,10 +959,15 @@ class DeviceController:
             self.win._multi["cals"][slot] = path
             return
         # Not live yet — nothing to verify against, so the file is checked on
-        # its own and only then remembered for the connect.
+        # its own (by the reader the method in force will use) and only then
+        # remembered for the connect.
         if path is not None:
             try:
-                _wl, _fac, skipped = load_calibration_file(path)
+                if self.win.processing == "legacy":
+                    load_calibration_file_legacy(path)
+                    skipped = 0
+                else:
+                    _wl, _fac, skipped = load_calibration_file(path)
             except Exception as e:
                 QMessageBox.warning(
                     self.win, "Calibration not applied",
@@ -889,7 +1007,8 @@ class DeviceController:
                 if cal is not None:
                     if spec.set_calibration(cal):
                         ragged.append(f"slot {slot + 1} ('{cal.stem}')")
-            stitched = StitchedSpectrometer(*opened)
+            stitched = StitchedSpectrometer(*opened,
+                                            method=self.win.processing)
         except Exception as e:
             for s in opened:
                 self._drop(s)
@@ -961,26 +1080,38 @@ class DeviceController:
             return False, "No stitched pair is connected."
         if self.win.scanning.running():
             return False, "A scan is running — stop it before fitting."
+        legacy = self.win.processing == "legacy"
         darks = self._fit_darks()
+        n_frames = 1
+        if legacy:
+            # The legacy program's members subtract their dark only while
+            # its box is ticked, and average as many frames as one scan point.
+            if not self.win.chk_dark.isChecked():
+                darks = None
+            n_frames = max(1, int(self.win.dlg_settings.n_average))
         with self.device_lock() as ok:
             if not ok:
                 return False, FEED_BUSY_MSG
             try:
-                factor = self.win.spec.fit_stitch_factor(darks)
+                factor = self.win.spec.fit_stitch_factor(darks,
+                                                         n_frames=n_frames)
             except Exception as e:
                 return False, f"Stitch-factor fit failed: {e}"
         self.win._stitch_stale = False
         lo, hi = self.win.spec.overlap_band
         res = self.win.spec.stitch_residual
+        where = "the whole overlap" if legacy else "the band"
         quality = ("" if res is None else
                    f" Residual mismatch {res * 100:.1f}% — "
-                   + ("the two spectra agree across the band."
+                   + (f"the two spectra agree across {where}."
                       if res < 0.05 else
                       "one scalar does not reconcile them here; check the "
-                      "calibrations or narrow the band."))
+                      "calibrations" + ("." if legacy else " or narrow the band.")))
+        frames = (f", average of {n_frames} frame{'' if n_frames == 1 else 's'}"
+                  if legacy else "")
         return True, (f"Stitch factor fitted: {factor:.4g} "
                       f"(applied to {self.win.spec.spec1.name}) over "
-                      f"{lo:.1f}–{hi:.1f} nm"
+                      f"{lo:.1f}–{hi:.1f} nm{frames}"
                       + ("" if darks is not None else ", no dark subtracted")
                       + f".{quality}")
 
@@ -1002,6 +1133,11 @@ class DeviceController:
     def set_overlap_band(self):
         """Pick the sub-range of the overlap that the fit and blend use."""
         if not self.win._pair_live():
+            return
+        if self.win.processing == "legacy":
+            self.win.status.showMessage(
+                "Legacy mode averages over the whole overlap — there is no band "
+                "to set.", 5000)
             return
         lo, hi = self.win.spec.overlap_band
         glo, ghi = self.win.spec.geometric_overlap

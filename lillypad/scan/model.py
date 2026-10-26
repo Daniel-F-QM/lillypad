@@ -57,6 +57,10 @@ class FrogScanConfig:
     pos_max_um: float | None = None
     # Metadata only (does not affect acquisition)
     gate: str = "shg"
+    # Which method calibrated, stitched and darked the trace: "lillypad", or
+    # "legacy" for the legacy-compatible one. The devices carry the
+    # method; this only records it, so an archive says how it was made.
+    processing: str = "lillypad"
 
     def delays_fs(self):
         return build_delay_grid(self.delay_start_fs, self.delay_stop_fs,

@@ -189,7 +189,8 @@ class FrogScanWorker(QThread):
                         f"{int(bad.sum())} commanded positions fall outside "
                         f"[{lo:.1f}, {hi:.1f}] um — check zero-delay / range.")
 
-            n_wl     = self.spec.wavelengths.size
+            # The axis of the CALIBRATED column, which legacy mode trims.
+            n_wl     = self.spec.output_wavelengths.size
             trace    = np.zeros((n_wl, total))
             readback = np.zeros(total)
             ref_before = ref_after = None
@@ -326,7 +327,7 @@ class FrogScanWorker(QThread):
                 delays_fs=delays,
                 positions_cmd_um=targets,
                 positions_readback_um=readback,
-                wavelengths_nm=np.asarray(self.spec.wavelengths, float),
+                wavelengths_nm=np.asarray(self.spec.output_wavelengths, float),
                 trace=trace,
                 dark=self.dark,
                 delay_reference_before=ref_before,

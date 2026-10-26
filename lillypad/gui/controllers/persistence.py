@@ -121,7 +121,17 @@ class SettingsController:
                                     as_bool(v))),
             ("align_step_fs",   lambda: self.win.dlg_align.step_fs,
                                 lambda v: self.win.dlg_align.spin_align_step.setValue(float(v))),
+            # Acquisition policy, not hardware: which method calibrates,
+            # stitches and darks. Restored through the controller, the same
+            # route the Spectrometer window's Method box takes.
+            ("processing",      lambda: self.win.processing,
+                                self._restore_processing),
         ]
+
+    def _restore_processing(self, value):
+        ok, msg = self.win.devices.set_processing(str(value))
+        if not ok:
+            raise ValueError(msg)      # unknown method: this one key is dropped
 
     def _window_geometry(self):
         """Position and size for the next launch.

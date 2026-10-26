@@ -353,6 +353,14 @@ class FrogWindow(QMainWindow):
         self.state.stitch_stale = value
 
     @property
+    def processing(self):
+        return self.state.processing
+
+    @processing.setter
+    def processing(self, value):
+        self.state.processing = value
+
+    @property
     def sim_pulse(self):
         return self.state.sim_pulse
 

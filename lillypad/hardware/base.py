@@ -38,6 +38,13 @@ C_NM_PER_FS = 299.792458
 # StitchedSpectrometer.
 OVERLAP_BAND_FRAC = 0.90
 
+# The two methods for calibrating and stitching frames. "lillypad" is this
+# program's own. "legacy" reproduces the legacy acquisition program exactly —
+# its SeabreezeSpectrometer.update_calibration and its StitchedSpectrometer —
+# so the two programs can be compared on one bench with the method held fixed.
+# See SpectrometerBase.set_processing and StitchedSpectrometer.set_processing.
+PROCESSING_MODES = ("lillypad", "legacy")
+
 
 def load_calibration_file(path) -> tuple[np.ndarray, np.ndarray, int]:
     """Parse an intensity-calibration text file: two whitespace-separated
@@ -73,6 +80,66 @@ def load_calibration_file(path) -> tuple[np.ndarray, np.ndarray, int]:
             f"with at least two rows, got data of shape {data.shape}.")
     order = np.argsort(data[:, 0])
     return data[order, 0], data[order, 1], skipped
+
+
+def load_calibration_file_legacy(path) -> tuple[np.ndarray, np.ndarray]:
+    """Parse a calibration file exactly as the legacy acquisition program
+    does: np.loadtxt(fname, unpack=True), then sorted by wavelength.
+
+    Strict on purpose: legacy mode accepts and rejects exactly the files the
+    legacy program does, so one malformed line rejects the whole file. Where
+    the legacy program would then leave the device silently on raw counts,
+    this raises, and the GUI says so.
+    """
+    try:
+        data = np.asarray(np.loadtxt(path, unpack=True), float)
+    except Exception as e:
+        raise RuntimeError(
+            f"{Path(path).name}: legacy mode reads calibration files strictly "
+            f"(np.loadtxt), and this one does not parse: {e}") from None
+    if data.ndim != 2 or data.shape[0] != 2 or data.shape[1] < 2:
+        raise RuntimeError(
+            f"{Path(path).name}: expected two columns (wavelength_nm factor) "
+            f"with at least two rows, got data of shape {data.shape[::-1]}.")
+    wl, calfac = data
+    isort = np.argsort(wl)
+    return wl[isort], calfac[isort]
+
+
+def legacy_trim_mask(calfac) -> np.ndarray:
+    """The pixels the legacy program keeps once a calibration is loaded, as a
+    boolean mask. Copied from its SeabreezeSpectrometer.update_calibration
+    loop for loop.
+
+    Leading and trailing pixels whose factor is exactly 0 are dropped. Note the
+    red end: the legacy loop stops at the first non-zero pixel counted from the
+    end and then slices [:-(i+1)], which drops that pixel as well. So one
+    non-zero pixel more than the zero pad is always lost there, and with no
+    zero pad the last pixel alone. Kept on purpose: this mode exists to give
+    the legacy program's output pixel for pixel.
+
+    Raises where the legacy program would go on with an empty or one-pixel
+    spectrometer.
+    """
+    calfac = np.asarray(calfac, float)
+    n = calfac.size
+    if n == 0 or not np.any(calfac != 0):
+        raise RuntimeError("the calibration factor is zero at every pixel of "
+                           "this spectrometer.")
+    for i in range(n):
+        if calfac[i] != 0:
+            break
+    pad_left = i
+    for i in range(n):
+        if calfac[-(i + 1)] != 0:
+            break
+    pad_right = i + 1
+    mask = np.zeros(n, dtype=bool)
+    mask[pad_left:-pad_right] = True
+    if np.count_nonzero(mask) < 2:
+        raise RuntimeError("Legacy trimming leaves fewer than two pixels of "
+                           "this spectrometer.")
+    return mask
 
 
 # ===========================================================================
@@ -377,37 +444,124 @@ class SpectrometerBase(abc.ABC):
     # of raw ADC counts, so consumers must check saturation on acquire()'s
     # output and only then run it through calibrate().
     calibration_name: str | None = None
+    # The file it came from, kept so a change of method (set_processing) can
+    # re-read it under the new rules.
+    calibration_path: Path | None = None
     # How many malformed lines the loaded file had. Non-zero means the file
     # parsed but was not clean, which the GUI reports — a calibration is data
     # the operator has to trust, so a partial read must never pass silently.
     calibration_skipped: int = 0
     _cal_pixels: np.ndarray | None = None
+    # Which method calibrate() follows, one of PROCESSING_MODES. Changed only
+    # through set_processing(), which re-derives the loaded file under it.
+    processing: str = "lillypad"
+    # Legacy mode only: the pixels calibrate() keeps (legacy_trim_mask), or
+    # None when every pixel is kept. Raw frames from acquire() are never trimmed —
+    # saturation and the dark are judged on the whole detector.
+    _cal_mask: np.ndarray | None = None
+
+    def _compute_calibration(self, path, mode):
+        """(factor per pixel, kept-pixel mask or None, lines skipped) for the
+        file at `path` under method `mode`. Pure: nothing on the device moves.
+
+        lillypad: lenient read; pixels outside the file's range hold the edge
+                  factor; every pixel kept.
+        legacy:   strict read; factor 0 outside the file's range; leading and
+                  trailing zero-factor pixels trimmed, as the legacy program
+                  does.
+        """
+        wl_dev = np.asarray(self.wavelengths, float)
+        if mode == "legacy":
+            wl, fac = load_calibration_file_legacy(path)
+            pixels = np.interp(wl_dev, wl, fac, right=0, left=0)
+            try:
+                mask = legacy_trim_mask(pixels)
+            except RuntimeError as e:
+                raise RuntimeError(f"{Path(path).name}: {e}") from None
+            return pixels, mask, 0
+        if mode != "lillypad":
+            raise ValueError(f"processing must be one of {PROCESSING_MODES}, "
+                             f"got {mode!r}")
+        wl, fac, skipped = load_calibration_file(path)
+        return np.interp(wl_dev, wl, fac), None, skipped
 
     def set_calibration(self, path) -> int:
-        """Load a calibration file (see load_calibration_file) and hold it
-        interpolated onto this device's pixel grid. Pixels outside the file's
-        wavelength range hold the edge factor rather than extrapolating.
+        """Load a calibration file and hold it on this device's pixel grid,
+        under the current method (see _compute_calibration).
 
         Returns the number of malformed lines skipped. Nothing on the device is
         touched until the file has parsed, so a failed load leaves the previous
         calibration (or raw counts) in place rather than a half-applied one.
         """
-        wl, fac, skipped = load_calibration_file(path)
-        self._cal_pixels = np.interp(np.asarray(self.wavelengths, float),
-                                     wl, fac)
+        pixels, mask, skipped = self._compute_calibration(path,
+                                                          self.processing)
+        self._cal_pixels, self._cal_mask = pixels, mask
+        self.calibration_path = Path(path)
         self.calibration_name = Path(path).stem
         self.calibration_skipped = skipped
         return skipped
 
     def clear_calibration(self) -> None:
         self._cal_pixels = None
+        self._cal_mask = None
+        self.calibration_path = None
         self.calibration_name = None
         self.calibration_skipped = 0
 
+    def set_processing(self, mode: str) -> int:
+        """Switch the calibration method and re-read the loaded file under it.
+
+        All or nothing: if the file does not load under `mode` (legacy mode is
+        strict), this raises and the device keeps its method and calibration.
+        Returns the number of malformed lines skipped (always 0 in legacy mode).
+        """
+        if mode not in PROCESSING_MODES:
+            raise ValueError(f"processing must be one of {PROCESSING_MODES}, "
+                             f"got {mode!r}")
+        if mode == self.processing:
+            return self.calibration_skipped
+        if self.calibration_path is None:
+            self.processing = mode
+            return 0
+        pixels, mask, skipped = self._compute_calibration(
+            self.calibration_path, mode)
+        self.processing = mode
+        self._cal_pixels, self._cal_mask = pixels, mask
+        self.calibration_skipped = skipped
+        return skipped
+
+    def calibration_state(self) -> tuple:
+        """Everything set_calibration / set_processing can change, for
+        restore_calibration_state to put back after a failed multi-step
+        change (a stitched pair that no longer overlaps, say)."""
+        return (self.processing, self.calibration_path, self.calibration_name,
+                self.calibration_skipped, self._cal_pixels, self._cal_mask)
+
+    def restore_calibration_state(self, state: tuple) -> None:
+        (self.processing, self.calibration_path, self.calibration_name,
+         self.calibration_skipped, self._cal_pixels, self._cal_mask) = state
+
+    @property
+    def output_wavelengths(self) -> np.ndarray:
+        """The axis calibrate()'s output sits on.
+
+        The same as `wavelengths` except in legacy mode with a calibration
+        loaded, where the trimmed pixels are gone. Anything that pairs a
+        CALIBRATED frame with an axis must use this; anything that pairs a RAW
+        frame with one keeps `wavelengths`.
+        """
+        mask = self._cal_mask
+        wl = self.wavelengths
+        return wl if mask is None else np.asarray(wl)[mask]
+
     def calibrate(self, counts: np.ndarray) -> np.ndarray:
-        """Apply the loaded intensity calibration (identity when none)."""
+        """Apply the loaded intensity calibration (identity when none). In
+        legacy mode the trimmed pixels are then dropped, as the legacy program
+        does: ((I - dark) * calibration)[filter]."""
         cal = self._cal_pixels
-        return counts if cal is None else counts * cal
+        out = counts if cal is None else counts * cal
+        mask = self._cal_mask
+        return out if mask is None else np.asarray(out)[..., mask]
 
     def calibration_targets(self) -> list["SpectrometerBase"]:
         """The physical spectrometers a calibration file can be assigned to:

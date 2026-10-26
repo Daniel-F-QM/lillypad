@@ -101,6 +101,14 @@ class InstrumentState:
     # re-fitted.
     stitch_stale: bool = False
 
+    # ── How frames are calibrated, stitched and darked ───────────────────────
+    # One of hardware.PROCESSING_MODES: "lillypad", or "legacy" to reproduce
+    # the legacy acquisition program exactly. Pushed onto every connected
+    # device (calibration and stitch) by DeviceController.set_processing, and
+    # read by the live feed for the dark (frame count, clipping, whether an
+    # exposure change drops it).
+    processing: str = "lillypad"
+
     # ── What the simulator stands in for ─────────────────────────────────────
     # Kept here, not on the simulator, so the choice survives a swap to real
     # hardware and back.

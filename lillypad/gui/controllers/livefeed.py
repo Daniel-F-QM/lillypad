@@ -252,7 +252,14 @@ class LiveFeedController:
             if self.win._overlay_on and self._render_overlay():
                 self._flush_pending_fit()
                 return
-            self.win.canvas.update_spectrum(wl, self._dark_corrected(raw))
+            corrected = self._dark_corrected(raw)
+            if np.shape(corrected)[-1:] != np.shape(wl):
+                # Emitted before the calibrated axis last moved (a change of
+                # method, or a calibration in legacy mode, which trims pixels):
+                # its axis and today's correction disagree. The next frame is
+                # right, so this one is simply dropped.
+                return
+            self.win.canvas.update_spectrum(wl, corrected)
             self._flush_pending_fit()
 
     def _dark_corrected(self, raw):
@@ -289,7 +296,9 @@ class LiveFeedController:
                 *self.win.spec.prepare_pair(*frames, darks))
         spectrum = raw
         if self.win.background is not None:
-            spectrum = np.clip(raw - self.win.background, 0, None)
+            spectrum = raw - self.win.background
+            if self.win.processing != "legacy":      # legacy mode keeps negatives
+                spectrum = np.clip(spectrum, 0, None)
         # Calibration LAST, and never on what the lamp judged: saturation is a
         # raw-ADC property, the calibration is display/data physics.
         return self.win.spec.calibrate(spectrum)
@@ -394,7 +403,8 @@ class LiveFeedController:
             if y is None:
                 return False
             idx = spec.member_index(mem)
-            curves.append((np.asarray(mem.wavelengths, float),
+            # output_wavelengths: y is CALIBRATED, and legacy mode trims it.
+            curves.append((np.asarray(mem.output_wavelengths, float),
                            y * spec.member_scale(idx)))
         # Cheap and idempotent — set_overlap_band returns immediately unless
         # the band actually moved.
@@ -546,16 +556,26 @@ class LiveFeedController:
         # unmentioned entirely.
         had_dark = (self.win.background is not None
                     or self.win.background_members is not None)
+        msg = None
         if len(slots) == 2:
             # Frames stay in raw counts, so stitch_factor now carries the wrong
             # exposure ratio and the seam will show. Say so rather than let the
             # user discover it in the data.
             self.win._stitch_stale = True
+            msg = (f"{', '.join(changed)} — the two spectrometers no longer "
+                   f"share a scale; re-run Auto-stitch (⇌ above the spectrum, "
+                   f"or the Spectrometer window).")
+            self.win.status.showMessage(msg, 8000)
+        if had_dark and self.win.processing == "legacy":
+            # The legacy program keeps the dark it has whatever the exposure
+            # now is — and so does legacy mode, but it says so.
+            rec = ", ".join(f"{e:g} ms"
+                            for e in (self.win.background_exposures or ()))
+            note = (f"Dark kept (legacy mode) — it was recorded at {rec}."
+                    if rec else "Dark kept (legacy mode).")
             self.win.status.showMessage(
-                f"{', '.join(changed)} — the two spectrometers no longer "
-                f"share a scale; re-run Auto-stitch (⇌ above the spectrum, or "
-                f"the Spectrometer window).", 8000)
-        if had_dark:
+                f"{msg or ', '.join(changed) + '.'}  {note}", 10000)
+        elif had_dark:
             # Last, so its persistent message is the one left standing.
             self.invalidate_dark(f"integration time changed to "
                                   f"{', '.join(changed)}")
@@ -570,7 +590,13 @@ class LiveFeedController:
     DARK_BUDGET_MS = 5000.0
 
     def _dark_frame_count(self):
-        """How many frames to average into a dark (see DARK_* above)."""
+        """How many frames to average into a dark (see DARK_* above).
+
+        Legacy mode takes exactly the scan's frames per point, as the legacy
+        program's record_dark does (it averages navg) — no floor, cap or time
+        budget."""
+        if self.win.processing == "legacy":
+            return max(1, int(self.win.dlg_settings.n_average))
         n = max(self.DARK_MIN_FRAMES,
                 self.DARK_FRAMES_PER_AVG * int(self.win.dlg_settings.n_average))
         members = getattr(self.win.spec, "members", None)
@@ -652,6 +678,19 @@ class LiveFeedController:
         self.win.chk_dark.setEnabled(True); self.win.chk_dark.setChecked(True)
         self.win.status.showMessage(
             f"Dark recorded — {where}, average of {n} frames.", 4000)
+
+    def dark_matches_exposure(self):
+        """Whether the recorded dark was taken at the exposure(s) the device
+        has now. Only legacy mode can leave them apart (it keeps the dark across
+        an exposure change). True when there is no dark to mismatch."""
+        rec = self.win.background_exposures
+        if rec is None or not self.win._have_spec():
+            return True
+        members = getattr(self.win.spec, "members", None)
+        now = (tuple(_exposure_ms(m) for m in members) if members
+               else (_exposure_ms(self.win.spec),))
+        return len(now) == len(rec) and all(
+            abs(a - b) <= 1e-6 * max(1.0, abs(b)) for a, b in zip(now, rec))
 
     def invalidate_dark(self, reason):
         """Throw the recorded dark away and say why.

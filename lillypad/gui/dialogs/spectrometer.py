@@ -8,8 +8,10 @@ from PySide6.QtCore import QSignalBlocker
 from PySide6.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QVBoxLayout)
 
-from lillypad.hardware import SEABREEZE_BACKENDS, StitchedSpectrometer
+from lillypad.hardware import (PROCESSING_MODES, SEABREEZE_BACKENDS,
+                               StitchedSpectrometer)
 from lillypad.gui.dialogs.base import ConnectDialog
+from lillypad.gui.text import PROCESSING_LABELS
 from lillypad.gui.widgets import ComboBox, _hline
 
 
@@ -75,6 +77,25 @@ class SpectrometerDialog(ConnectDialog):
                       "spectrometer.")
         hint.setObjectName("dim"); hint.setWordWrap(True)
         lay.addWidget(hint)
+
+        # Processing method. Beside the calibrations rather than under
+        # Stitching: it changes how a single spectrometer is calibrated too.
+        mrow = QGridLayout(); mrow.setSpacing(6)
+        mrow.setColumnStretch(1, 1)
+        mrow.addWidget(QLabel("Method"), 0, 0)
+        self.cmb_method = ComboBox()
+        for mode in PROCESSING_MODES:
+            self.cmb_method.addItem(PROCESSING_LABELS[mode], mode)
+        self.cmb_method.setToolTip(
+            "How frames are calibrated, stitched and darked. Legacy mode "
+            "reproduces the legacy acquisition program exactly, for "
+            "comparing the two programs on the same bench.")
+        self.cmb_method.activated.connect(self._on_method_picked)
+        mrow.addWidget(self.cmb_method, 0, 1)
+        lay.addLayout(mrow)
+        self.lbl_method = QLabel()
+        self.lbl_method.setObjectName("dim"); self.lbl_method.setWordWrap(True)
+        lay.addWidget(self.lbl_method)
 
         lay.addWidget(_hline())
 
@@ -199,6 +220,11 @@ class SpectrometerDialog(ConnectDialog):
     def _disconnect(self):
         self._do(self.main.devices.disconnect_spectrometer)
 
+    def _on_method_picked(self):
+        mode = self.cmb_method.currentData()
+        # _do refreshes, which puts the box back if the switch was refused.
+        self._do(lambda: self.main.devices.set_processing(mode))
+
     # ── Stitching handlers ───────────────────────────────────────────────────
     def _manual_stitch(self):
         self.main.devices.set_stitch_factor()
@@ -272,7 +298,19 @@ class SpectrometerDialog(ConnectDialog):
         self.edit_full_scale.setPlaceholderText(
             f"auto — device reports {reported:.0f}" if reported
             else "device reports none — saturation unchecked")
+        self._refresh_method()
         self._refresh_stitch()
+
+    def _refresh_method(self):
+        mode = self.state.processing
+        with QSignalBlocker(self.cmb_method):
+            self.cmb_method.setCurrentIndex(
+                max(0, self.cmb_method.findData(mode)))
+        self.lbl_method.setVisible(mode == "legacy")
+        self.lbl_method.setText(
+            "As the legacy program: strict file reading, zero-factor pixels "
+            "removed, 50/50 blend over the whole overlap, dark from one scan "
+            "point's frames and kept across exposure changes.")
 
     def _fill_device_combo(self, slot):
         """Rebuild one slot's device list: (none), whatever the slot currently
@@ -325,8 +363,17 @@ class SpectrometerDialog(ConnectDialog):
         """
         spec = self.state.spec
         live = isinstance(spec, StitchedSpectrometer)
-        for b in (self.btn_fit, self.btn_manual, self.btn_band):
+        legacy = self.state.processing == "legacy"
+        for b in (self.btn_fit, self.btn_manual):
             b.setEnabled(live)
+        # Legacy mode has no band: it averages over the whole overlap.
+        self.btn_band.setEnabled(live and not legacy)
+        self.btn_fit.setToolTip(
+            "Fit the stitch factor over the whole overlap, averaging one scan "
+            "point's frames per spectrometer (as the legacy program does) — "
+            "needs light across the overlap" if legacy else
+            "Fit the stitch factor from one frame — needs light across the "
+            "overlap region")
         if not live:
             self.lbl_stitch.setText(
                 "Fill both slots to stitch two spectrometers into one.")
@@ -338,6 +385,8 @@ class SpectrometerDialog(ConnectDialog):
                  if self.state.stitch_stale else "")
         lo, hi = spec.overlap_band
         glo, ghi = spec.geometric_overlap
+        where = (f"Legacy: 50/50 average over the whole overlap, "
+                 f"{lo:.1f}–{hi:.1f} nm." if legacy else
+                 f"Overlap band {lo:.1f}–{hi:.1f} nm of {glo:.1f}–{ghi:.1f} nm.")
         self.lbl_stitch.setText(
-            f"Factor {spec.stitch_factor:.4g}  ({quality}){stale}\n"
-            f"Overlap band {lo:.1f}–{hi:.1f} nm of {glo:.1f}–{ghi:.1f} nm.")
+            f"Factor {spec.stitch_factor:.4g}  ({quality}){stale}\n{where}")

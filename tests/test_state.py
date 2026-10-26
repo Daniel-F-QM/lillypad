@@ -97,6 +97,7 @@ FORWARDED = [
     ("seabreeze_backend", "cseabreeze"),
     ("_multi_members", ["a", "b"]),
     ("_stitch_stale", True),
+    ("processing", "legacy"),
 ]
 
 # window attribute -> InstrumentState field, where the two names differ.
